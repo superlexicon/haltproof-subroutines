@@ -1,15 +1,15 @@
-//! # `isr-sdk`
+//! # `hps-sdk`
 //!
 //! Ergonomic `#![no_std]` guest SDK for authoring WebAssembly (`wasm32-unknown-unknown`)
-//! **Immortal Subroutines (ISRs)** targeting Lexicon's `WasmtimeAdapter`.
+//! **Haltproof Subroutines (HPS)** targeting Lexicon's `WasmtimeAdapter`.
 //!
 //! - Hides all fixed linear-memory host buffers (`0x10000..0x70000`) and raw `env` imports.
 //! - Provides compile-time `const fn` Keccak-256 selectors (`selector("fn(bytes32,uint64)")`)
 //!   and event topic hashes (`event_topic("Updated(bytes32,uint64)")`).
-//! - Provides safe wrappers for ISR persistent state (`storage`), execution context (`context`),
+//! - Provides safe wrappers for HPS persistent state (`storage`), execution context (`context`),
 //!   ABI calldata decoding (`abi::CalldataReader`), structured return payloads (`ret`),
 //!   and indexed event emission (`events`).
-//! - Includes an in-memory host simulator (`mock`) on non-`wasm32` targets so Immortal Subroutines
+//! - Includes an in-memory host simulator (`mock`) on non-`wasm32` targets so Haltproof Subroutines
 //!   can be unit-tested natively with `cargo test` in milliseconds.
 
 #![cfg_attr(target_arch = "wasm32", no_std)]
@@ -104,11 +104,11 @@ pub mod mock {
     }
 }
 
-/// Compute a 4-byte ISR function selector at compile time.
+/// Compute a 4-byte HPS function selector at compile time.
 ///
 /// Example:
 /// ```
-/// use isr_sdk::selector;
+/// use hps_sdk::selector;
 /// const TRANSFER: [u8; 4] = selector("transfer(address,uint256)");
 /// assert_eq!(TRANSFER, [0xa9, 0x05, 0x9c, 0xbb]);
 /// ```
@@ -182,12 +182,12 @@ pub mod context {
     }
 }
 
-/// Per-ISR persistent key-value slot storage backed by `FlatKvDb` & rooted `StorageTree`.
+/// Per-HPS persistent key-value slot storage backed by `FlatKvDb` & rooted `StorageTree`.
 pub mod storage {
     #[cfg(target_arch = "wasm32")]
     use crate::{layout, sys};
 
-    /// Check whether `key` exists in this ISR's persistent state.
+    /// Check whether `key` exists in this HPS's persistent state.
     pub fn exists(key: &[u8]) -> bool {
         #[cfg(target_arch = "wasm32")]
         unsafe {
@@ -199,7 +199,7 @@ pub mod storage {
         }
     }
 
-    /// Read `key` from ISR state into `VAL_BUF` and copy up to `out.len()` bytes into `out`.
+    /// Read `key` from HPS state into `VAL_BUF` and copy up to `out.len()` bytes into `out`.
     /// Returns `Some(total_stored_len)` if present (`> 0` bytes), or `None` if absent.
     pub fn get_into(key: &[u8], out: &mut [u8]) -> Option<usize> {
         #[cfg(target_arch = "wasm32")]
@@ -255,7 +255,7 @@ pub mod storage {
         }
     }
 
-    /// Write `val` under `key` in ISR storage. Passing `val = &[]` clears the entry.
+    /// Write `val` under `key` in HPS storage. Passing `val = &[]` clears the entry.
     pub fn set(key: &[u8], val: &[u8]) {
         #[cfg(target_arch = "wasm32")]
         unsafe {
@@ -335,7 +335,7 @@ pub mod storage {
     }
 }
 
-/// Structured return-buffer helpers for `eth_call` and ISR return data.
+/// Structured return-buffer helpers for `eth_call` and HPS return data.
 pub mod ret {
     #[cfg(target_arch = "wasm32")]
     use crate::layout;
@@ -406,7 +406,7 @@ pub mod ret {
     }
 }
 
-/// Indexed ISR event logs (`eth_getLogs` & WebSocket `logs`).
+/// Indexed HPS event logs (`eth_getLogs` & WebSocket `logs`).
 pub mod events {
     #[cfg(target_arch = "wasm32")]
     use crate::{layout, sys};
@@ -535,26 +535,26 @@ pub mod abi {
     }
 }
 
-/// Declare the Immortal Subroutine (`ISR`) entrypoint (`main`) and `#![no_std]` panic handler,
+/// Declare the Haltproof Subroutine (`HPS`) entrypoint (`main`) and `#![no_std]` panic handler,
 /// routing 4-byte ABI function selectors to Rust handler functions.
 ///
 /// Example:
 /// ```ignore
-/// isr_sdk::isr_entry! {
+/// hps_sdk::hps_entry! {
 ///     "increment(bytes32,uint64)" => handle_increment,
 ///     "getCount(bytes32)"         => handle_get_count,
 /// }
 /// ```
 #[macro_export]
-macro_rules! isr_entry {
+macro_rules! hps_entry {
     ( $( $sig:literal => $handler:ident ),+ $(,)? ) => {
         #[cfg(target_arch = "wasm32")]
         #[panic_handler]
-        fn _isr_panic(_info: &core::panic::PanicInfo) -> ! {
+        fn _hps_panic(_info: &core::panic::PanicInfo) -> ! {
             core::arch::wasm32::unreachable()
         }
 
-        /// ISR dispatch function (callable both from Wasmtime `main` and native `cargo test`).
+        /// HPS dispatch function (callable both from Wasmtime `main` and native `cargo test`).
         pub fn dispatch_calldata(raw: &[u8]) -> i32 {
             let Some((sel, reader)) = $crate::abi::CalldataReader::parse(raw) else {
                 return -1;

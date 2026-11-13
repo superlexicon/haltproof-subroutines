@@ -1,9 +1,9 @@
 [package]
-name = "isr-client"
+name = "hps-client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Rust client, EIP-155 signer, 2-step Immortal Subroutine (ISR) deployer, and ABI encoder for Lexicon"
+description = "Rust client, EIP-155 signer, 2-step Haltproof Subroutine (HPS) deployer, and ABI encoder for Lexicon"
 
 [dependencies]
 anyhow = "1.0"

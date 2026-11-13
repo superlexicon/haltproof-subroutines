@@ -27,7 +27,7 @@ export declare function signLexiconTransaction(
   params: SignLexiconTxParams
 ): string;
 
-export declare class IsrRpcClient {
+export declare class HpsRpcClient {
   rpcUrl: string;
   constructor(rpcUrl?: string);
   rpc(method: string, params?: unknown[]): Promise<any>;
@@ -36,14 +36,14 @@ export declare class IsrRpcClient {
   sendRawTransaction(rawTxHex: string): Promise<string>;
   readCall(to: string, data: string, from?: string): Promise<string>;
   waitForReceipt(txHash: string, timeoutMs?: number): Promise<any>;
-  deployIsr(
+  deployHps(
     ethersUtils: EthersV6Utils,
     privateKey: string,
     wasmHex: string,
     initArgsHex?: string
   ): Promise<{
     codeHash: string;
-    isrAddress: string;
+    hpsAddress: string;
     storeTxHash: string;
     deployTxHash: string;
     blockNumber: number;

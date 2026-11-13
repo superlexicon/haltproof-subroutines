@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/isr-sdk",
-    "crates/isr-client",
-    "crates/cargo-isr",
+    "crates/hps-sdk",
+    "crates/hps-client",
+    "crates/cargo-hps",
     "examples/counter-registry",
 ]
 

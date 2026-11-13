@@ -7,11 +7,11 @@ use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
-use isr_client::abi::{
+use hps_client::abi::{
     encode_call_from_strings, keccak256, try_decode_abi_bytes, try_decode_u256,
 };
-use isr_client::{
-    parse_address, IsrClient, IsrSigner, DEFAULT_CHAIN_ID, DEFAULT_DEV_PRIVATE_KEY,
+use hps_client::{
+    parse_address, HpsClient, HpsSigner, DEFAULT_CHAIN_ID, DEFAULT_DEV_PRIVATE_KEY,
 };
 use serde_json::json;
 
@@ -19,10 +19,10 @@ const MAX_LEXICON_BYTECODE_BYTES: usize = 100_000;
 
 #[derive(Parser)]
 #[command(
-    name = "cargo-isr",
-    bin_name = "cargo isr",
+    name = "cargo-hps",
+    bin_name = "cargo hps",
     version,
-    about = "Build, validate, deploy, and invoke Lexicon Wasmtime Immortal Subroutines (ISRs)"
+    about = "Build, validate, deploy, and invoke Lexicon Wasmtime Haltproof Subroutines (HPS)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -31,7 +31,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Scaffold a new Lexicon WASM Immortal Subroutine (ISR) project
+    /// Scaffold a new Lexicon WASM Haltproof Subroutine (HPS) project
     New {
         /// Project / crate name (e.g. my-counter)
         name: String,
@@ -40,7 +40,7 @@ enum Commands {
         path: Option<PathBuf>,
     },
 
-    /// Compile an ISR crate to wasm32-unknown-unknown, strip zero-data segments, and validate ABI
+    /// Compile an HPS crate to wasm32-unknown-unknown, strip zero-data segments, and validate ABI
     Build {
         /// Path to Cargo.toml (defaults to ./Cargo.toml)
         #[arg(long)]
@@ -56,7 +56,7 @@ enum Commands {
         keep_custom_sections: bool,
     },
 
-    /// Execute Lexicon's 2-step ISR deployment (store_bytecode + instantiate) in a single command
+    /// Execute Lexicon's 2-step HPS deployment (store_bytecode + instantiate) in a single command
     Deploy {
         /// Path to the compiled .wasm artifact (e.g. dist/counter_registry.wasm)
         wasm_path: PathBuf,
@@ -77,10 +77,10 @@ enum Commands {
         save: Option<PathBuf>,
     },
 
-    /// Submit a stateful Immortal Subroutine (ISR) invocation and wait for block confirmation
+    /// Submit a stateful Haltproof Subroutine (HPS) invocation and wait for block confirmation
     Send {
-        /// Deployed 20-byte ISR address (0x...)
-        isr: String,
+        /// Deployed 20-byte HPS address (0x...)
+        hps: String,
         /// Function signature, e.g. "increment(bytes32,uint64)"
         signature: String,
         /// Function arguments matching the signature types
@@ -96,10 +96,10 @@ enum Commands {
         chain_id: u64,
     },
 
-    /// Execute a read-only `eth_call` against committed Immortal Subroutine (ISR) state
+    /// Execute a read-only `eth_call` against committed Haltproof Subroutine (HPS) state
     Call {
-        /// Deployed 20-byte ISR address (0x...)
-        isr: String,
+        /// Deployed 20-byte HPS address (0x...)
+        hps: String,
         /// Function signature, e.g. "getCount(bytes32)"
         signature: String,
         /// Function arguments matching the signature types
@@ -126,10 +126,10 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Support both `cargo isr <cmd>` (where cargo passes "isr" as arg[1])
-    // and direct `cargo-isr <cmd>` invocation.
+    // Support both `cargo hps <cmd>` (where cargo passes "hps" as arg[1])
+    // and direct `cargo-hps <cmd>` invocation.
     let mut raw_args: Vec<String> = env::args().collect();
-    if raw_args.get(1).map(|s| s.as_str()) == Some("isr") {
+    if raw_args.get(1).map(|s| s.as_str()) == Some("hps") {
         raw_args.remove(1);
     }
     let cli = Cli::parse_from(raw_args);
@@ -151,19 +151,19 @@ async fn main() -> Result<()> {
             save,
         } => cmd_deploy(&wasm_path, &rpc, &private_key, chain_id, &init_args, save).await,
         Commands::Send {
-            isr,
+            hps,
             signature,
             args,
             rpc,
             private_key,
             chain_id,
-        } => cmd_send(&isr, &signature, &args, &rpc, &private_key, chain_id).await,
+        } => cmd_send(&hps, &signature, &args, &rpc, &private_key, chain_id).await,
         Commands::Call {
-            isr,
+            hps,
             signature,
             args,
             rpc,
-        } => cmd_call(&isr, &signature, &args, &rpc).await,
+        } => cmd_call(&hps, &signature, &args, &rpc).await,
         Commands::Keygen { dev } => cmd_keygen(dev),
         Commands::Status { rpc } => cmd_status(&rpc).await,
     }
@@ -178,10 +178,10 @@ fn cmd_new(name: &str, path: Option<PathBuf>) -> Result<()> {
     let sdk_dep = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
-        .map(|p| p.join("crates/isr-sdk"))
+        .map(|p| p.join("crates/hps-sdk"))
         .filter(|p| p.exists())
         .map(|p| format!("{{ path = \"{}\" }}", p.display()))
-        .unwrap_or_else(|| "{ git = \"https://github.com/superlexicon/immortal-subroutines.git\" }".to_string());
+        .unwrap_or_else(|| "{ git = \"https://github.com/superlexicon/haltproof-subroutines.git\" }".to_string());
 
     fs::create_dir_all(target_dir.join("src"))?;
     fs::create_dir_all(target_dir.join(".cargo"))?;
@@ -199,7 +199,7 @@ name = "{bin_name}"
 path = "src/main.rs"
 
 [dependencies]
-isr-sdk = {sdk_dep}
+hps-sdk = {sdk_dep}
 
 [profile.release]
 opt-level = "z"
@@ -220,13 +220,13 @@ rustflags = [
     let starter_src = r#"#![cfg_attr(target_arch = "wasm32", no_std)]
 #![cfg_attr(target_arch = "wasm32", no_main)]
 
-use isr_sdk::abi::CalldataReader;
-use isr_sdk::storage::KeyBuilder;
-use isr_sdk::{context, event_topic, events, isr_entry, ret, storage};
+use hps_sdk::abi::CalldataReader;
+use hps_sdk::storage::KeyBuilder;
+use hps_sdk::{context, event_topic, events, hps_entry, ret, storage};
 
 const COUNT_UPDATED: [u8; 32] = event_topic("CountUpdated(bytes32,address,uint64)");
 
-isr_entry! {
+hps_entry! {
     "increment(bytes32,uint64)" => handle_increment,
     "getCount(bytes32)"         => handle_get_count,
 }
@@ -260,7 +260,7 @@ fn handle_get_count(args: &CalldataReader) -> Result<(), i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use isr_sdk::{mock, selector};
+    use hps_sdk::{mock, selector};
 
     #[test]
     fn increments_and_reads_back() {
@@ -292,12 +292,12 @@ mod tests {
     fs::write(target_dir.join(".cargo/config.toml"), cargo_config)?;
     fs::write(target_dir.join("src/main.rs"), starter_src)?;
 
-    println!("Scaffolded new Immortal Subroutine (ISR) at {}", target_dir.display());
+    println!("Scaffolded new Haltproof Subroutine (HPS) at {}", target_dir.display());
     println!("Next steps:");
     println!("  cd {}", target_dir.display());
     println!("  cargo test                                  # fast native unit tests");
-    println!("  cargo isr build                             # compile & strip WASM");
-    println!("  cargo isr deploy dist/{bin_name}.wasm       # deploy to --localtestnet");
+    println!("  cargo hps build                             # compile & strip WASM");
+    println!("  cargo hps deploy dist/{bin_name}.wasm       # deploy to --localtestnet");
     Ok(())
 }
 
@@ -371,7 +371,7 @@ fn cmd_build(
         .replace('-', "_");
 
     println!(
-        "Compiling ISR `{}` for wasm32-unknown-unknown (release, 2 MiB linear memory)...",
+        "Compiling HPS `{}` for wasm32-unknown-unknown (release, 2 MiB linear memory)...",
         selected_pkg["name"].as_str().unwrap_or(&artifact_stem)
     );
 
@@ -426,7 +426,7 @@ fn cmd_build(
     fs::write(&out_wasm, &optimized_bytes)?;
 
     let meta_json = json!({
-        "isr": selected_pkg["name"],
+        "hps": selected_pkg["name"],
         "artifact": out_wasm.display().to_string(),
         "code_hash": code_hash,
         "raw_wasm_bytes": report.raw_size,
@@ -472,11 +472,11 @@ async fn cmd_deploy(
         hex::decode(clean_args).context("invalid hex in --init-args")?
     };
 
-    let signer = IsrSigner::from_hex(private_key, chain_id)?;
-    let client = IsrClient::new(rpc);
+    let signer = HpsSigner::from_hex(private_key, chain_id)?;
+    let client = HpsClient::new(rpc);
 
     println!(
-        "Deploying ISR {} ({} bytes) to {}...",
+        "Deploying HPS {} ({} bytes) to {}...",
         wasm_path.display(),
         wasm_bytes.len(),
         rpc
@@ -484,11 +484,11 @@ async fn cmd_deploy(
     println!("  Deployer   : {}", signer.address_hex());
 
     let receipt = client
-        .deploy_isr(&signer, &wasm_bytes, &init_args)
+        .deploy_hps(&signer, &wasm_bytes, &init_args)
         .await?;
 
     println!("Deployment confirmed in block #{}:", receipt.block_number);
-    println!("  ISR Addr   : {}", receipt.isr_address);
+    println!("  HPS Addr   : {}", receipt.hps_address);
     println!("  Code Hash  : {}", receipt.code_hash);
     println!("  Store Tx   : {}", receipt.store_tx_hash);
     println!("  Deploy Tx  : {}", receipt.deploy_tx_hash);
@@ -502,23 +502,23 @@ async fn cmd_deploy(
 }
 
 async fn cmd_send(
-    isr_str: &str,
+    hps_str: &str,
     signature: &str,
     args: &[String],
     rpc: &str,
     private_key: &str,
     chain_id: u64,
 ) -> Result<()> {
-    let isr = parse_address(isr_str)?;
+    let hps = parse_address(hps_str)?;
     let calldata = encode_call_from_strings(signature, args)?;
-    let signer = IsrSigner::from_hex(private_key, chain_id)?;
-    let client = IsrClient::new(rpc);
+    let signer = HpsSigner::from_hex(private_key, chain_id)?;
+    let client = HpsClient::new(rpc);
 
     println!(
-        "Invoking `{signature}` on ISR {isr_str} from {}...",
+        "Invoking `{signature}` on HPS {hps_str} from {}...",
         signer.address_hex()
     );
-    let outcome = client.send_call(&signer, isr, &calldata).await?;
+    let outcome = client.send_call(&signer, hps, &calldata).await?;
     println!("Transaction confirmed:");
     println!("  Tx Hash    : {}", outcome.tx_hash);
     println!(
@@ -541,22 +541,22 @@ async fn cmd_send(
         );
     }
     if !outcome.status {
-        bail!("ISR execution reverted / failed");
+        bail!("HPS execution reverted / failed");
     }
     Ok(())
 }
 
 async fn cmd_call(
-    isr_str: &str,
+    hps_str: &str,
     signature: &str,
     args: &[String],
     rpc: &str,
 ) -> Result<()> {
-    let isr = parse_address(isr_str)?;
+    let hps = parse_address(hps_str)?;
     let calldata = encode_call_from_strings(signature, args)?;
-    let client = IsrClient::new(rpc);
+    let client = HpsClient::new(rpc);
 
-    let ret = client.read_call(None, isr, &calldata).await?;
+    let ret = client.read_call(None, hps, &calldata).await?;
     println!("Raw Return   : 0x{}", hex::encode(&ret));
     if let Some(bytes_slice) = try_decode_abi_bytes(&ret) {
         if let Ok(utf8) = std::str::from_utf8(bytes_slice) {
@@ -572,12 +572,12 @@ async fn cmd_call(
 
 fn cmd_keygen(dev: bool) -> Result<()> {
     if dev {
-        let signer = IsrSigner::from_hex(DEFAULT_DEV_PRIVATE_KEY, DEFAULT_CHAIN_ID)?;
+        let signer = HpsSigner::from_hex(DEFAULT_DEV_PRIVATE_KEY, DEFAULT_CHAIN_ID)?;
         println!("Built-in `--localtestnet` Developer Account:");
         println!("  Address     : {}", signer.address_hex());
         println!("  Private Key : {DEFAULT_DEV_PRIVATE_KEY}");
     } else {
-        let (priv_hex, signer) = IsrSigner::generate_random(DEFAULT_CHAIN_ID);
+        let (priv_hex, signer) = HpsSigner::generate_random(DEFAULT_CHAIN_ID);
         println!("Generated New Lexicon Account:");
         println!("  Address     : {}", signer.address_hex());
         println!("  Private Key : {priv_hex}");
@@ -586,7 +586,7 @@ fn cmd_keygen(dev: bool) -> Result<()> {
 }
 
 async fn cmd_status(rpc: &str) -> Result<()> {
-    let client = IsrClient::new(rpc);
+    let client = HpsClient::new(rpc);
     let height = client.block_number().await?;
     let role = client.rpc_call("slx_role", json!([])).await.unwrap_or(json!(null));
     println!("Connected to Lexicon JSON-RPC at {rpc}");

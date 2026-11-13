@@ -1,9 +1,0 @@
-[package]
-name = "isr-sdk"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-description = "Guest Rust SDK for authoring deterministic WebAssembly Immortal Subroutines (ISRs) on Lexicon"
-
-[lib]
-path = "src/lib.rs"

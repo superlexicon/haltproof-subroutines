@@ -1,4 +1,4 @@
-//! Reference Lexicon WASM **Immortal Subroutine (ISR)** built with `isr-sdk`.
+//! Reference Lexicon WASM **Haltproof Subroutine (HPS)** built with `hps-sdk`.
 //!
 //! Supported ABI methods:
 //! - `increment(bytes32,uint64)` -> increments a named counter, records `msg.sender` + `block.number`, emits `CountUpdated`
@@ -10,14 +10,14 @@
 #![cfg_attr(target_arch = "wasm32", no_std)]
 #![cfg_attr(target_arch = "wasm32", no_main)]
 
-use isr_sdk::abi::CalldataReader;
-use isr_sdk::storage::KeyBuilder;
-use isr_sdk::{context, event_topic, events, isr_entry, ret, storage};
+use hps_sdk::abi::CalldataReader;
+use hps_sdk::storage::KeyBuilder;
+use hps_sdk::{context, event_topic, events, hps_entry, ret, storage};
 
 const COUNT_UPDATED: [u8; 32] = event_topic("CountUpdated(bytes32,address,uint64)");
 const NOTE_UPDATED: [u8; 32] = event_topic("NoteUpdated(bytes32,address,uint64)");
 
-isr_entry! {
+hps_entry! {
     "increment(bytes32,uint64)" => handle_increment,
     "getCount(bytes32)"         => handle_get_count,
     "setNote(bytes32,string)"   => handle_set_note,
@@ -98,7 +98,7 @@ fn handle_get_last_block(args: &CalldataReader) -> Result<(), i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use isr_sdk::{mock, selector};
+    use hps_sdk::{mock, selector};
 
     #[test]
     fn counter_and_notes_work_in_native_unit_tests() {
@@ -124,8 +124,8 @@ mod tests {
         let ret_bytes = mock::take_return_data();
         assert_eq!(&ret_bytes[24..32], &15u64.to_be_bytes());
 
-        // setNote(key, "hello immortal subroutine")
-        let msg = b"hello immortal subroutine";
+        // setNote(key, "hello haltproof subroutine")
+        let msg = b"hello haltproof subroutine";
         let mut note_cd = Vec::new();
         note_cd.extend_from_slice(&selector("setNote(bytes32,string)"));
         note_cd.extend_from_slice(&key);
@@ -139,7 +139,7 @@ mod tests {
         note_cd.resize(note_cd.len() + (32 - msg.len() % 32) % 32, 0);
         assert_eq!(dispatch_calldata(&note_cd), 0);
 
-        // getNote(key) -> ABI string "hello immortal subroutine"
+        // getNote(key) -> ABI string "hello haltproof subroutine"
         let mut gn = Vec::new();
         gn.extend_from_slice(&selector("getNote(bytes32)"));
         gn.extend_from_slice(&key);

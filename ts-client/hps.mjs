@@ -1,8 +1,8 @@
 /**
- * @lexicon/isr — Lightweight JavaScript/TypeScript client for Lexicon Immortal Subroutines (ISRs)
+ * @lexicon/hps — Lightweight JavaScript/TypeScript client for Lexicon Haltproof Subroutines (HPS)
  *
  * Implements Lexicon's 10-field EIP-155 RLP transaction encoding, 2-step WASM
- * ISR deployment (`0x000...0100` store + instantiate),
+ * HPS deployment (`0x000...0100` store + instantiate),
  * read-only `eth_call` queries, and receipt polling.
  *
  * Works with `ethers` v6 (`SigningKey`, `keccak256`, `encodeRlp`, `AbiCoder`, `id`)
@@ -76,7 +76,7 @@ export function signLexiconTransaction(ethersUtils, {
   ]);
 }
 
-export class IsrRpcClient {
+export class HpsRpcClient {
   constructor(rpcUrl = "http://127.0.0.1:8545") {
     this.rpcUrl = rpcUrl;
   }
@@ -124,9 +124,9 @@ export class IsrRpcClient {
   }
 
   /**
-   * 2-step content-addressed WASM Immortal Subroutine (ISR) deployment (store_bytecode + instantiate in 1 call).
+   * 2-step content-addressed WASM Haltproof Subroutine (HPS) deployment (store_bytecode + instantiate in 1 call).
    */
-  async deployIsr(ethersUtils, privateKey, wasmHex, initArgsHex = "0x") {
+  async deployHps(ethersUtils, privateKey, wasmHex, initArgsHex = "0x") {
     const address = ethersUtils.computeAddress(privateKey);
     const nonce = await this.getNonce(address);
     const cleanWasm = wasmHex.startsWith("0x") ? wasmHex.slice(2) : wasmHex;
@@ -162,7 +162,7 @@ export class IsrRpcClient {
 
     return {
       codeHash,
-      isrAddress: deployReceipt.contractAddress,
+      hpsAddress: deployReceipt.contractAddress,
       storeTxHash,
       deployTxHash,
       blockNumber: Number(BigInt(deployReceipt.blockNumber)),

@@ -1,6 +1,6 @@
-//! # `isr-client`
+//! # `hps-client`
 //!
-//! Pure-Rust transaction signer, 2-step WASM **Immortal Subroutine (ISR)** deployer,
+//! Pure-Rust transaction signer, 2-step WASM **Haltproof Subroutine (HPS)** deployer,
 //! ABI encoder, and JSON-RPC client for Lexicon (`--localtestnet` and multi-node radio subnets).
 
 pub mod abi;
@@ -30,8 +30,8 @@ pub const BYTECODE_STORE_ADDRESS: H160 = H160([
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
 ]);
 
-/// Compute deterministic Immortal Subroutine (ISR) address from `(sender, nonce)`.
-pub fn compute_isr_address(sender: H160, nonce: u64) -> H160 {
+/// Compute deterministic Haltproof Subroutine (HPS) address from `(sender, nonce)`.
+pub fn compute_hps_address(sender: H160, nonce: u64) -> H160 {
     let mut stream = RlpStream::new();
     stream.begin_list(2);
     stream.append(&sender);
@@ -42,7 +42,7 @@ pub fn compute_isr_address(sender: H160, nonce: u64) -> H160 {
 
 /// EIP-155 transaction signer using Lexicon's 10-field RLP wire format.
 #[derive(Clone)]
-pub struct IsrSigner {
+pub struct HpsSigner {
     secret_key: SecretKey,
     address: H160,
     pub chain_id: u64,
@@ -50,7 +50,7 @@ pub struct IsrSigner {
     pub default_gas_limit: U256,
 }
 
-impl IsrSigner {
+impl HpsSigner {
     pub fn from_hex(private_key_hex: &str, chain_id: u64) -> Result<Self> {
         let clean = private_key_hex.trim().strip_prefix("0x").unwrap_or(private_key_hex.trim());
         let bytes = hex::decode(clean).context("invalid hex private key")?;
@@ -150,7 +150,7 @@ impl IsrSigner {
         Ok(format!("0x{}", hex::encode(wire.out())))
     }
 
-    /// Build Step 1 of 2-step ISR deployment (`store_bytecode` to `0x000...0100`).
+    /// Build Step 1 of 2-step HPS deployment (`store_bytecode` to `0x000...0100`).
     pub fn build_store_bytecode_tx(&self, nonce: u64, wasm_bytes: &[u8]) -> Result<(H256, String)> {
         let code_hash_bytes = abi::keccak256(wasm_bytes);
         let mut data = Vec::with_capacity(32 + wasm_bytes.len());
@@ -161,7 +161,7 @@ impl IsrSigner {
         Ok((H256::from(code_hash_bytes), raw))
     }
 
-    /// Build Step 2 of 2-step ISR instantiation (`to = None`, `data = code_hash || init_args`).
+    /// Build Step 2 of 2-step HPS instantiation (`to = None`, `data = code_hash || init_args`).
     pub fn build_instantiate_tx(
         &self,
         nonce: u64,
@@ -171,21 +171,21 @@ impl IsrSigner {
         let mut data = Vec::with_capacity(32 + init_args.len());
         data.extend_from_slice(code_hash.as_bytes());
         data.extend_from_slice(init_args);
-        let derived_addr = compute_isr_address(self.address, nonce);
+        let derived_addr = compute_hps_address(self.address, nonce);
         let raw = self.sign_raw_tx(nonce, None, U256::zero(), &data, Some(self.default_gas_limit))?;
         Ok((derived_addr, raw))
     }
 
-    /// Build a signed ISR invocation transaction.
-    pub fn build_call_tx(&self, nonce: u64, isr: H160, calldata: &[u8]) -> Result<String> {
-        self.sign_raw_tx(nonce, Some(isr), U256::zero(), calldata, Some(self.default_gas_limit))
+    /// Build a signed HPS invocation transaction.
+    pub fn build_call_tx(&self, nonce: u64, hps: H160, calldata: &[u8]) -> Result<String> {
+        self.sign_raw_tx(nonce, Some(hps), U256::zero(), calldata, Some(self.default_gas_limit))
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IsrDeployReceipt {
+pub struct HpsDeployReceipt {
     pub code_hash: String,
-    pub isr_address: String,
+    pub hps_address: String,
     pub store_tx_hash: String,
     pub deploy_tx_hash: String,
     pub block_number: u64,
@@ -198,20 +198,20 @@ pub struct TxOutcome {
     pub status: bool,
     pub block_number: u64,
     pub gas_used: u64,
-    pub isr_address: Option<String>,
+    pub hps_address: Option<String>,
     pub logs: Vec<Value>,
     pub raw: Value,
 }
 
 /// Async JSON-RPC client for interacting with `lexicon-node` (`--localtestnet` or live subnets).
 #[derive(Clone)]
-pub struct IsrClient {
+pub struct HpsClient {
     http: Client,
     rpc_url: String,
     pub receipt_timeout: Duration,
 }
 
-impl IsrClient {
+impl HpsClient {
     pub fn new(rpc_url: impl Into<String>) -> Self {
         let http = Client::builder()
             .timeout(Duration::from_secs(15))
@@ -289,14 +289,14 @@ impl IsrClient {
                 let block_number = parse_hex_u64(r["blockNumber"].as_str().unwrap_or("0x0")).unwrap_or(0);
                 let gas_used = parse_hex_u64(r["gasUsed"].as_str().unwrap_or("0x0")).unwrap_or(0);
                 // Underlying JSON-RPC wire field is named `contractAddress` for Ethereum RPC compatibility.
-                let isr_address = r["contractAddress"].as_str().map(|s| s.to_string());
+                let hps_address = r["contractAddress"].as_str().map(|s| s.to_string());
                 let logs = r["logs"].as_array().cloned().unwrap_or_default();
                 return Ok(TxOutcome {
                     tx_hash: tx_hash.to_string(),
                     status,
                     block_number,
                     gas_used,
-                    isr_address,
+                    hps_address,
                     logs,
                     raw: r,
                 });
@@ -309,16 +309,16 @@ impl IsrClient {
         );
     }
 
-    /// Deploy a compiled WASM Immortal Subroutine (ISR) in one function call!
+    /// Deploy a compiled WASM Haltproof Subroutine (HPS) in one function call!
     ///
     /// Automatically submits Step 1 (`store_bytecode` at `nonce`) and Step 2 (`instantiate`
     /// at `nonce + 1`) back-to-back so on `--localtestnet` both confirm in the very same 4s block!
-    pub async fn deploy_isr(
+    pub async fn deploy_hps(
         &self,
-        signer: &IsrSigner,
+        signer: &HpsSigner,
         wasm_bytes: &[u8],
         init_args: &[u8],
-    ) -> Result<IsrDeployReceipt> {
+    ) -> Result<HpsDeployReceipt> {
         let nonce = self.get_nonce(signer.address()).await?;
         let (code_hash, store_raw) = signer.build_store_bytecode_tx(nonce, wasm_bytes)?;
         let (expected_addr, deploy_raw) =
@@ -336,13 +336,13 @@ impl IsrClient {
             bail!("instantiate transaction {deploy_tx_hash} failed: {}", deploy_rcpt.raw);
         }
 
-        let isr_address = deploy_rcpt
-            .isr_address
+        let hps_address = deploy_rcpt
+            .hps_address
             .unwrap_or_else(|| format!("0x{}", hex::encode(expected_addr.as_bytes())));
 
-        Ok(IsrDeployReceipt {
+        Ok(HpsDeployReceipt {
             code_hash: format!("0x{}", hex::encode(code_hash.as_bytes())),
-            isr_address,
+            hps_address,
             store_tx_hash,
             deploy_tx_hash,
             block_number: deploy_rcpt.block_number,
@@ -350,27 +350,27 @@ impl IsrClient {
         })
     }
 
-    /// Sign, submit, and await confirmation of a stateful ISR invocation.
+    /// Sign, submit, and await confirmation of a stateful HPS invocation.
     pub async fn send_call(
         &self,
-        signer: &IsrSigner,
-        isr: H160,
+        signer: &HpsSigner,
+        hps: H160,
         calldata: &[u8],
     ) -> Result<TxOutcome> {
         let nonce = self.get_nonce(signer.address()).await?;
-        let raw_tx = signer.build_call_tx(nonce, isr, calldata)?;
+        let raw_tx = signer.build_call_tx(nonce, hps, calldata)?;
         let tx_hash = self.send_raw_transaction(&raw_tx).await?;
         self.wait_for_receipt(&tx_hash).await
     }
 
-    /// Execute a read-only `eth_call` against committed ISR state (consumes 0 blocks / 0 txns).
+    /// Execute a read-only `eth_call` against committed HPS state (consumes 0 blocks / 0 txns).
     pub async fn read_call(
         &self,
         from: Option<H160>,
-        isr: H160,
+        hps: H160,
         calldata: &[u8],
     ) -> Result<Vec<u8>> {
-        let to_hex = format!("0x{}", hex::encode(isr.as_bytes()));
+        let to_hex = format!("0x{}", hex::encode(hps.as_bytes()));
         let data_hex = format!("0x{}", hex::encode(calldata));
         let mut req_obj = json!({
             "to": to_hex,

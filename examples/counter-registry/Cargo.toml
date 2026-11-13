@@ -3,11 +3,11 @@ name = "counter-registry"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Reference Lexicon WASM Immortal Subroutine (ISR) demonstrating counters, dynamic notes, events, and read calls"
+description = "Reference Lexicon WASM Haltproof Subroutine (HPS) demonstrating counters, dynamic notes, events, and read calls"
 
 [[bin]]
 name = "counter_registry"
 path = "src/main.rs"
 
 [dependencies]
-isr-sdk = { path = "../../crates/isr-sdk" }
+hps-sdk = { path = "../../crates/hps-sdk" }

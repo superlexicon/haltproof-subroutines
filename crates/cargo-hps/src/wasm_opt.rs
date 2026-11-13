@@ -191,7 +191,7 @@ pub fn optimize_and_validate_wasm(raw: &[u8], strip_custom_sections: bool) -> Re
 
                     if module != "env" || !ALLOWED_ENV_IMPORTS.contains(&field) {
                         bail!(
-                            "ISR imports unsupported host function `{module}::{field}`.\n\
+                            "HPS imports unsupported host function `{module}::{field}`.\n\
                              Allowed Lexicon WasmtimeAdapter imports: env::{{{}}}",
                             ALLOWED_ENV_IMPORTS.join(", ")
                         );
@@ -268,7 +268,7 @@ pub fn optimize_and_validate_wasm(raw: &[u8], strip_custom_sections: bool) -> Re
     if !exports.iter().any(|e| e == "main") {
         bail!(
             "compiled WASM module does not export `main(i32, i32) -> i32` \
-             (use `isr_sdk::isr_entry! {{ ... }}`)"
+             (use `hps_sdk::hps_entry! {{ ... }}`)"
         );
     }
     let min_pages = initial_memory_pages.unwrap_or(0);
