@@ -573,10 +573,17 @@ macro_rules! isr_entry {
             -2
         }
 
-        #[cfg_attr(target_arch = "wasm32", no_mangle)]
+        #[cfg(target_arch = "wasm32")]
+        #[no_mangle]
         pub extern "C" fn main(_argc: i32, _argv: i32) -> i32 {
             let cd = $crate::context::calldata();
             dispatch_calldata(cd)
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        fn main() {
+            let cd = $crate::context::calldata();
+            let _ = dispatch_calldata(cd);
         }
     };
 }
