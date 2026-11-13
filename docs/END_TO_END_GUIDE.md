@@ -21,10 +21,14 @@ Lexicon models replicated on-chain programs as **Haltproof Subroutines (HPS)** â
 ## 2. Environment Setup
 
 ```bash
-# 1. Ensure the Rust WASM target is installed
+# 1. Install the prebuilt `lexicon-node` binary (from superlexicon/lexicon-bin)
+git clone https://github.com/superlexicon/lexicon-bin.git
+(cd lexicon-bin && bash install.sh)
+
+# 2. Ensure the Rust WASM target is installed
 rustup target add wasm32-unknown-unknown
 
-# 2. Install the `cargo hps` CLI from this repository
+# 3. Install the `cargo hps` CLI from this repository
 cd /path/to/haltproof-subroutines
 cargo install --path crates/cargo-hps
 ```

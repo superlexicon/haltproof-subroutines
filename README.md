@@ -23,7 +23,14 @@ Zero C++/RocksDB dependencies are required to build Haltproof Subroutines or run
 
 ### 1. Prerequisites
 
+Install the prebuilt [`lexicon-node`](https://github.com/superlexicon/lexicon-bin) binary and the `cargo hps` CLI:
+
 ```bash
+# Install lexicon-node -> ~/.local/bin/lexicon-node
+git clone https://github.com/superlexicon/lexicon-bin.git
+(cd lexicon-bin && bash install.sh)
+
+# Install WASM target & cargo-hps
 rustup target add wasm32-unknown-unknown
 cargo install --path crates/cargo-hps
 ```
