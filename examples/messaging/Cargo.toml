@@ -1,0 +1,13 @@
+[package]
+name = "messaging"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "High-TPS channel messaging Haltproof Subroutine (HPS) compatible with Lexicon's throughput benchmark suite"
+
+[[bin]]
+name = "messaging"
+path = "src/main.rs"
+
+[dependencies]
+hps-sdk = { path = "../../crates/hps-sdk" }

@@ -5,6 +5,10 @@ members = [
     "crates/hps-client",
     "crates/cargo-hps",
     "examples/counter-registry",
+    "examples/messaging",
+    "examples/asset-ledger",
+    "examples/identity",
+    "examples/asset-pair-otc",
 ]
 
 [workspace.package]

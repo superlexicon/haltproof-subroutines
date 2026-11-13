@@ -7,10 +7,10 @@
 //! - Provides compile-time `const fn` Keccak-256 selectors (`selector("fn(bytes32,uint64)")`)
 //!   and event topic hashes (`event_topic("Updated(bytes32,uint64)")`).
 //! - Provides safe wrappers for HPS persistent state (`storage`), execution context (`context`),
-//!   ABI calldata decoding (`abi::CalldataReader`), structured return payloads (`ret`),
-//!   and indexed event emission (`events`).
-//! - Includes an in-memory host simulator (`mock`) on non-`wasm32` targets so Haltproof Subroutines
-//!   can be unit-tested natively with `cargo test` in milliseconds.
+//!   synchronous cross-HPS calls (`call`), ABI calldata decoding (`abi::CalldataReader`),
+//!   structured return payloads (`ret`), and indexed event emission (`events`).
+//! - Includes a multi-HPS in-memory host simulator (`mock`) on non-`wasm32` targets so single
+//!   and multi-subroutine workflows can be unit-tested natively with `cargo test` in milliseconds.
 
 #![cfg_attr(target_arch = "wasm32", no_std)]
 
@@ -21,6 +21,9 @@ pub mod layout {
     pub const CALLDATA_BUF: usize = 0x10000;
     pub const CALLDATA_CAP: usize = 0x10000; // 64 KiB
     pub const SENDER_BUF: usize = 0x20000;
+    pub const SELF_ADDR_BUF: usize = 0x20020;
+    pub const SUBCALL_RET_BUF: usize = 0x22000;
+    pub const SUBCALL_RET_CAP: usize = 0x8000; // 32 KiB
     pub const KEY_BUF: usize = 0x30000;
     pub const KEY_CAP: usize = 0x10000;
     /// Fixed address where `WasmtimeAdapter::host_state_get` writes retrieved values.
@@ -44,12 +47,20 @@ mod sys {
         pub fn host_state_exists(key_ptr: i32, key_len: i32) -> i32;
         pub fn get_calldata(buf_ptr: i32) -> i32;
         pub fn get_msg_sender(buf_ptr: i32);
+        pub fn get_self_address(buf_ptr: i32);
         pub fn get_block_number(buf_ptr: i32);
         pub fn host_emit_event(topics_ptr: i32, topics_len: i32, data_ptr: i32, data_len: i32);
+        pub fn host_call_contract(
+            target_ptr: i32,
+            cd_ptr: i32,
+            cd_len: i32,
+            ret_ptr: i32,
+            ret_cap: i32,
+        ) -> i32;
     }
 }
 
-/// Native in-memory host simulator enabled automatically during `cargo test` on host targets.
+/// Native in-memory multi-HPS host simulator enabled automatically during `cargo test` on host targets.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod mock {
     use std::cell::RefCell;
@@ -57,15 +68,21 @@ pub mod mock {
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct EmittedEvent {
+        pub address: [u8; 20],
         pub topics: Vec<[u8; 32]>,
         pub data: Vec<u8>,
     }
 
+    pub type DispatchFn = fn(&[u8]) -> i32;
+
     #[derive(Default)]
     pub(crate) struct MockHost {
-        pub state: BTreeMap<Vec<u8>, Vec<u8>>,
+        /// Per-HPS isolated key-value state: `address -> (key -> val)`
+        pub states: BTreeMap<[u8; 20], BTreeMap<Vec<u8>, Vec<u8>>>,
+        pub handlers: BTreeMap<[u8; 20], DispatchFn>,
         pub calldata: Vec<u8>,
         pub sender: [u8; 20],
+        pub self_address: [u8; 20],
         pub block_number: u64,
         pub events: Vec<EmittedEvent>,
         pub return_data: Vec<u8>,
@@ -83,8 +100,18 @@ pub mod mock {
         HOST.with(|h| h.borrow_mut().sender = sender);
     }
 
+    pub fn set_self_address(self_address: [u8; 20]) {
+        HOST.with(|h| h.borrow_mut().self_address = self_address);
+    }
+
     pub fn set_block_number(block_number: u64) {
         HOST.with(|h| h.borrow_mut().block_number = block_number);
+    }
+
+    pub fn register_hps(address: [u8; 20], handler: DispatchFn) {
+        HOST.with(|h| {
+            h.borrow_mut().handlers.insert(address, handler);
+        });
     }
 
     pub fn set_calldata(calldata: &[u8]) {
@@ -93,6 +120,36 @@ pub mod mock {
             b.calldata = calldata.to_vec();
             b.return_data.clear();
         });
+    }
+
+    /// Execute a registered HPS as a top-level transaction with atomic revert semantics on `ret < 0`.
+    pub fn transact_as(sender: [u8; 20], target: [u8; 20], calldata: &[u8]) -> Result<Vec<u8>, i32> {
+        let handler = HOST.with(|h| h.borrow().handlers.get(&target).copied()).ok_or(-101)?;
+        let snapshot = HOST.with(|h| {
+            let mut b = h.borrow_mut();
+            let snap = (b.states.clone(), b.events.len(), b.sender, b.self_address, b.calldata.clone());
+            b.sender = sender;
+            b.self_address = target;
+            b.calldata = calldata.to_vec();
+            b.return_data.clear();
+            snap
+        });
+
+        let code = handler(calldata);
+        HOST.with(|h| {
+            let mut b = h.borrow_mut();
+            b.sender = snapshot.2;
+            b.self_address = snapshot.3;
+            b.calldata = snapshot.4;
+            if code >= 0 {
+                Ok(std::mem::take(&mut b.return_data))
+            } else {
+                b.states = snapshot.0;
+                b.events.truncate(snapshot.1);
+                b.return_data.clear();
+                Err(code)
+            }
+        })
     }
 
     pub fn take_return_data() -> Vec<u8> {
@@ -122,7 +179,7 @@ pub const fn event_topic(signature: &str) -> [u8; 32] {
     keccak::keccak256(signature.as_bytes())
 }
 
-/// Execution context queries (`msg.sender`, `block.number`, and `calldata`).
+/// Execution context queries (`msg.sender`, `self_address`, `block.number`, and `calldata`).
 pub mod context {
     #[cfg(target_arch = "wasm32")]
     use crate::{layout, sys};
@@ -167,6 +224,21 @@ pub mod context {
         }
     }
 
+    /// Return this Haltproof Subroutine's own 20-byte contract address (`address(this)`).
+    pub fn self_address() -> [u8; 20] {
+        #[cfg(target_arch = "wasm32")]
+        unsafe {
+            sys::get_self_address(layout::SELF_ADDR_BUF as i32);
+            let mut out = [0u8; 20];
+            core::ptr::copy_nonoverlapping(layout::SELF_ADDR_BUF as *const u8, out.as_mut_ptr(), 20);
+            out
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            crate::mock::HOST.with(|h| h.borrow().self_address)
+        }
+    }
+
     /// Return the chain-assigned block height of the current block.
     pub fn block_number() -> u64 {
         #[cfg(target_arch = "wasm32")]
@@ -195,7 +267,13 @@ pub mod storage {
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            crate::mock::HOST.with(|h| h.borrow().state.contains_key(key))
+            crate::mock::HOST.with(|h| {
+                let b = h.borrow();
+                b.states
+                    .get(&b.self_address)
+                    .map(|m| m.contains_key(key))
+                    .unwrap_or(false)
+            })
         }
     }
 
@@ -217,7 +295,7 @@ pub mod storage {
         {
             crate::mock::HOST.with(|h| {
                 let b = h.borrow();
-                let v = b.state.get(key)?;
+                let v = b.states.get(&b.self_address)?.get(key)?;
                 if v.is_empty() {
                     return None;
                 }
@@ -246,7 +324,7 @@ pub mod storage {
         {
             crate::mock::HOST.with(|h| {
                 let b = h.borrow();
-                let v = b.state.get(key)?;
+                let v = b.states.get(&b.self_address)?.get(key)?;
                 if v.is_empty() {
                     return None;
                 }
@@ -270,10 +348,12 @@ pub mod storage {
         {
             crate::mock::HOST.with(|h| {
                 let mut b = h.borrow_mut();
+                let addr = b.self_address;
+                let map = b.states.entry(addr).or_default();
                 if val.is_empty() {
-                    b.state.remove(key);
+                    map.remove(key);
                 } else {
-                    b.state.insert(key.to_vec(), val.to_vec());
+                    map.insert(key.to_vec(), val.to_vec());
                 }
             });
         }
@@ -291,6 +371,20 @@ pub mod storage {
     /// Write a little-endian `u64` counter/value under `key`.
     pub fn set_u64(key: &[u8], val: u64) {
         set(key, &val.to_le_bytes());
+    }
+
+    /// Read a fixed 20-byte `address` under `key`.
+    pub fn get_address(key: &[u8]) -> Option<[u8; 20]> {
+        let mut buf = [0u8; 20];
+        match get_into(key, &mut buf) {
+            Some(20) => Some(buf),
+            _ => None,
+        }
+    }
+
+    /// Write a fixed 20-byte `address` under `key`.
+    pub fn set_address(key: &[u8], addr: &[u8; 20]) {
+        set(key, addr);
     }
 
     /// Read a fixed 32-byte word under `key`.
@@ -329,8 +423,117 @@ pub mod storage {
             self.push(&val.to_be_bytes())
         }
 
+        pub fn push_u64_le(self, val: u64) -> Self {
+            self.push(&val.to_le_bytes())
+        }
+
         pub fn as_slice(&self) -> &[u8] {
             &self.buf[..self.len]
+        }
+    }
+}
+
+/// Synchronous cross-HPS calls (`host_call_contract`) with atomic revert rollback on failure.
+pub mod call {
+    #[cfg(target_arch = "wasm32")]
+    use crate::{layout, sys};
+
+    /// Stack-allocated ABI calldata builder for `#![no_std]` cross-HPS invocations.
+    pub struct CallEncoder<const CAP: usize = 256> {
+        buf: [u8; CAP],
+        len: usize,
+    }
+
+    impl<const CAP: usize> CallEncoder<CAP> {
+        pub fn new(selector: [u8; 4]) -> Self {
+            let mut buf = [0u8; CAP];
+            buf[0..4].copy_from_slice(&selector);
+            Self { buf, len: 4 }
+        }
+
+        pub fn push_word(mut self, word: &[u8; 32]) -> Self {
+            if self.len + 32 <= CAP {
+                self.buf[self.len..self.len + 32].copy_from_slice(word);
+                self.len += 32;
+            }
+            self
+        }
+
+        pub fn push_address(self, addr: &[u8; 20]) -> Self {
+            let mut w = [0u8; 32];
+            w[12..32].copy_from_slice(addr);
+            self.push_word(&w)
+        }
+
+        pub fn push_u64(self, val: u64) -> Self {
+            let mut w = [0u8; 32];
+            w[24..32].copy_from_slice(&val.to_be_bytes());
+            self.push_word(&w)
+        }
+
+        pub fn push_bool(self, val: bool) -> Self {
+            self.push_u64(if val { 1 } else { 0 })
+        }
+
+        pub fn push_bytes32(self, b: &[u8; 32]) -> Self {
+            self.push_word(b)
+        }
+
+        pub fn as_slice(&self) -> &[u8] {
+            &self.buf[..self.len]
+        }
+    }
+
+    /// Invoke another deployed Haltproof Subroutine synchronously with `msg.sender = self_address()`.
+    ///
+    /// On `Ok(slice)`, returns the callee's return buffer payload (`SUBCALL_RET_BUF`).
+    /// On `Err(code)`, the callee reverted (`code < 0`) and any state writes made inside the
+    /// callee were atomically rolled back by the host.
+    pub fn call_raw(target: &[u8; 20], calldata: &[u8]) -> Result<&'static [u8], i32> {
+        #[cfg(target_arch = "wasm32")]
+        unsafe {
+            let res = sys::host_call_contract(
+                target.as_ptr() as i32,
+                calldata.as_ptr() as i32,
+                calldata.len() as i32,
+                layout::SUBCALL_RET_BUF as i32,
+                layout::SUBCALL_RET_CAP as i32,
+            );
+            if res < 0 {
+                return Err(res);
+            }
+            let n = (res as usize).min(layout::SUBCALL_RET_CAP);
+            Ok(core::slice::from_raw_parts(layout::SUBCALL_RET_BUF as *const u8, n))
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let caller_self = crate::mock::HOST.with(|h| h.borrow().self_address);
+            let out = crate::mock::transact_as(caller_self, *target, calldata)?;
+            if out.is_empty() {
+                Ok(&[] as &'static [u8])
+            } else {
+                Ok(Box::leak(out.into_boxed_slice()) as &'static [u8])
+            }
+        }
+    }
+
+    /// Invoke another HPS and decode an ABI 32-byte `uint64` return word.
+    pub fn call_u64(target: &[u8; 20], calldata: &[u8]) -> Result<u64, i32> {
+        let ret = call_raw(target, calldata)?;
+        if ret.len() < 32 || ret[0..24] != [0u8; 24] {
+            return Err(-104);
+        }
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&ret[24..32]);
+        Ok(u64::from_be_bytes(b))
+    }
+
+    /// Invoke another HPS and decode an ABI 32-byte `bool` return word.
+    pub fn call_bool(target: &[u8; 20], calldata: &[u8]) -> Result<bool, i32> {
+        match call_u64(target, calldata)? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(-104),
         }
     }
 }
@@ -365,6 +568,18 @@ pub mod ret {
     pub fn write_u64_word(val: u64) {
         let mut word = [0u8; 32];
         word[24..32].copy_from_slice(&val.to_be_bytes());
+        write(&word);
+    }
+
+    /// Return an ABI-encoded `bool` word.
+    pub fn write_bool(val: bool) {
+        write_u64_word(if val { 1 } else { 0 });
+    }
+
+    /// Return an ABI-encoded 20-byte `address` word (left-padded with 12 zero bytes).
+    pub fn write_address(addr: &[u8; 20]) {
+        let mut word = [0u8; 32];
+        word[12..32].copy_from_slice(addr);
         write(&word);
     }
 
@@ -434,7 +649,10 @@ pub mod events {
         #[cfg(not(target_arch = "wasm32"))]
         {
             crate::mock::HOST.with(|h| {
-                h.borrow_mut().events.push(crate::mock::EmittedEvent {
+                let mut b = h.borrow_mut();
+                let addr = b.self_address;
+                b.events.push(crate::mock::EmittedEvent {
+                    address: addr,
                     topics: topics.iter().take(4).copied().collect(),
                     data: data.to_vec(),
                 });
@@ -458,6 +676,11 @@ pub mod abi {
             }
             let sel = [calldata[0], calldata[1], calldata[2], calldata[3]];
             Some((sel, Self { args: &calldata[4..] }))
+        }
+
+        /// Raw argument slice after the 4-byte selector.
+        pub fn raw_args(&self) -> &'a [u8] {
+            self.args
         }
 
         /// Read static 32-byte head word `index` (`0`, `1`, ...).
@@ -535,6 +758,43 @@ pub mod abi {
     }
 }
 
+/// Conversion trait allowing `hps_entry!` handlers to return either `Result<(), i32>` or `Result<i32, i32>`.
+pub trait IntoHpsReturn {
+    fn into_hps_return(self) -> i32;
+}
+
+impl IntoHpsReturn for Result<(), i32> {
+    #[inline]
+    fn into_hps_return(self) -> i32 {
+        match self {
+            Ok(()) => 0,
+            Err(code) => {
+                if code < 0 {
+                    code
+                } else {
+                    -code.max(1)
+                }
+            }
+        }
+    }
+}
+
+impl IntoHpsReturn for Result<i32, i32> {
+    #[inline]
+    fn into_hps_return(self) -> i32 {
+        match self {
+            Ok(v) => v.max(0),
+            Err(code) => {
+                if code < 0 {
+                    code
+                } else {
+                    -code.max(1)
+                }
+            }
+        }
+    }
+}
+
 /// Declare the Haltproof Subroutine (`HPS`) entrypoint (`main`) and `#![no_std]` panic handler,
 /// routing 4-byte ABI function selectors to Rust handler functions.
 ///
@@ -563,10 +823,7 @@ macro_rules! hps_entry {
                 {
                     const SEL: [u8; 4] = $crate::selector($sig);
                     if sel == SEL {
-                        return match $handler(&reader) {
-                            Ok(()) => 0,
-                            Err(code) => if code < 0 { code } else { -code.max(1) },
-                        };
+                        return $crate::IntoHpsReturn::into_hps_return($handler(&reader));
                     }
                 }
             )+

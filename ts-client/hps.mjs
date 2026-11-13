@@ -35,11 +35,16 @@ export function signLexiconTransaction(ethersUtils, {
   gasLimit = 5_000_000n,
   gasPrice = 1_000_000_000n,
   chainId = DEFAULT_CHAIN_ID,
+  extraTargets = [],
 }) {
   const { SigningKey, keccak256, encodeRlp } = ethersUtils;
   const signingKey = new SigningKey(privateKey);
   const toRlp = to ? to.toLowerCase() : "0x";
   const targetAddresses = to ? [to.toLowerCase()] : [];
+  for (const t of extraTargets) {
+    const low = t.toLowerCase();
+    if (!targetAddresses.includes(low)) targetAddresses.push(low);
+  }
 
   // 10-item EIP-155 signing preimage:
   // [nonce, gas_price, gas_limit, to, value, data, target_addresses, chain_id, 0, 0]

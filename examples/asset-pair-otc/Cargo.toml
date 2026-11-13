@@ -1,0 +1,13 @@
+[package]
+name = "asset-pair-otc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "AssetPair_OTC Haltproof Subroutine (HPS) pairing Base & Quote Asset Ledgers for atomic Identity-to-Identity OTC ask/buy settlement"
+
+[[bin]]
+name = "asset_pair_otc"
+path = "src/main.rs"
+
+[dependencies]
+hps-sdk = { path = "../../crates/hps-sdk" }

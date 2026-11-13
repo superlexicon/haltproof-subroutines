@@ -1,6 +1,6 @@
 # End-to-End Haltproof Subroutine (HPS) & App Developer Guide
 
-This guide walks through developing, testing, compiling, deploying, and integrating a **Haltproof Subroutine-driven application** on Lexicon using `haltproof-subroutines` (`cargo hps`) and `lexicon-node --localtestnet`.
+This guide walks through developing, testing, compiling, deploying, and integrating **Haltproof Subroutine-driven applications** on Lexicon using `haltproof-subroutines` (`cargo hps`) and `lexicon-node --localtestnet` — from single-subroutine state machines to composable multi-HPS workflows (`Identity` + `AssetLedger` + `AssetPair_OTC`).
 
 ---
 
@@ -9,12 +9,13 @@ This guide walks through developing, testing, compiling, deploying, and integrat
 Lexicon models replicated on-chain programs as **Haltproof Subroutines (HPS)** — deterministic, fuel-bounded state-transition subroutines replicated across ISP-independent broadcast radio subnets that neither hang individual nodes nor depend on centralized cloud infrastructure or token fee markets:
 
 1. **Deterministic, Fuel-Bounded WASM Execution**: Written in `#![no_std]` Rust using `hps-sdk` and compiled to WebAssembly (`wasm32-unknown-unknown`) executed by Lexicon's **Wasmtime** VM (`1 fuel = 1 gas`, strictly bounded per call so every invocation is guaranteed to terminate cleanly).
-2. **Zero-Fee Operations (No Token Balance Required)**: Users and apps never need native tokens to deploy or invoke Haltproof Subroutines. Spam is bounded structurally via per-transaction fuel caps (`10,000,000` gas), per-account nonce horizons, and physical RF TDMA/LBT rules.
-3. **2-Step Content-Addressed Deployment**:
+2. **Synchronous Cross-HPS Calls & Atomic Rollback**: Subroutines can invoke other deployed subroutines synchronously via `hps_sdk::call` (`host_call_contract`, up to depth `8`), sharing the transaction's fuel budget with automatic state rollback if any nested or top-level call returns `< 0` or traps.
+3. **Zero-Fee Operations (No Token Balance Required)**: Users and apps never need native tokens to deploy or invoke Haltproof Subroutines. Spam is bounded structurally via per-transaction fuel caps (`10,000,000` gas), per-account nonce horizons, and physical RF TDMA/LBT rules.
+4. **2-Step Content-Addressed Deployment**:
    - **Step 1 (`store_bytecode`)**: Uploads `[32-byte keccak256(wasm)] || [wasm]` to `0x0000000000000000000000000000000000000100`.
    - **Step 2 (`instantiate`)**: Sends `to = null` with `[32-byte code_hash] || [init_args]`, binding an HPS instance at `keccak256(rlp(sender, nonce))[12:]`.
    - `cargo hps deploy`, `HpsClient::deploy_hps`, and `HpsRpcClient.deployHps` execute **both steps automatically in a single call** (confirming together in a single 4-second block on `--localtestnet`).
-4. **Local vs Subnet Parity**: `lexicon-node --localtestnet` runs the exact same JSON-RPC, WebSocket, `LayeredMempool`, `WasmtimeAdapter`, `NetworkState`, and RocksDB `FlatKvDb` storage as a live multi-validator radio subnet — simply replacing over-the-air TDMA rounds with a 1-node 4-second block timer.
+5. **Local vs Subnet Parity**: `lexicon-node --localtestnet` runs the exact same JSON-RPC, WebSocket, `LayeredMempool`, `WasmtimeAdapter`, `NetworkState`, and RocksDB `FlatKvDb` storage as a live multi-validator radio subnet — simply replacing over-the-air TDMA rounds with a 1-node 4-second block timer.
 
 ---
 
@@ -121,57 +122,93 @@ fn handle_get_count(args: &CalldataReader) -> Result<(), i32> {
 | :--- | :--- | :--- |
 | `hps_sdk` | `selector("fn(type1,type2)")` | `const fn` 4-byte function selector |
 | `hps_sdk` | `event_topic("Ev(type1,type2)")` | `const fn` 32-byte `topic[0]` hash |
-| `context` | `context::msg_sender() -> [u8; 20]` | Verified ECDSA sender of the transaction |
+| `context` | `context::msg_sender() -> [u8; 20]` | Immediate caller (`EOA` for top-level tx, or calling HPS address during a cross-HPS subcall) |
+| `context` | `context::self_address() -> [u8; 20]` | 20-byte address of the currently executing HPS instance |
 | `context` | `context::block_number() -> u64` | Current chain block height |
 | `storage` | `storage::get_u64(k)` / `set_u64(k, v)` | Read/write `u64` counters (`0` if unset) |
+| `storage` | `storage::get_address(k)` / `set_address(k, a)` | Read/write 20-byte addresses |
 | `storage` | `storage::get_ref(k)` / `set(k, bytes)` | Read/write arbitrary byte slices (`set(k, &[])` deletes) |
 | `storage` | `storage::exists(k) -> bool` | Check if a storage key is non-empty |
+| `call` | `CallEncoder::<CAP>::new(sel)` | Encode fixed-word cross-HPS ABI calldata (`push_address`, `push_u64`, `push_bytes32`, `push_bool`) |
+| `call` | `call::call_raw`, `call_u64`, `call_bool` | Synchronously invoke another HPS (`msg.sender` inside target becomes `self_address()`) |
 | `abi` | `args.bytes32(i)`, `args.u64(i)`, `args.address(i)`, `args.bool(i)`, `args.dynamic_bytes(i)` | Bounds-checked ABI argument decoders safe on 32-bit WASM |
-| `ret` | `ret::write_u64_word(v)`, `ret::write_abi_bytes(b)`, `ret::write(raw)` | Populate `RETURN_BUF` (`0x70000`) for read calls |
+| `ret` | `ret::write_u64_word(v)`, `write_bool(b)`, `write_address(a)`, `write_abi_bytes(b)`, `write(raw)` | Populate `RETURN_BUF` (`0x70000`) for read calls and parent cross-HPS callers |
 | `events` | `events::emit(&[topic0, ...], &data)` | Emit indexed receipt logs (`<= 4` topics) |
 
 ---
 
-## 5. Unit Testing, Compiling & Deploying
+## 5. Multi-HPS Composition Walkthrough: `Identity` + `AssetLedger` + `AssetPair_OTC`
 
-### Step 1: Fast Native Unit Tests (`< 100 ms`)
-Because `hps-sdk` swaps in a thread-local mock host (`hps_sdk::mock`) on native targets, `cargo test` tests your HPS logic directly without spinning up a node:
+This repository ships five production-grade reference Haltproof Subroutines in `examples/`:
+1. **`examples/counter-registry`** — Keyed counters & notes (`4.7 KB`).
+2. **`examples/messaging`** — High-TPS channel messaging matching Lexicon's throughput benchmark (`4.4 KB`).
+3. **`examples/asset-ledger`** — Fungible Asset Ledger with balances & allowances (`6.9 KB`).
+4. **`examples/identity`** — Programmable Identity subroutine that holds balances in Asset Ledgers (`9.3 KB`).
+5. **`examples/asset-pair-otc`** — Atomic Over-The-Counter ask-book & settlement subroutine pairing a Base Asset and Quote Asset (`14.0 KB`).
 
-```bash
-cargo test
-```
-
-### Step 2: Build & Optimize WASM Bytecode
-
-```bash
-cargo hps build
-```
-
-`cargo hps build` automatically:
-- Compiles `wasm32-unknown-unknown --release` with `2 MiB` initial linear memory (`--initial-memory=2097152 --max-memory=4194304`),
-- Strips debug/custom sections and zero-filled data segment runs so `.wasm` artifacts stay ultra-compact (`~1–5 KB`) for radio transmission,
-- Verifies that only supported `WasmtimeAdapter` `env::*` imports are used and `main` + `memory` are exported,
-- Outputs `dist/<name>.wasm` and `dist/<name>.meta.json` (containing `code_hash`).
-
-### Step 3: Deploy to `--localtestnet` (or a Live Subnet)
+### Declaring Touched Subroutines (`--touch`)
+Lexicon's 10-field transaction format includes a `target_addresses` list (`field #10`) enabling deterministic conflict detection in `LayeredMempool`. Whenever a transaction triggers cross-HPS calls, pass `--touch <address>` on the CLI (or `send_call_with_targets` in Rust / `extraTargets` in JS) for the additional subroutines touched by the call:
 
 ```bash
-cargo hps deploy dist/task_board.wasm --save deployment.json
+# Build the suite
+cargo hps build -p asset-ledger
+cargo hps build -p identity
+cargo hps build -p asset-pair-otc
+
+# 1. Generate Owner (Seller) and Buyer keys
+OWNER_ADDR=$(cargo hps keygen --dev | awk '/Address/ {print $3}')
+BUYER_OUT=$(cargo hps keygen)
+BUYER_ADDR=$(echo "$BUYER_OUT" | awk '/Address/ {print $3}')
+BUYER_KEY=$(echo "$BUYER_OUT" | awk '/Private Key/ {print $4}')
+
+# 2. Deploy & initialize Base Asset ("GOLD") and Quote Asset ("USD") ledgers
+cargo hps deploy dist/asset_ledger.wasm --save base.json
+BASE=$(jq -r .hps_address base.json)
+cargo hps send "$BASE" "initialize(address,string,uint64)" "$OWNER_ADDR" "GOLD" 2
+
+cargo hps deploy dist/asset_ledger.wasm --save quote.json
+QUOTE=$(jq -r .hps_address quote.json)
+cargo hps send "$QUOTE" "initialize(address,string,uint64)" "$OWNER_ADDR" "USD" 2
+
+# 3. Deploy Seller & Buyer Identity subroutines (these addresses hold ledger balances)
+cargo hps deploy dist/identity.wasm --save seller_id.json
+SELLER_ID=$(jq -r .hps_address seller_id.json)
+cargo hps send "$SELLER_ID" "initialize(address,string)" "$OWNER_ADDR" "SellerVault"
+
+cargo hps deploy dist/identity.wasm --private-key "$BUYER_KEY" --save buyer_id.json
+BUYER_ID=$(jq -r .hps_address buyer_id.json)
+cargo hps send "$BUYER_ID" "initialize(address,string)" "$BUYER_ADDR" "BuyerVault" --private-key "$BUYER_KEY"
+
+# 4. Mint 500 GOLD to SellerIdentity and 50,000 USD to BuyerIdentity
+cargo hps send "$BASE"  "mint(address,uint64)" "$SELLER_ID" 500
+cargo hps send "$QUOTE" "mint(address,uint64)" "$BUYER_ID"  50000
+
+# 5. Deploy AssetPair_OTC pairing GOLD (base) and USD (quote)
+cargo hps deploy dist/asset_pair_otc.wasm --save otc.json
+OTC=$(jq -r .hps_address otc.json)
+cargo hps send "$OTC" "initialize(address,address,address,address)" \
+  "$OWNER_ADDR" "$SELLER_ID" "$BASE" "$QUOTE"
+
+# 6. Seller authorizes 200 GOLD to OTC & Owner places Ask Order for "ITEM-1" @ 100 USD/GOLD
+cargo hps send "$SELLER_ID" "approveAsset(address,address,uint64)" "$BASE" "$OTC" 200 --touch "$BASE"
+cargo hps send "$OTC" "placeAskOrder(bytes32,uint64,uint64)" "ITEM-1" 200 100 \
+  --touch "$SELLER_ID" --touch "$BASE"
+
+# 7. Buyer authorizes debit of 2,500 USD & buys 25 GOLD at the prevailing 100 USD price
+cargo hps send "$BUYER_ID" "approveAsset(address,address,uint64)" "$QUOTE" "$OTC" 2500 \
+  --private-key "$BUYER_KEY" --touch "$QUOTE"
+
+cargo hps send "$OTC" "buyOrderWithIdentity(bytes32,address,uint64)" "ITEM-1" "$BUYER_ID" 25 \
+  --private-key "$BUYER_KEY" \
+  --touch "$BUYER_ID" --touch "$SELLER_ID" --touch "$QUOTE" --touch "$BASE"
+
+# 8. Verify atomic settlement across both ledgers
+cargo hps call "$BASE"  "balanceOf(address)" "$BUYER_ID"    # -> 25
+cargo hps call "$BASE"  "balanceOf(address)" "$SELLER_ID"   # -> 475
+cargo hps call "$QUOTE" "balanceOf(address)" "$BUYER_ID"    # -> 47500
+cargo hps call "$QUOTE" "balanceOf(address)" "$SELLER_ID"   # -> 2500
+cargo hps call "$OTC"   "getAskAvailable(bytes32)" "ITEM-1" # -> 175
 ```
-
-### Step 4: Invoke & Read via CLI
-
-```bash
-HPS=$(jq -r .hps_address deployment.json)
-
-# Stateful write (confirmed in <= 4s on --localtestnet)
-cargo hps send "$HPS" "increment(bytes32,uint64)" "sprint-1" 10
-
-# Instant read-only query
-cargo hps call "$HPS" "getCount(bytes32)" "sprint-1"
-```
-
-> **Tip for `bytes32` arguments on the CLI:** You can pass a full hex value (`0x1122...`), a plain ASCII label up to 32 bytes (`"sprint-1"`, right-padded with zeros), or `keccak:my-long-channel-name` to hash an arbitrary string with Keccak-256!
 
 ---
 
@@ -197,7 +234,7 @@ async fn main() -> anyhow::Result<()> {
     let deployed = client.deploy_hps(&signer, &wasm, &[]).await?;
     let hps = parse_address(&deployed.hps_address)?;
 
-    // 2. Submit stateful invocation
+    // 2. Submit stateful invocation (use `send_call_with_targets` for cross-HPS calls)
     let calldata = encode_call_from_strings(
         "increment(bytes32,uint64)",
         &["keccak:general".into(), "7".into()],
@@ -215,7 +252,7 @@ async fn main() -> anyhow::Result<()> {
 
 ### Option B: Web / TypeScript / SuperLexicon Frontend (`ts-client/hps.mjs`)
 
-Lexicon uses a **10-field EIP-155 RLP** wire format (`[nonce, gasPrice, gasLimit, to, value, data, v, r, s, targetAddresses]`) with a nominal non-zero `gasPrice` (`1 gwei` default — no account balance is required or deducted on-chain). Use `ts-client/hps.mjs` alongside `ethers` v6:
+Lexicon uses a **10-field EIP-155 RLP** wire format (`[nonce, gasPrice, gasLimit, to, value, data, v, r, s, targetAddresses]`) with a nominal non-zero `gasPrice` (`1 gwei` default — no account balance is required or deducted on-chain). Pass `extraTargets: [addr1, addr2]` when calling across multiple Haltproof Subroutines:
 
 ```ts
 import { AbiCoder, SigningKey, computeAddress, encodeRlp, id, keccak256 } from "ethers";
@@ -225,29 +262,21 @@ const ethersUtils = { SigningKey, keccak256, encodeRlp, computeAddress };
 const client = new HpsRpcClient("http://127.0.0.1:8545");
 const abi = AbiCoder.defaultAbiCoder();
 
-// 1. Build ABI calldata: increment(bytes32,uint64)
+// Build ABI calldata & sign transaction
 const selector = id("increment(bytes32,uint64)").slice(0, 10);
 const argsHex = abi.encode(["bytes32", "uint64"], [id("general"), 5n]).slice(2);
-const calldata = selector + argsHex;
-
-// 2. Sign zero-balance Lexicon transaction & await confirmation
 const sender = computeAddress(DEFAULT_DEV_PRIVATE_KEY);
 const nonce = await client.getNonce(sender);
+
 const rawTx = signLexiconTransaction(ethersUtils, {
   privateKey: DEFAULT_DEV_PRIVATE_KEY,
   nonce,
   to: hpsAddress,
-  data: calldata,
+  data: selector + argsHex,
+  extraTargets: [], // include cross-called HPS addresses here when applicable
 });
 const txHash = await client.sendRawTransaction(rawTx);
 const receipt = await client.waitForReceipt(txHash);
-
-// 3. Read state via readCall
-const getSelector = id("getCount(bytes32)").slice(0, 10);
-const getArgs = abi.encode(["bytes32"], [id("general")]).slice(2);
-const resultHex = await client.readCall(hpsAddress, getSelector + getArgs);
-const [count] = abi.decode(["uint256"], resultHex);
-console.log("Count:", count.toString());
 ```
 
 ### Real-Time Event Streaming via WebSocket (`ws://127.0.0.1:8546`)

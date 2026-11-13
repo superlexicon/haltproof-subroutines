@@ -98,8 +98,27 @@ impl HpsSigner {
         data: &[u8],
         gas_limit: Option<U256>,
     ) -> Result<String> {
+        self.sign_raw_tx_with_targets(nonce, to, value, data, gas_limit, &[])
+    }
+
+    /// Sign and RLP-encode a raw Lexicon transaction declaring additional cross-HPS `extra_targets`
+    /// in the 10th RLP field (`target_addresses`) for parallel conflict scheduling.
+    pub fn sign_raw_tx_with_targets(
+        &self,
+        nonce: u64,
+        to: Option<H160>,
+        value: U256,
+        data: &[u8],
+        gas_limit: Option<U256>,
+        extra_targets: &[H160],
+    ) -> Result<String> {
         let gas_limit = gas_limit.unwrap_or(self.default_gas_limit);
-        let target_addresses: Vec<H160> = to.into_iter().collect();
+        let mut target_addresses: Vec<H160> = to.into_iter().collect();
+        for addr in extra_targets {
+            if !target_addresses.contains(addr) {
+                target_addresses.push(*addr);
+            }
+        }
 
         // 1. Lexicon 10-field EIP-155 signing preimage:
         // [nonce, gas_price, gas_limit, to, value, data, target_addresses, chain_id, 0, 0]
@@ -179,6 +198,24 @@ impl HpsSigner {
     /// Build a signed HPS invocation transaction.
     pub fn build_call_tx(&self, nonce: u64, hps: H160, calldata: &[u8]) -> Result<String> {
         self.sign_raw_tx(nonce, Some(hps), U256::zero(), calldata, Some(self.default_gas_limit))
+    }
+
+    /// Build a signed HPS invocation transaction declaring additional touched HPS addresses.
+    pub fn build_call_tx_with_targets(
+        &self,
+        nonce: u64,
+        hps: H160,
+        calldata: &[u8],
+        extra_targets: &[H160],
+    ) -> Result<String> {
+        self.sign_raw_tx_with_targets(
+            nonce,
+            Some(hps),
+            U256::zero(),
+            calldata,
+            Some(self.default_gas_limit),
+            extra_targets,
+        )
     }
 }
 
@@ -357,8 +394,19 @@ impl HpsClient {
         hps: H160,
         calldata: &[u8],
     ) -> Result<TxOutcome> {
+        self.send_call_with_targets(signer, hps, calldata, &[]).await
+    }
+
+    /// Sign, submit, and await confirmation of a multi-HPS invocation declaring `extra_targets`.
+    pub async fn send_call_with_targets(
+        &self,
+        signer: &HpsSigner,
+        hps: H160,
+        calldata: &[u8],
+        extra_targets: &[H160],
+    ) -> Result<TxOutcome> {
         let nonce = self.get_nonce(signer.address()).await?;
-        let raw_tx = signer.build_call_tx(nonce, hps, calldata)?;
+        let raw_tx = signer.build_call_tx_with_targets(nonce, hps, calldata, extra_targets)?;
         let tx_hash = self.send_raw_transaction(&raw_tx).await?;
         self.wait_for_receipt(&tx_hash).await
     }

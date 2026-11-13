@@ -1,0 +1,13 @@
+[package]
+name = "asset-ledger"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Fungible Asset Ledger Haltproof Subroutine (HPS) tracking per-identity balances and debit allowances"
+
+[[bin]]
+name = "asset_ledger"
+path = "src/main.rs"
+
+[dependencies]
+hps-sdk = { path = "../../crates/hps-sdk" }

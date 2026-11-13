@@ -18,8 +18,10 @@ const ALLOWED_ENV_IMPORTS: &[&str] = &[
     "host_state_exists",
     "get_calldata",
     "get_msg_sender",
+    "get_self_address",
     "get_block_number",
     "host_emit_event",
+    "host_call_contract",
 ];
 
 #[derive(Debug, Clone)]

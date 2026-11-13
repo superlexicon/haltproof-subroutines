@@ -85,6 +85,9 @@ enum Commands {
         signature: String,
         /// Function arguments matching the signature types
         args: Vec<String>,
+        /// Additional HPS addresses touched via cross-HPS calls (`--touch 0x...`)
+        #[arg(long = "touch")]
+        touch: Vec<String>,
         /// JSON-RPC endpoint URL
         #[arg(long, env = "LEXICON_RPC_URL", default_value = "http://127.0.0.1:8545")]
         rpc: String,
@@ -154,10 +157,11 @@ async fn main() -> Result<()> {
             hps,
             signature,
             args,
+            touch,
             rpc,
             private_key,
             chain_id,
-        } => cmd_send(&hps, &signature, &args, &rpc, &private_key, chain_id).await,
+        } => cmd_send(&hps, &signature, &args, &touch, &rpc, &private_key, chain_id).await,
         Commands::Call {
             hps,
             signature,
@@ -505,11 +509,16 @@ async fn cmd_send(
     hps_str: &str,
     signature: &str,
     args: &[String],
+    touch_strs: &[String],
     rpc: &str,
     private_key: &str,
     chain_id: u64,
 ) -> Result<()> {
     let hps = parse_address(hps_str)?;
+    let mut extra_targets = Vec::with_capacity(touch_strs.len());
+    for t in touch_strs {
+        extra_targets.push(parse_address(t)?);
+    }
     let calldata = encode_call_from_strings(signature, args)?;
     let signer = HpsSigner::from_hex(private_key, chain_id)?;
     let client = HpsClient::new(rpc);
@@ -518,7 +527,9 @@ async fn cmd_send(
         "Invoking `{signature}` on HPS {hps_str} from {}...",
         signer.address_hex()
     );
-    let outcome = client.send_call(&signer, hps, &calldata).await?;
+    let outcome = client
+        .send_call_with_targets(&signer, hps, &calldata, &extra_targets)
+        .await?;
     println!("Transaction confirmed:");
     println!("  Tx Hash    : {}", outcome.tx_hash);
     println!(

@@ -20,6 +20,7 @@ export interface SignLexiconTxParams {
   gasLimit?: bigint | number;
   gasPrice?: bigint | number;
   chainId?: bigint | number;
+  extraTargets?: string[];
 }
 
 export declare function signLexiconTransaction(
