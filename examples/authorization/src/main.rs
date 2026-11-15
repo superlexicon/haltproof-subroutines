@@ -19,10 +19,12 @@ use hps_sdk::abi::CalldataReader;
 use hps_sdk::call::{self, CallEncoder};
 use hps_sdk::governance::{
     oracle_policy_id, require_valid_identity, AuctionBook, AuctionOrder, PolicySpec, StageSpec,
-    ACTION_TRANSFER, ERR_NOT_EXISTING_SHAREHOLDER, ERR_POLICY_INVALID,
+    ACTION_TRANSFER, ERR_NOT_EXISTING_SHAREHOLDER, ERR_NOT_ORDER_OWNER,
+    ERR_ORDER_ALREADY_CANCELLED, ERR_ORDER_NOT_FOUND, ERR_POLICY_INVALID,
     ERR_STEP2_SELLER_INELIGIBLE_STEP3, ERR_WRONG_AUCTION_STEP, MAX_ENCODED_AUCTION_BOOK_BYTES,
-    MAX_ENCODED_POLICY_BYTES, ORDER_SIDE_BUY_STEP1, ORDER_SIDE_BUY_STEP3, ORDER_SIDE_SELL_STEP2,
-    POLICY_SHARE_TRANSFER_AUCTION,
+    MAX_ENCODED_POLICY_BYTES, ORDER_SIDE_BUY_STEP1, ORDER_SIDE_BUY_STEP3, ORDER_SIDE_CANCELLED,
+    ORDER_SIDE_SELL_STEP2, POLICY_SHAREHOLDER_SUPERMAJORITY, POLICY_SHARE_TRANSFER_AUCTION,
+    POLICY_SUPER_GOVERNANCE,
 };
 use hps_sdk::storage::KeyBuilder;
 use hps_sdk::{context, event_topic, events, hps_entry, ret, selector, storage};
@@ -54,6 +56,8 @@ const AUCTION_STEP1_STARTED: [u8; 32] =
     event_topic("AuctionStep1Started(address,uint64,uint64,uint64,uint64,uint64)");
 const BUY_ORDER_PLACED: [u8; 32] =
     event_topic("BuyOrderPlaced(address,uint64,uint64,uint64)");
+const BUY_ORDER_CANCELLED: [u8; 32] =
+    event_topic("BuyOrderCancelled(address,uint64,uint64,uint64)");
 const SELL_ORDER_PLACED: [u8; 32] =
     event_topic("SellOrderPlaced(address,uint64,uint64,uint64)");
 
@@ -83,7 +87,11 @@ hps_entry! {
     "initializeCustom(address,address,bytes32,bytes32,bytes)"             => handle_init_custom,
     "approve()"                                                           => handle_approve,
     "placeBuyOrder(uint64,uint64)"                                        => handle_place_buy_order,
+    "placeBuyOrderFor(address,uint64,uint64)"                             => handle_place_buy_order_for,
+    "cancelBuyOrder(uint64)"                                              => handle_cancel_buy_order,
+    "cancelBuyOrderFor(address,uint64)"                                   => handle_cancel_buy_order_for,
     "placeSellOrder(uint64,uint64)"                                       => handle_place_sell_order,
+    "placeSellOrderFor(address,uint64,uint64)"                            => handle_place_sell_order_for,
     "finalize()"                                                          => handle_finalize,
     "approveAndFinalize()"                                                => handle_approve_and_finalize,
     "consume(address,bytes32,bytes32,address)"                            => handle_consume,
@@ -98,6 +106,7 @@ hps_entry! {
     "getOrdersRaw()"                                                      => handle_get_orders_raw,
     "isReadyToConsume()"                                                  => handle_is_ready_to_consume,
     "targetHps()"                                                         => handle_target_hps,
+    "constitution()"                                                      => handle_constitution,
     "actionHash()"                                                        => handle_action_hash,
 }
 
@@ -355,6 +364,38 @@ fn handle_init_custom(args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
+/// Query multi-class shareholder voting power from `Constitution.shareholderVotingPower(address)`
+/// when the Constitution has registered share-class ledgers (`totalVotingPower > 0`).
+fn query_dynamic_shareholder_power(
+    constitution: &[u8; 20],
+    voter: &[u8; 20],
+) -> Option<(u64, u64)> {
+    if *constitution == [0u8; 20] {
+        return None;
+    }
+    let cd = CallEncoder::<64>::new(selector("shareholderVotingPower(address)"))
+        .push_address(voter);
+    let Ok(raw) = call::call_raw(constitution, cd.as_slice()) else {
+        return None;
+    };
+    if raw.len() < 128 {
+        return None;
+    }
+    let mut w_voter = [0u8; 8];
+    let mut w_total = [0u8; 8];
+    let mut w_req = [0u8; 8];
+    w_voter.copy_from_slice(&raw[24..32]);
+    w_total.copy_from_slice(&raw[56..64]);
+    w_req.copy_from_slice(&raw[88..96]);
+    let voter_power = u64::from_be_bytes(w_voter);
+    let total_power = u64::from_be_bytes(w_total);
+    let req_power = u64::from_be_bytes(w_req);
+    if total_power == 0 || req_power == 0 {
+        return None;
+    }
+    Some((voter_power, req_power))
+}
+
 fn execute_approve_step() -> Result<[u8; 20], i32> {
     if storage::get_u64(KEY_STATE) != STATE_PENDING || storage::get_u64(KEY_STAGES_DONE) != 0 {
         return Err(-62); // not in active pending approval phase
@@ -377,9 +418,30 @@ fn execute_approve_step() -> Result<[u8; 20], i32> {
     }
 
     let stage = &spec.stages[cur_stage];
-    let weight = stage
-        .member_weight(&caller)
-        .ok_or(ERR_NOT_STAGE_AUTHORIZER)?;
+    let bound_con = storage::get_address(KEY_CONSTITUTION).unwrap_or([0u8; 20]);
+    let bound_pol = storage::get_bytes32(KEY_POLICY_ID).unwrap_or([0u8; 32]);
+
+    let (weight, required_weight) = if cur_stage == 0
+        && bound_con != [0u8; 20]
+        && (bound_pol == POLICY_SHAREHOLDER_SUPERMAJORITY || bound_pol == POLICY_SUPER_GOVERNANCE)
+    {
+        if let Some((dyn_weight, dyn_req)) = query_dynamic_shareholder_power(&bound_con, &caller) {
+            if dyn_weight == 0 {
+                return Err(ERR_NOT_STAGE_AUTHORIZER);
+            }
+            (dyn_weight, dyn_req)
+        } else {
+            let w = stage
+                .member_weight(&caller)
+                .ok_or(ERR_NOT_STAGE_AUTHORIZER)?;
+            (w, stage.required_weight)
+        }
+    } else {
+        let w = stage
+            .member_weight(&caller)
+            .ok_or(ERR_NOT_STAGE_AUTHORIZER)?;
+        (w, stage.required_weight)
+    };
 
     let sk = signed_key(cur_stage as u64, &caller);
     if storage::get_u64(sk.as_slice()) != 0 {
@@ -397,11 +459,11 @@ fn execute_approve_step() -> Result<[u8; 20], i32> {
     ev[16..24].copy_from_slice(&accum.to_be_bytes());
     events::emit(&[STAGE_APPROVED, addr_topic(&caller)], &ev);
 
-    if accum >= stage.required_weight {
+    if accum >= required_weight {
         let mut thr = [0u8; 24];
         thr[0..8].copy_from_slice(&(cur_stage as u64).to_be_bytes());
         thr[8..16].copy_from_slice(&accum.to_be_bytes());
-        thr[16..24].copy_from_slice(&stage.required_weight.to_be_bytes());
+        thr[16..24].copy_from_slice(&required_weight.to_be_bytes());
         events::emit(&[STAGE_THRESHOLD_REACHED], &thr);
 
         if cur_stage + 1 < spec.stage_count {
@@ -463,25 +525,24 @@ fn execute_finalize_step(caller: &[u8; 20]) -> Result<(), i32> {
     Ok(())
 }
 
-/// Place a buy order (`price`, `quantity`) in a `POLICY_SHARE_TRANSFER_AUCTION` Authorization HPS:
+/// Core implementation for placing a buy order (`price`, `quantity`) on behalf of `buyer`
+/// in a `POLICY_SHARE_TRANSFER_AUCTION` Authorization HPS:
 /// - **Step 1**: First potential buyer starts the Step 1 clock (`step1_deadline = now + step1_window_blocks`).
 ///   Additional potential buyers can place buy orders while `now <= step1_deadline`.
 /// - **Step 2 (`step1_deadline < now <= step2_deadline`)**: Buy orders are rejected (`ERR_WRONG_AUCTION_STEP`).
 /// - **Step 3 (`step2_deadline < now <= step3_deadline`)**: Existing shareholders of `targetHps`
-///   (`balanceOf(caller) > 0`) who did **not** place a sell order in Step 2 can place buy orders.
-fn handle_place_buy_order(args: &CalldataReader) -> Result<(), i32> {
+///   (`balanceOf(buyer) > 0`) who did **not** place a sell order in Step 2 can place buy orders.
+/// Returns the 0-based `orderIndex` in `AuctionBook`.
+fn execute_place_buy_order(buyer: &[u8; 20], price: u64, quantity: u64) -> Result<u64, i32> {
     if storage::get_u64(KEY_IS_AUCTION) != 1 || storage::get_u64(KEY_STATE) != STATE_PENDING {
         return Err(-62);
     }
-    let price = args.u64(0).ok_or(-3)?;
-    let quantity = args.u64(1).ok_or(-3)?;
     if price == 0 || quantity == 0 {
         return Err(-61);
     }
 
     let registry = storage::get_address(KEY_REGISTRY).ok_or(-62)?;
-    let caller = context::msg_sender();
-    require_valid_identity(&registry, &caller)?;
+    require_valid_identity(&registry, buyer)?;
 
     let now = context::block_number();
     let started = storage::get_u64(KEY_AUCTION_STARTED) == 1;
@@ -507,7 +568,7 @@ fn handle_place_buy_order(args: &CalldataReader) -> Result<(), i32> {
         st_ev[16..24].copy_from_slice(&step1_dl.to_be_bytes());
         st_ev[24..32].copy_from_slice(&step2_dl.to_be_bytes());
         st_ev[32..40].copy_from_slice(&step3_dl.to_be_bytes());
-        events::emit(&[AUCTION_STEP1_STARTED, addr_topic(&caller)], &st_ev);
+        events::emit(&[AUCTION_STEP1_STARTED, addr_topic(buyer)], &st_ev);
         ORDER_SIDE_BUY_STEP1
     } else {
         let step1_dl = storage::get_u64(KEY_STEP1_DL);
@@ -521,11 +582,11 @@ fn handle_place_buy_order(args: &CalldataReader) -> Result<(), i32> {
         } else if now <= step3_dl {
             // Step 3: ONLY existing shareholders who did NOT participate in Step 2 can place buy orders!
             let target_ledger = storage::get_address(KEY_TARGET).ok_or(-62)?;
-            let holder_bal = query_ledger_balance(&target_ledger, &caller)?;
+            let holder_bal = query_ledger_balance(&target_ledger, buyer)?;
             if holder_bal == 0 {
                 return Err(ERR_NOT_EXISTING_SHAREHOLDER);
             }
-            let s2k = step2_seller_key(&caller);
+            let s2k = step2_seller_key(buyer);
             if storage::get_u64(s2k.as_slice()) != 0 {
                 return Err(ERR_STEP2_SELLER_INELIGIBLE_STEP3);
             }
@@ -538,9 +599,10 @@ fn handle_place_buy_order(args: &CalldataReader) -> Result<(), i32> {
     };
 
     let mut book = load_auction_book()?;
+    let order_idx = book.order_count as u64;
     if !book.push(AuctionOrder {
         side: step_tag,
-        trader: caller,
+        trader: *buyer,
         price,
         quantity,
     }) {
@@ -552,32 +614,145 @@ fn handle_place_buy_order(args: &CalldataReader) -> Result<(), i32> {
     ev[0..8].copy_from_slice(&(step_tag as u64).to_be_bytes());
     ev[8..16].copy_from_slice(&price.to_be_bytes());
     ev[16..24].copy_from_slice(&quantity.to_be_bytes());
-    events::emit(&[BUY_ORDER_PLACED, addr_topic(&caller)], &ev);
+    events::emit(&[BUY_ORDER_PLACED, addr_topic(buyer)], &ev);
 
-    ret::write_u64_word(book.order_count as u64);
+    Ok(order_idx)
+}
+
+fn handle_place_buy_order(args: &CalldataReader) -> Result<(), i32> {
+    let price = args.u64(0).ok_or(-3)?;
+    let quantity = args.u64(1).ok_or(-3)?;
+    let caller = context::msg_sender();
+    let order_idx = execute_place_buy_order(&caller, price, quantity)?;
+    ret::write_u64_word(order_idx);
+    Ok(())
+}
+
+/// Constitution-proxied buy order placement (`msg.sender` must be the bound `Constitution` HPS).
+fn handle_place_buy_order_for(args: &CalldataReader) -> Result<(), i32> {
+    let bound_con = storage::get_address(KEY_CONSTITUTION).ok_or(-62)?;
+    if bound_con == [0u8; 20] || context::msg_sender() != bound_con {
+        return Err(ERR_WRONG_TARGET);
+    }
+    let buyer = args.address(0).ok_or(-3)?;
+    let price = args.u64(1).ok_or(-3)?;
+    let quantity = args.u64(2).ok_or(-3)?;
+    let order_idx = execute_place_buy_order(&buyer, price, quantity)?;
+    ret::write_u64_word(order_idx);
+    Ok(())
+}
+
+/// Cancel a buy order (`orderIndex`) in a `POLICY_SHARE_TRANSFER_AUCTION` Authorization HPS.
+/// Enforces that a buy order can **only** be cancelled during the exact step in which it was placed:
+/// - `ORDER_SIDE_BUY_STEP1` orders can only be cancelled during Step 1 (`now <= step1_deadline`).
+/// - `ORDER_SIDE_BUY_STEP3` orders can only be cancelled during Step 3 (`step2_deadline < now <= step3_deadline`).
+/// Returns `(uint64 price, uint64 quantity)` so the `Constitution` can refund `price * quantity`
+/// from its special clearing account back to the buyer's bank sub-account.
+fn execute_cancel_buy_order(buyer: &[u8; 20], order_index: u64) -> Result<(u64, u64), i32> {
+    if storage::get_u64(KEY_IS_AUCTION) != 1 || storage::get_u64(KEY_STATE) != STATE_PENDING {
+        return Err(-62);
+    }
+    if storage::get_u64(KEY_AUCTION_STARTED) != 1 {
+        return Err(ERR_WRONG_AUCTION_STEP);
+    }
+
+    let registry = storage::get_address(KEY_REGISTRY).ok_or(-62)?;
+    require_valid_identity(&registry, buyer)?;
+
+    let mut book = load_auction_book()?;
+    let idx = order_index as usize;
+    if idx >= book.order_count {
+        return Err(ERR_ORDER_NOT_FOUND);
+    }
+
+    let ord = book.orders[idx];
+    if ord.is_cancelled() {
+        return Err(ERR_ORDER_ALREADY_CANCELLED);
+    }
+    if !ord.is_buy() {
+        return Err(ERR_WRONG_AUCTION_STEP);
+    }
+    if &ord.trader != buyer {
+        return Err(ERR_NOT_ORDER_OWNER);
+    }
+
+    let now = context::block_number();
+    let step1_dl = storage::get_u64(KEY_STEP1_DL);
+    let step2_dl = storage::get_u64(KEY_STEP2_DL);
+    let step3_dl = storage::get_u64(KEY_STEP3_DL);
+
+    if ord.side == ORDER_SIDE_BUY_STEP1 {
+        if now > step1_dl {
+            return Err(ERR_WRONG_AUCTION_STEP); // Step 1 buy orders can ONLY be cancelled in Step 1!
+        }
+    } else if ord.side == ORDER_SIDE_BUY_STEP3 {
+        if now <= step2_dl || now > step3_dl {
+            return Err(ERR_WRONG_AUCTION_STEP); // Step 3 buy orders can ONLY be cancelled in Step 3!
+        }
+    } else {
+        return Err(ERR_WRONG_AUCTION_STEP);
+    }
+
+    let orig_side = ord.side;
+    let orig_price = ord.price;
+    let orig_qty = ord.quantity;
+    book.orders[idx].side = ORDER_SIDE_CANCELLED;
+    book.orders[idx].quantity = 0;
+    save_auction_book(&book)?;
+
+    let mut ev = [0u8; 24];
+    ev[0..8].copy_from_slice(&(orig_side as u64).to_be_bytes());
+    ev[8..16].copy_from_slice(&orig_price.to_be_bytes());
+    ev[16..24].copy_from_slice(&orig_qty.to_be_bytes());
+    events::emit(&[BUY_ORDER_CANCELLED, addr_topic(buyer)], &ev);
+
+    Ok((orig_price, orig_qty))
+}
+
+fn handle_cancel_buy_order(args: &CalldataReader) -> Result<(), i32> {
+    let order_index = args.u64(0).ok_or(-3)?;
+    let caller = context::msg_sender();
+    let (price, qty) = execute_cancel_buy_order(&caller, order_index)?;
+    let mut out = [0u8; 64];
+    out[24..32].copy_from_slice(&price.to_be_bytes());
+    out[56..64].copy_from_slice(&qty.to_be_bytes());
+    ret::write(&out);
+    Ok(())
+}
+
+/// Constitution-proxied buy order cancellation (`msg.sender` must be the bound `Constitution` HPS).
+fn handle_cancel_buy_order_for(args: &CalldataReader) -> Result<(), i32> {
+    let bound_con = storage::get_address(KEY_CONSTITUTION).ok_or(-62)?;
+    if bound_con == [0u8; 20] || context::msg_sender() != bound_con {
+        return Err(ERR_WRONG_TARGET);
+    }
+    let buyer = args.address(0).ok_or(-3)?;
+    let order_index = args.u64(1).ok_or(-3)?;
+    let (price, qty) = execute_cancel_buy_order(&buyer, order_index)?;
+    let mut out = [0u8; 64];
+    out[24..32].copy_from_slice(&price.to_be_bytes());
+    out[56..64].copy_from_slice(&qty.to_be_bytes());
+    ret::write(&out);
     Ok(())
 }
 
 /// Place a sell order (`price`, `quantity`) during **Step 2** (`step1_deadline < now <= step2_deadline`)
 /// of a `POLICY_SHARE_TRANSFER_AUCTION` Authorization HPS.
-/// Caller must be an existing shareholder (`balanceOf(caller) > 0`) in `targetHps` and cannot offer
+/// Seller must be an existing shareholder (`balanceOf(seller) > 0`) in `targetHps` and cannot offer
 /// more shares than their existing holding.
-fn handle_place_sell_order(args: &CalldataReader) -> Result<(), i32> {
+fn execute_place_sell_order(seller: &[u8; 20], price: u64, quantity: u64) -> Result<u64, i32> {
     if storage::get_u64(KEY_IS_AUCTION) != 1 || storage::get_u64(KEY_STATE) != STATE_PENDING {
         return Err(-62);
     }
     if storage::get_u64(KEY_AUCTION_STARTED) != 1 {
         return Err(ERR_WRONG_AUCTION_STEP); // Step 1 has not even started yet
     }
-    let price = args.u64(0).ok_or(-3)?;
-    let quantity = args.u64(1).ok_or(-3)?;
     if price == 0 || quantity == 0 {
         return Err(-61);
     }
 
     let registry = storage::get_address(KEY_REGISTRY).ok_or(-62)?;
-    let caller = context::msg_sender();
-    require_valid_identity(&registry, &caller)?;
+    require_valid_identity(&registry, seller)?;
 
     let now = context::block_number();
     let step1_dl = storage::get_u64(KEY_STEP1_DL);
@@ -587,12 +762,12 @@ fn handle_place_sell_order(args: &CalldataReader) -> Result<(), i32> {
     }
 
     let target_ledger = storage::get_address(KEY_TARGET).ok_or(-62)?;
-    let holder_bal = query_ledger_balance(&target_ledger, &caller)?;
+    let holder_bal = query_ledger_balance(&target_ledger, seller)?;
     if holder_bal == 0 {
         return Err(ERR_NOT_EXISTING_SHAREHOLDER);
     }
 
-    let qk = seller_offered_key(&caller);
+    let qk = seller_offered_key(seller);
     let prev_offered = storage::get_u64(qk.as_slice());
     let new_offered = prev_offered.checked_add(quantity).ok_or(-16)?;
     if new_offered > holder_bal {
@@ -600,15 +775,16 @@ fn handle_place_sell_order(args: &CalldataReader) -> Result<(), i32> {
     }
     storage::set_u64(qk.as_slice(), new_offered);
 
-    let s2k = step2_seller_key(&caller);
+    let s2k = step2_seller_key(seller);
     storage::set_u64(s2k.as_slice(), 1);
     storage::set_u64(KEY_CUR_STAGE, 1);
     storage::set_u64(KEY_STAGE_DEADLINE, step2_dl);
 
     let mut book = load_auction_book()?;
+    let order_idx = book.order_count as u64;
     if !book.push(AuctionOrder {
         side: ORDER_SIDE_SELL_STEP2,
-        trader: caller,
+        trader: *seller,
         price,
         quantity,
     }) {
@@ -620,9 +796,31 @@ fn handle_place_sell_order(args: &CalldataReader) -> Result<(), i32> {
     ev[0..8].copy_from_slice(&price.to_be_bytes());
     ev[8..16].copy_from_slice(&quantity.to_be_bytes());
     ev[16..24].copy_from_slice(&holder_bal.to_be_bytes());
-    events::emit(&[SELL_ORDER_PLACED, addr_topic(&caller)], &ev);
+    events::emit(&[SELL_ORDER_PLACED, addr_topic(seller)], &ev);
 
-    ret::write_u64_word(book.order_count as u64);
+    Ok(order_idx)
+}
+
+fn handle_place_sell_order(args: &CalldataReader) -> Result<(), i32> {
+    let price = args.u64(0).ok_or(-3)?;
+    let quantity = args.u64(1).ok_or(-3)?;
+    let caller = context::msg_sender();
+    let order_idx = execute_place_sell_order(&caller, price, quantity)?;
+    ret::write_u64_word(order_idx);
+    Ok(())
+}
+
+/// Constitution-proxied sell order placement (`msg.sender` must be the bound `Constitution` HPS).
+fn handle_place_sell_order_for(args: &CalldataReader) -> Result<(), i32> {
+    let bound_con = storage::get_address(KEY_CONSTITUTION).ok_or(-62)?;
+    if bound_con == [0u8; 20] || context::msg_sender() != bound_con {
+        return Err(ERR_WRONG_TARGET);
+    }
+    let seller = args.address(0).ok_or(-3)?;
+    let price = args.u64(1).ok_or(-3)?;
+    let quantity = args.u64(2).ok_or(-3)?;
+    let order_idx = execute_place_sell_order(&seller, price, quantity)?;
+    ret::write_u64_word(order_idx);
     Ok(())
 }
 
@@ -686,7 +884,9 @@ fn handle_consume(args: &CalldataReader) -> Result<(), i32> {
     }
 
     let registry = storage::get_address(KEY_REGISTRY).ok_or(-62)?;
-    require_valid_identity(&registry, &invoker_identity)?;
+    if !(bound_con != [0u8; 20] && invoker_identity == bound_con) {
+        require_valid_identity(&registry, &invoker_identity)?;
+    }
 
     storage::set_u64(KEY_CONSUMED, 1);
     storage::set_u64(KEY_STATE, STATE_CONSUMED);
@@ -745,7 +945,9 @@ fn handle_consume_auction(args: &CalldataReader) -> Result<(), i32> {
     }
 
     let registry = storage::get_address(KEY_REGISTRY).ok_or(-62)?;
-    require_valid_identity(&registry, &invoker_identity)?;
+    if !(bound_con != [0u8; 20] && invoker_identity == bound_con) {
+        require_valid_identity(&registry, &invoker_identity)?;
+    }
 
     if storage::get_u64(KEY_STATE) == STATE_PENDING {
         events::emit(
@@ -871,6 +1073,11 @@ fn handle_is_ready_to_consume(_args: &CalldataReader) -> Result<(), i32> {
 
 fn handle_target_hps(_args: &CalldataReader) -> Result<(), i32> {
     ret::write_address(&storage::get_address(KEY_TARGET).unwrap_or([0u8; 20]));
+    Ok(())
+}
+
+fn handle_constitution(_args: &CalldataReader) -> Result<(), i32> {
+    ret::write_address(&storage::get_address(KEY_CONSTITUTION).unwrap_or([0u8; 20]));
     Ok(())
 }
 
@@ -1211,5 +1418,314 @@ mod tests {
         let len = u64::from_be_bytes(consumed_bytes[56..64].try_into().unwrap()) as usize;
         let decoded = AuctionBook::decode(&consumed_bytes[64..64 + len]).unwrap();
         assert_eq!(decoded.order_count, 5);
+    }
+
+    #[test]
+    fn same_step_buy_order_cancellation_and_dynamic_multiclass_shareholder_power() {
+        use hps_sdk::governance::{
+            AuctionBook, ERR_NOT_ORDER_OWNER, ERR_ORDER_ALREADY_CANCELLED, ERR_WRONG_AUCTION_STEP,
+            POLICY_SHAREHOLDER_SUPERMAJORITY, POLICY_SHARE_TRANSFER_AUCTION,
+        };
+
+        mod reg_stub_3 {
+            use hps_sdk::abi::CalldataReader;
+            use hps_sdk::{ret, selector};
+            pub fn dispatch(raw: &[u8]) -> i32 {
+                let Some((sel, _args)) = CalldataReader::parse(raw) else { return -1; };
+                if sel == selector("isValidIdentity(address)")
+                    || sel == selector("isValidAuthorizationHps(address)")
+                {
+                    ret::write_bool(true);
+                    return 0;
+                }
+                -2
+            }
+        }
+
+        mod con_multiclass_stub {
+            use hps_sdk::abi::CalldataReader;
+            use hps_sdk::governance::{
+                share_transfer_auction_policy_spec, PolicySpec, StageSpec,
+                MAX_ENCODED_POLICY_BYTES, POLICY_SHAREHOLDER_SUPERMAJORITY,
+                POLICY_SHARE_TRANSFER_AUCTION,
+            };
+            use hps_sdk::{ret, selector};
+            pub fn dispatch(raw: &[u8]) -> i32 {
+                let Some((sel, args)) = CalldataReader::parse(raw) else { return -1; };
+                if sel == selector("getPolicyRaw(address,bytes32)") {
+                    let pol = args.bytes32(1).unwrap();
+                    let spec = if pol == POLICY_SHARE_TRANSFER_AUCTION {
+                        share_transfer_auction_policy_spec([0xD1; 20], 10, 10, 10, 50).unwrap()
+                    } else if pol == POLICY_SHAREHOLDER_SUPERMAJORITY {
+                        PolicySpec::new(100)
+                            .add_stage(
+                                StageSpec::new(75_000, 50)
+                                    .add_member([0xA1; 20], 50_000)
+                                    .unwrap()
+                                    .add_member([0xA2; 20], 25_000)
+                                    .unwrap(),
+                            )
+                            .unwrap()
+                    } else {
+                        return -62;
+                    };
+                    let mut buf = [0u8; MAX_ENCODED_POLICY_BYTES];
+                    let len = spec.encode(&mut buf).unwrap();
+                    ret::write_abi_bytes(&buf[..len]);
+                    return 0;
+                }
+                if sel == selector("shareholderVotingPower(address)") {
+                    let voter = args.address(0).unwrap();
+                    // Total company voting power across Common (100k @ 1x) + Class B (6k @ 10x) + Series A (20k @ 2x) = 200,000
+                    // 75% threshold = 150,000
+                    let vp = if voter == [0xA1; 20] {
+                        110_000u64 // Manogaran: 50k Common + 6k*10 Class B = 110,000 votes
+                    } else if voter == [0xA2; 20] {
+                        40_000u64 // Evelyn: 20k Series A (2:1 conversion) = 40,000 votes
+                    } else {
+                        0u64
+                    };
+                    let mut out = [0u8; 128];
+                    out[24..32].copy_from_slice(&vp.to_be_bytes());
+                    out[56..64].copy_from_slice(&200_000u64.to_be_bytes());
+                    out[88..96].copy_from_slice(&150_000u64.to_be_bytes());
+                    out[120..128].copy_from_slice(&vp.to_be_bytes());
+                    ret::write(&out);
+                    return 0;
+                }
+                -2
+            }
+        }
+
+        mod ledger_stub_2 {
+            use hps_sdk::abi::CalldataReader;
+            use hps_sdk::{ret, selector};
+            pub fn dispatch(raw: &[u8]) -> i32 {
+                let Some((sel, args)) = CalldataReader::parse(raw) else { return -1; };
+                if sel == selector("balanceOf(address)") {
+                    let who = args.address(0).unwrap();
+                    let bal = if who == [0xA1; 20] || who == [0xA2; 20] {
+                        20_000u64
+                    } else {
+                        0u64
+                    };
+                    ret::write_u64_word(bal);
+                    return 0;
+                }
+                -2
+            }
+        }
+
+        mock::reset();
+        let reg = [0x10; 20];
+        let con = [0x20; 20];
+        let ledger = [0x30; 20];
+        let auth_auc = [0x40; 20];
+        let auth_res = [0x41; 20];
+        let buyer_1 = [0xD1; 20];
+        let buyer_2 = [0xD2; 20];
+        let sh_1 = [0xA1; 20];
+        let sh_2 = [0xA2; 20];
+
+        mock::register_hps(reg, reg_stub_3::dispatch);
+        mock::register_hps(con, con_multiclass_stub::dispatch);
+        mock::register_hps(ledger, ledger_stub_2::dispatch);
+        mock::register_hps(auth_auc, dispatch_calldata);
+        mock::register_hps(auth_res, dispatch_calldata);
+
+        // 1. Initialize auction & place two Step 1 buy orders at block 500 (Step 1 window = 500..=510)
+        mock::set_block_number(500);
+        mock::transact_as(
+            buyer_1,
+            auth_auc,
+            CallEncoder::<128>::new(selector(
+                "initializeTransferAuction(address,address,address)",
+            ))
+            .push_address(&reg)
+            .push_address(&con)
+            .push_address(&ledger)
+            .as_slice(),
+        )
+        .unwrap();
+
+        mock::transact_as(
+            con,
+            auth_auc,
+            CallEncoder::<128>::new(selector("placeBuyOrderFor(address,uint64,uint64)"))
+                .push_address(&buyer_1)
+                .push_u64(100)
+                .push_u64(1_000)
+                .as_slice(),
+        )
+        .unwrap();
+        mock::transact_as(
+            con,
+            auth_auc,
+            CallEncoder::<128>::new(selector("placeBuyOrderFor(address,uint64,uint64)"))
+                .push_address(&buyer_2)
+                .push_u64(110)
+                .push_u64(2_000)
+                .as_slice(),
+        )
+        .unwrap();
+
+        // Non-owner (`buyer_2`) cannot cancel `buyer_1`'s order 0!
+        assert_eq!(
+            mock::transact_as(
+                con,
+                auth_auc,
+                CallEncoder::<96>::new(selector("cancelBuyOrderFor(address,uint64)"))
+                    .push_address(&buyer_2)
+                    .push_u64(0)
+                    .as_slice(),
+            ),
+            Err(ERR_NOT_ORDER_OWNER)
+        );
+
+        // `buyer_1` cancels order 0 during Step 1 (block 505 <= 510) -> succeeds!
+        mock::set_block_number(505);
+        let c_ret = mock::transact_as(
+            con,
+            auth_auc,
+            CallEncoder::<96>::new(selector("cancelBuyOrderFor(address,uint64)"))
+                .push_address(&buyer_1)
+                .push_u64(0)
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(u64::from_be_bytes(c_ret[24..32].try_into().unwrap()), 100);
+        assert_eq!(u64::from_be_bytes(c_ret[56..64].try_into().unwrap()), 1_000);
+
+        // Cancelling order 0 a second time -> fails with ERR_ORDER_ALREADY_CANCELLED (-79)!
+        assert_eq!(
+            mock::transact_as(
+                con,
+                auth_auc,
+                CallEncoder::<96>::new(selector("cancelBuyOrderFor(address,uint64)"))
+                    .push_address(&buyer_1)
+                    .push_u64(0)
+                    .as_slice(),
+            ),
+            Err(ERR_ORDER_ALREADY_CANCELLED)
+        );
+
+        // Advance to Step 2 (block 515 in 511..=520):
+        // Attempting to cancel Step 1 order 1 (`buyer_2`) during Step 2 MUST fail with ERR_WRONG_AUCTION_STEP (-74)!
+        mock::set_block_number(515);
+        assert_eq!(
+            mock::transact_as(
+                con,
+                auth_auc,
+                CallEncoder::<96>::new(selector("cancelBuyOrderFor(address,uint64)"))
+                    .push_address(&buyer_2)
+                    .push_u64(1)
+                    .as_slice(),
+            ),
+            Err(ERR_WRONG_AUCTION_STEP)
+        );
+
+        // `sh_1` places a sell order in Step 2
+        mock::transact_as(
+            con,
+            auth_auc,
+            CallEncoder::<128>::new(selector("placeSellOrderFor(address,uint64,uint64)"))
+                .push_address(&sh_1)
+                .push_u64(100)
+                .push_u64(2_000)
+                .as_slice(),
+        )
+        .unwrap();
+
+        // Advance to Step 3 (block 525 in 521..=530):
+        // Attempting to cancel Step 1 order 1 (`buyer_2`) during Step 3 MUST ALSO fail!
+        mock::set_block_number(525);
+        assert_eq!(
+            mock::transact_as(
+                con,
+                auth_auc,
+                CallEncoder::<96>::new(selector("cancelBuyOrderFor(address,uint64)"))
+                    .push_address(&buyer_2)
+                    .push_u64(1)
+                    .as_slice(),
+            ),
+            Err(ERR_WRONG_AUCTION_STEP)
+        );
+
+        // Non-selling shareholder `sh_2` places a Step 3 buy order (order index 3) AND cancels it during Step 3!
+        mock::transact_as(
+            con,
+            auth_auc,
+            CallEncoder::<128>::new(selector("placeBuyOrderFor(address,uint64,uint64)"))
+                .push_address(&sh_2)
+                .push_u64(120)
+                .push_u64(500)
+                .as_slice(),
+        )
+        .unwrap();
+        mock::transact_as(
+            con,
+            auth_auc,
+            CallEncoder::<96>::new(selector("cancelBuyOrderFor(address,uint64)"))
+                .push_address(&sh_2)
+                .push_u64(3)
+                .as_slice(),
+        )
+        .unwrap();
+
+        // Consume after Step 3 ends (block 531 > 530) and verify orders 0 and 3 are marked cancelled
+        mock::set_block_number(531);
+        let raw_consume = CallEncoder::<128>::new(selector(
+            "consumeAuction(address,bytes32,address)",
+        ))
+        .push_address(&con)
+        .push_bytes32(&POLICY_SHARE_TRANSFER_AUCTION)
+        .push_address(&sh_1);
+        let consumed_bytes = mock::transact_as(ledger, auth_auc, raw_consume.as_slice()).unwrap();
+        let len = u64::from_be_bytes(consumed_bytes[56..64].try_into().unwrap()) as usize;
+        let book = AuctionBook::decode(&consumed_bytes[64..64 + len]).unwrap();
+        assert_eq!(book.order_count, 4);
+        assert!(book.orders[0].is_cancelled());
+        assert!(book.orders[1].is_buy());
+        assert!(book.orders[2].is_sell());
+        assert!(book.orders[3].is_cancelled());
+
+        // 2. Dynamic Multi-Class Shareholder Resolution Voting in `Authorization`:
+        // Initialize `auth_res` with `POLICY_SHAREHOLDER_SUPERMAJORITY` from `con`.
+        // Even though the static StageSpec only listed `sh_1` with 50,000 / 75,000,
+        // `con.shareholderVotingPower` reports:
+        // - Total company voting power = 200,000, required super-majority = 150,000
+        // - `sh_1` (Manogaran: Common + Class B 10:1) = 110,000 votes (not enough alone: 110k < 150k!)
+        // - `sh_2` (Evelyn: Preferred Series A 2:1 conversion) = 40,000 votes (even though `sh_2` wasn't in static StageSpec!)
+        // Together `sh_1` + `sh_2` = 150,000 >= 150,000 -> reaches threshold and finalizes!
+        mock::transact_as(
+            sh_1,
+            auth_res,
+            CallEncoder::<192>::new(selector(
+                "initializeFromConstitution(address,address,address,bytes32,bytes32)",
+            ))
+            .push_address(&reg)
+            .push_address(&con)
+            .push_address(&ledger)
+            .push_bytes32(&POLICY_SHAREHOLDER_SUPERMAJORITY)
+            .push_bytes32(&[0x77; 32])
+            .as_slice(),
+        )
+        .unwrap();
+
+        let done_1 = mock::transact_as(
+            sh_1,
+            auth_res,
+            CallEncoder::<16>::new(selector("approve()")).as_slice(),
+        )
+        .unwrap();
+        assert_eq!(done_1[31], 0); // 110,000 < 150,000!
+
+        let fin_2 = mock::transact_as(
+            sh_2,
+            auth_res,
+            CallEncoder::<16>::new(selector("approveAndFinalize()")).as_slice(),
+        )
+        .unwrap();
+        assert_eq!(fin_2[31], 1); // 110,000 + 40,000 = 150,000 >= 150,000 -> finalized!
     }
 }

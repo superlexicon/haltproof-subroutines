@@ -37,8 +37,17 @@ hps_entry! {
     "approveAndFinalizeAuth(address)"                                                 => handle_approve_and_finalize_auth,
     "finalizeAuth(address)"                                                           => handle_finalize_auth,
     "placeBuyOrder(address,uint64,uint64)"                                            => handle_place_buy_order,
+    "cancelBuyOrder(address,uint64)"                                                  => handle_cancel_buy_order,
     "placeSellOrder(address,uint64,uint64)"                                           => handle_place_sell_order,
     "settleTransferAuction(address,address)"                                          => handle_settle_transfer_auction,
+    "placeBuyOrderViaConstitution(address,address,uint64,uint64)"                     => handle_place_buy_order_via_con,
+    "cancelBuyOrderViaConstitution(address,address,uint64)"                           => handle_cancel_buy_order_via_con,
+    "placeSellOrderViaConstitution(address,address,uint64,uint64)"                    => handle_place_sell_order_via_con,
+    "settleAuctionViaConstitution(address,address,address)"                           => handle_settle_auction_via_con,
+    "transferBankBalance(address,address,uint64)"                                     => handle_transfer_bank_balance,
+    "setBankOracle(address,address,address,uint64,address)"                           => handle_set_bank_oracle,
+    "setClearingAccount(address,address,address,address)"                             => handle_set_clearing_account,
+    "registerShareClass(address,address,uint64,uint64,uint64,address)"                => handle_register_share_class,
     "issueAsset(address,address,uint64,address)"                                      => handle_issue_asset,
     "cancelAsset(address,address,uint64,address)"                                     => handle_cancel_asset,
     "transferAsset(address,address,address,uint64,address)"                           => handle_transfer_asset,
@@ -327,6 +336,165 @@ fn handle_settle_transfer_auction(args: &CalldataReader) -> Result<(), i32> {
         .push_address(&auth_obj);
     let out = call::call_raw(&ledger, sub_cd.as_slice())?;
     ret::write(out);
+    Ok(())
+}
+
+fn handle_cancel_buy_order(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let auth_obj = args.address(0).ok_or(-3)?;
+    let order_index = args.u64(1).ok_or(-3)?;
+
+    let sub_cd =
+        CallEncoder::<64>::new(selector("cancelBuyOrder(uint64)")).push_u64(order_index);
+    let out = call::call_raw(&auth_obj, sub_cd.as_slice())?;
+    ret::write(out);
+    Ok(())
+}
+
+fn handle_place_buy_order_via_con(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let constitution = args.address(0).ok_or(-3)?;
+    let auth_obj = args.address(1).ok_or(-3)?;
+    let price = args.u64(2).ok_or(-3)?;
+    let quantity = args.u64(3).ok_or(-3)?;
+
+    stamp_auth_approval(&auth_obj);
+    let sub_cd = CallEncoder::<128>::new(selector("placeBuyOrder(address,uint64,uint64)"))
+        .push_address(&auth_obj)
+        .push_u64(price)
+        .push_u64(quantity);
+    let order_idx = call::call_u64(&constitution, sub_cd.as_slice())?;
+    ret::write_u64_word(order_idx);
+    Ok(())
+}
+
+fn handle_cancel_buy_order_via_con(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let constitution = args.address(0).ok_or(-3)?;
+    let auth_obj = args.address(1).ok_or(-3)?;
+    let order_index = args.u64(2).ok_or(-3)?;
+
+    let sub_cd = CallEncoder::<96>::new(selector("cancelBuyOrder(address,uint64)"))
+        .push_address(&auth_obj)
+        .push_u64(order_index);
+    let refunded = call::call_u64(&constitution, sub_cd.as_slice())?;
+    ret::write_u64_word(refunded);
+    Ok(())
+}
+
+fn handle_place_sell_order_via_con(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let constitution = args.address(0).ok_or(-3)?;
+    let auth_obj = args.address(1).ok_or(-3)?;
+    let price = args.u64(2).ok_or(-3)?;
+    let quantity = args.u64(3).ok_or(-3)?;
+
+    stamp_auth_approval(&auth_obj);
+    let sub_cd = CallEncoder::<128>::new(selector("placeSellOrder(address,uint64,uint64)"))
+        .push_address(&auth_obj)
+        .push_u64(price)
+        .push_u64(quantity);
+    let order_idx = call::call_u64(&constitution, sub_cd.as_slice())?;
+    ret::write_u64_word(order_idx);
+    Ok(())
+}
+
+fn handle_settle_auction_via_con(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let constitution = args.address(0).ok_or(-3)?;
+    let share_ledger = args.address(1).ok_or(-3)?;
+    let auth_obj = args.address(2).ok_or(-3)?;
+
+    let sub_cd = CallEncoder::<96>::new(selector(
+        "settleShareTransferAuction(address,address)",
+    ))
+    .push_address(&share_ledger)
+    .push_address(&auth_obj);
+    let out = call::call_raw(&constitution, sub_cd.as_slice())?;
+    ret::write(out);
+    Ok(())
+}
+
+fn handle_transfer_bank_balance(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let bank_ledger = args.address(0).ok_or(-3)?;
+    let to_payee = args.address(1).ok_or(-3)?;
+    let amount = args.u64(2).ok_or(-3)?;
+
+    let sub_cd = CallEncoder::<96>::new(selector("transferDirect(address,uint64)"))
+        .push_address(&to_payee)
+        .push_u64(amount);
+    let ok = call::call_bool(&bank_ledger, sub_cd.as_slice())?;
+    if !ok {
+        return Err(-24);
+    }
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_set_bank_oracle(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let constitution = args.address(0).ok_or(-3)?;
+    let bank_ledger = args.address(1).ok_or(-3)?;
+    let oracle_identity = args.address(2).ok_or(-3)?;
+    let expiry_blocks = args.u64(3).ok_or(-3)?;
+    let board_auth = args.address(4).ok_or(-3)?;
+
+    let sub_cd = CallEncoder::<160>::new(selector(
+        "setBankOracle(address,address,uint64,address)",
+    ))
+    .push_address(&bank_ledger)
+    .push_address(&oracle_identity)
+    .push_u64(expiry_blocks)
+    .push_address(&board_auth);
+    let ok = call::call_bool(&constitution, sub_cd.as_slice())?;
+    if !ok {
+        return Err(-24);
+    }
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_set_clearing_account(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let constitution = args.address(0).ok_or(-3)?;
+    let bank_ledger = args.address(1).ok_or(-3)?;
+    let clearing_account = args.address(2).ok_or(-3)?;
+    let board_auth = args.address(3).ok_or(-3)?;
+
+    let sub_cd = CallEncoder::<128>::new(selector(
+        "setClearingAccount(address,address,address)",
+    ))
+    .push_address(&bank_ledger)
+    .push_address(&clearing_account)
+    .push_address(&board_auth);
+    let ok = call::call_bool(&constitution, sub_cd.as_slice())?;
+    if !ok {
+        return Err(-24);
+    }
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_register_share_class(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let constitution = args.address(0).ok_or(-3)?;
+    let share_ledger = args.address(1).ok_or(-3)?;
+    let votes_per_share = args.u64(2).ok_or(-3)?;
+    let conversion_numer = args.u64(3).ok_or(-3)?;
+    let conversion_denom = args.u64(4).ok_or(-3)?;
+    let super_auth = args.address(5).ok_or(-3)?;
+
+    let sub_cd = CallEncoder::<192>::new(selector(
+        "registerShareClass(address,uint64,uint64,uint64,address)",
+    ))
+    .push_address(&share_ledger)
+    .push_u64(votes_per_share)
+    .push_u64(conversion_numer)
+    .push_u64(conversion_denom)
+    .push_address(&super_auth);
+    let count = call::call_u64(&constitution, sub_cd.as_slice())?;
+    ret::write_u64_word(count);
     Ok(())
 }
 

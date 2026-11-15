@@ -57,8 +57,9 @@ use hps_client::{
 };
 use hps_sdk::governance::{
     share_transfer_auction_policy_spec, PolicySpec, StageSpec, ACTION_APPROVE, ACTION_CANCEL,
-    ACTION_ISSUE, ACTION_SUPER, ACTION_TRANSFER, POLICY_BOARD_RESOLUTION, POLICY_HOLDER_SELF,
-    POLICY_SHAREHOLDER_SUPERMAJORITY, POLICY_SHARE_TRANSFER_AUCTION, POLICY_SUPER_GOVERNANCE,
+    ACTION_ISSUE, ACTION_SUPER, ACTION_TRANSFER, POLICY_BANK_ORACLE, POLICY_BOARD_RESOLUTION,
+    POLICY_HOLDER_SELF, POLICY_SHAREHOLDER_SUPERMAJORITY, POLICY_SHARE_TRANSFER_AUCTION,
+    POLICY_SUPER_GOVERNANCE,
 };
 
 const STATE_PENDING: u64 = 1;
@@ -376,8 +377,8 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
     //   - ids[3..51]= 48 Minority Shareholders (Shareholders #2..#49 holding 50,000 shares total)
     //   - ids[51]   = Dr. Rajesh Nair (Director #3 candidate to be appointed via Shareholder Super-Majority)
     // =========================================================================
-    let id_specs_batch1: Vec<_> = (0..26).map(|_| (id_code, Vec::new())).collect();
-    let id_specs_batch2: Vec<_> = (0..26).map(|_| (id_code, Vec::new())).collect();
+    let id_specs_batch1: Vec<_> = (0..27).map(|_| (id_code, Vec::new())).collect();
+    let id_specs_batch2: Vec<_> = (0..27).map(|_| (id_code, Vec::new())).collect();
     let mut ids = client
         .instantiate_batch(&deployer, &id_specs_batch1)
         .await
@@ -388,24 +389,28 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
             .await
             .unwrap(),
     );
-    assert_eq!(ids.len(), 52);
+    assert_eq!(ids.len(), 54);
 
     let manogaran_id = ids[0];
     let evelyn_director_id = ids[1];
     let superlexicon_company_id = ids[2];
     let minority_shareholder_ids: Vec<H160> = ids[3..51].to_vec();
     let third_director_id = ids[51];
+    let dbs_bank_oracle_id = ids[52];
+    let clearing_acct_id = ids[53];
     assert_eq!(minority_shareholder_ids.len(), 48);
 
-    // Initialize all 52 Identity HPSes in 2 pipelined batches (controlled by `deployer` EOA for test orchestration)
-    let mut init_calls_1 = Vec::with_capacity(26);
-    let mut init_calls_2 = Vec::with_capacity(26);
+    // Initialize all 54 Identity HPSes in 2 pipelined batches (controlled by `deployer` EOA for test orchestration)
+    let mut init_calls_1 = Vec::with_capacity(27);
+    let mut init_calls_2 = Vec::with_capacity(27);
     for (idx, id_hps) in ids.iter().enumerate() {
         let handle = match idx {
             0 => "manogaran.thanabalan".to_string(),
             1 => "evelyn.tan.director".to_string(),
             2 => "superlexicon.pte.ltd".to_string(),
             51 => "rajesh.nair.director3".to_string(),
+            52 => "oracle.dbs.bank.api".to_string(),
+            53 => "clearing.superlexicon.pte.ltd".to_string(),
             _ => format!("shareholder.{:02}", idx - 1),
         };
         let cd = encode_values(
@@ -415,7 +420,7 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
                 AbiValue::Bytes(handle.into_bytes()),
             ],
         );
-        if idx < 26 {
+        if idx < 27 {
             init_calls_1.push((*id_hps, cd, Vec::new()));
         } else {
             init_calls_2.push((*id_hps, cd, Vec::new()));
@@ -438,14 +443,14 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
 
     deployer.default_gas_limit = U256::from(15_000_000u64);
 
-    // Deploy & initialize IdentityRegistry with all 52 verified Identities and approved WASM bytecode hashes
+    // Deploy & initialize IdentityRegistry with all 54 verified Identities and approved WASM bytecode hashes
     let reg_deploy = client
         .deploy_hps(&deployer, &registry_wasm, &[])
         .await
         .unwrap();
     let registry = hps_client::parse_address(&reg_deploy.hps_address).unwrap();
 
-    let mut initial_packed_ids = Vec::with_capacity(51 * 20);
+    let mut initial_packed_ids = Vec::with_capacity(53 * 20);
     for id_hps in &ids[1..] {
         initial_packed_ids.extend_from_slice(id_hps.as_bytes());
     }
@@ -472,7 +477,7 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
         ),
         "RegistryInitialized event must be emitted"
     );
-    assert_eq!(read_u64(&client, registry, "activeCount()", &[]).await, 52);
+    assert_eq!(read_u64(&client, registry, "activeCount()", &[]).await, 54);
     println!(
         "[2/9] Deployed & verified 52 Identity HPSes (2 Directors, 49 Shareholders, 1 Corporate Identity, 1 Director Candidate) in IdentityRegistry ({})",
         reg_deploy.hps_address
@@ -706,7 +711,7 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
         &sh_supermajority_spec,
     ));
     con_blob.extend_from_slice(&encode_constitution_entry(
-        slx_ledger,
+        H160::zero(),
         POLICY_SHAREHOLDER_SUPERMAJORITY,
         &sh_supermajority_spec,
     ));
@@ -1875,6 +1880,873 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
         200_000
     );
     println!(
-        "[10/10] Settled 3-Step Call-Auction on SLX-COMMON at price=100, matched=2,600 shares (pro-rated sellers by existing holdings 150,000:6,000 -> Manogaran -2,500, Shareholder#4 -100; buyers +1,400/+600/+600). All 10 steps & 15 negative security tests passed!"
+        "[10/12] Settled 3-Step Call-Auction on SLX-COMMON at price=100, matched=2,600 shares (pro-rated sellers by existing holdings 150,000:6,000 -> Manogaran -2,500, Shareholder#4 -100; buyers +1,400/+600/+600)."
+    );
+
+    // =========================================================================
+    // 11. Company Bank Account AssetLedger (`SLX-DBS-SGD`), Board-Managed Bank
+    //     Oracle (`POLICY_BANK_ORACLE`), Simple Client-Signed Transfers, and
+    //     Constitution-Routed Share Transfer Auction with Bank Escrow, Same-Step
+    //     Buy Order Cancellation, and DvP Cash Settlement
+    // =========================================================================
+    let step11_12_insts = client
+        .instantiate_batch(
+            &deployer,
+            &[
+                (ledger_code, Vec::new()),
+                (auth_code, Vec::new()),
+                (auth_code, Vec::new()),
+                (auth_code, Vec::new()),
+                (auth_code, Vec::new()),
+                (auth_code, Vec::new()),
+                (auth_code, Vec::new()),
+                (ledger_code, Vec::new()),
+                (auth_code, Vec::new()),
+            ],
+        )
+        .await
+        .unwrap();
+    let dbs_bank_ledger = step11_12_insts[0];
+    let auth_set_bank_oracle = step11_12_insts[1];
+    let auth_oracle_dep_evelyn = step11_12_insts[2];
+    let auth_oracle_dep_dir3 = step11_12_insts[3];
+    let auth_oracle_dep_sh0 = step11_12_insts[4];
+    let auth_oracle_withdraw = step11_12_insts[5];
+    let auth_escrowed_auction = step11_12_insts[6];
+    let series_a_ledger = step11_12_insts[7];
+    let auth_multiclass_res = step11_12_insts[8];
+
+    // Initialize `SLX-DBS-SGD` Bank Account AssetLedger pinned to `slx_constitution`:
+    // - `ACTION_ISSUE` & `ACTION_CANCEL` -> `(slx_constitution, POLICY_BANK_ORACLE)`
+    // - `ACTION_TRANSFER` -> `(0x0, POLICY_HOLDER_SELF)` (clients sign simple transfers directly!)
+    let mut bank_alloc_blob = Vec::with_capacity(28);
+    bank_alloc_blob.extend_from_slice(manogaran_id.as_bytes());
+    bank_alloc_blob.extend_from_slice(&100_000u64.to_be_bytes());
+
+    let mut bank_perms_blob = Vec::new();
+    for (act, con_addr, pol_id) in [
+        (ACTION_SUPER, slx_constitution, POLICY_SUPER_GOVERNANCE),
+        (ACTION_ISSUE, slx_constitution, POLICY_BANK_ORACLE),
+        (ACTION_CANCEL, slx_constitution, POLICY_BANK_ORACLE),
+        (ACTION_TRANSFER, H160::zero(), POLICY_HOLDER_SELF),
+        (ACTION_APPROVE, H160::zero(), POLICY_HOLDER_SELF),
+    ] {
+        bank_perms_blob.extend_from_slice(&pack_permission(act, con_addr, pol_id));
+    }
+
+    let init_bank_ledger_cd = encode_values(
+        "execute(address,bytes)",
+        &[
+            AbiValue::Address(dbs_bank_ledger),
+            AbiValue::Bytes(encode_values(
+                "initialize(address,string,uint64,bytes,bytes)",
+                &[
+                    AbiValue::Address(registry),
+                    AbiValue::Bytes(b"SLX-DBS-SGD".to_vec()),
+                    AbiValue::Uint(U256::from(2u64)),
+                    AbiValue::Bytes(bank_alloc_blob),
+                    AbiValue::Bytes(bank_perms_blob),
+                ],
+            )),
+        ],
+    );
+    assert!(
+        client
+            .send_call_with_targets(
+                &deployer,
+                manogaran_id,
+                &init_bank_ledger_cd,
+                &[dbs_bank_ledger, registry, manogaran_id]
+            )
+            .await
+            .unwrap()
+            .status
+    );
+
+    // Board Resolution (`POLICY_BOARD_RESOLUTION` requiring both Directors Manogaran + Evelyn Tan)
+    // authorizes `dbs_bank_oracle_id` as the Bank Oracle for `dbs_bank_ledger` in `slx_constitution`,
+    // and sets `clearing_acct_id` as the Constitution's special clearing account!
+    let h_set_ora = read_b32(
+        &client,
+        slx_constitution,
+        "hashSetBankOracle(address,address,uint64)",
+        &[
+            AbiValue::Address(dbs_bank_ledger),
+            AbiValue::Address(dbs_bank_oracle_id),
+            AbiValue::Uint(U256::from(50u64)),
+        ],
+    )
+    .await;
+    let init_ora_board_cd = encode_values(
+        "initConstitutionAuth(address,address,address,address,bytes32,bytes32)",
+        &[
+            AbiValue::Address(auth_set_bank_oracle),
+            AbiValue::Address(registry),
+            AbiValue::Address(slx_constitution),
+            AbiValue::Address(slx_constitution),
+            AbiValue::Bytes32(POLICY_BOARD_RESOLUTION),
+            AbiValue::Bytes32(h_set_ora),
+        ],
+    );
+    assert!(
+        client
+            .send_call_with_targets(
+                &deployer,
+                manogaran_id,
+                &init_ora_board_cd,
+                &[auth_set_bank_oracle, registry, slx_constitution]
+            )
+            .await
+            .unwrap()
+            .status
+    );
+    let board_ora_batch = vec![
+        (
+            manogaran_id,
+            encode_values("approveAuth(address)", &[AbiValue::Address(auth_set_bank_oracle)]),
+            vec![auth_set_bank_oracle, registry],
+        ),
+        (
+            evelyn_director_id,
+            encode_values("approveAuth(address)", &[AbiValue::Address(auth_set_bank_oracle)]),
+            vec![auth_set_bank_oracle, registry],
+        ),
+        (
+            third_director_id,
+            encode_values(
+                "approveAndFinalizeAuth(address)",
+                &[AbiValue::Address(auth_set_bank_oracle)],
+            ),
+            vec![auth_set_bank_oracle, registry],
+        ),
+        (
+            manogaran_id,
+            encode_values(
+                "setBankOracle(address,address,address,uint64,address)",
+                &[
+                    AbiValue::Address(slx_constitution),
+                    AbiValue::Address(dbs_bank_ledger),
+                    AbiValue::Address(dbs_bank_oracle_id),
+                    AbiValue::Uint(U256::from(50u64)),
+                    AbiValue::Address(auth_set_bank_oracle),
+                ],
+            ),
+            vec![slx_constitution, auth_set_bank_oracle, registry, dbs_bank_oracle_id],
+        ),
+        (
+            manogaran_id,
+            encode_values(
+                "setClearingAccount(address,address,address,address)",
+                &[
+                    AbiValue::Address(slx_constitution),
+                    AbiValue::Address(dbs_bank_ledger),
+                    AbiValue::Address(clearing_acct_id),
+                    AbiValue::Address(H160::zero()),
+                ],
+            ),
+            vec![slx_constitution, registry, clearing_acct_id],
+        ),
+    ];
+    for r in client.send_call_batch(&deployer, &board_ora_batch).await.unwrap() {
+        assert!(r.status, "Board resolution setting bank oracle & clearing account must succeed");
+    }
+
+    // Bank Oracle (`dbs_bank_oracle_id`) credits incoming bank deposits (`issueAsset`) for:
+    // - `evelyn_director_id`: +300,000 SGD
+    // - `third_director_id`: +150,000 SGD
+    // - `step3_buyer`: +100,000 SGD
+    // And debits a payment/withdrawal (`cancelAsset`) of 20,000 SGD from `manogaran_id` (100,000 -> 80,000)!
+    for (auth_dep, client_id, dep_amt) in [
+        (auth_oracle_dep_evelyn, evelyn_director_id, 300_000u64),
+        (auth_oracle_dep_dir3, third_director_id, 150_000u64),
+        (auth_oracle_dep_sh0, step3_buyer, 100_000u64),
+    ] {
+        let h_dep = read_b32(
+            &client,
+            dbs_bank_ledger,
+            "hashIssue(address,uint64)",
+            &[
+                AbiValue::Address(client_id),
+                AbiValue::Uint(U256::from(dep_amt)),
+            ],
+        )
+        .await;
+        let dep_batch = vec![
+            (
+                dbs_bank_oracle_id,
+                encode_values(
+                    "initConstitutionAuth(address,address,address,address,bytes32,bytes32)",
+                    &[
+                        AbiValue::Address(auth_dep),
+                        AbiValue::Address(registry),
+                        AbiValue::Address(slx_constitution),
+                        AbiValue::Address(dbs_bank_ledger),
+                        AbiValue::Bytes32(POLICY_BANK_ORACLE),
+                        AbiValue::Bytes32(h_dep),
+                    ],
+                ),
+                vec![auth_dep, registry, slx_constitution, dbs_bank_ledger],
+            ),
+            (
+                dbs_bank_oracle_id,
+                encode_values("approveAndFinalizeAuth(address)", &[AbiValue::Address(auth_dep)]),
+                vec![auth_dep, registry],
+            ),
+            (
+                dbs_bank_oracle_id,
+                encode_values(
+                    "issueAsset(address,address,uint64,address)",
+                    &[
+                        AbiValue::Address(dbs_bank_ledger),
+                        AbiValue::Address(client_id),
+                        AbiValue::Uint(U256::from(dep_amt)),
+                        AbiValue::Address(auth_dep),
+                    ],
+                ),
+                vec![dbs_bank_ledger, auth_dep, registry, client_id],
+            ),
+        ];
+        for r in client.send_call_batch(&deployer, &dep_batch).await.unwrap() {
+            assert!(r.status, "Bank oracle deposit credit must succeed");
+        }
+    }
+
+    let h_wd = read_b32(
+        &client,
+        dbs_bank_ledger,
+        "hashCancel(address,uint64)",
+        &[
+            AbiValue::Address(manogaran_id),
+            AbiValue::Uint(U256::from(20_000u64)),
+        ],
+    )
+    .await;
+    let wd_batch = vec![
+        (
+            dbs_bank_oracle_id,
+            encode_values(
+                "initConstitutionAuth(address,address,address,address,bytes32,bytes32)",
+                &[
+                    AbiValue::Address(auth_oracle_withdraw),
+                    AbiValue::Address(registry),
+                    AbiValue::Address(slx_constitution),
+                    AbiValue::Address(dbs_bank_ledger),
+                    AbiValue::Bytes32(POLICY_BANK_ORACLE),
+                    AbiValue::Bytes32(h_wd),
+                ],
+            ),
+            vec![auth_oracle_withdraw, registry, slx_constitution, dbs_bank_ledger],
+        ),
+        (
+            dbs_bank_oracle_id,
+            encode_values(
+                "approveAndFinalizeAuth(address)",
+                &[AbiValue::Address(auth_oracle_withdraw)],
+            ),
+            vec![auth_oracle_withdraw, registry],
+        ),
+        (
+            dbs_bank_oracle_id,
+            encode_values(
+                "cancelAsset(address,address,uint64,address)",
+                &[
+                    AbiValue::Address(dbs_bank_ledger),
+                    AbiValue::Address(manogaran_id),
+                    AbiValue::Uint(U256::from(20_000u64)),
+                    AbiValue::Address(auth_oracle_withdraw),
+                ],
+            ),
+            vec![dbs_bank_ledger, auth_oracle_withdraw, registry, manogaran_id],
+        ),
+    ];
+    for r in client.send_call_batch(&deployer, &wd_batch).await.unwrap() {
+        assert!(r.status, "Bank oracle withdrawal debit must succeed");
+    }
+    assert_eq!(
+        read_u64(
+            &client,
+            dbs_bank_ledger,
+            "balanceOf(address)",
+            &[AbiValue::Address(manogaran_id)]
+        )
+        .await,
+        80_000
+    );
+
+    // Simple Client-Signed Bank Transfer (`transferBankBalance` -> `dbs_bank_ledger.transferDirect`):
+    // `manogaran_id` transfers 30,000 SGD directly to `seller_2` without needing an Authorization HPS!
+    let direct_bank_xfer_cd = encode_values(
+        "transferBankBalance(address,address,uint64)",
+        &[
+            AbiValue::Address(dbs_bank_ledger),
+            AbiValue::Address(seller_2),
+            AbiValue::Uint(U256::from(30_000u64)),
+        ],
+    );
+    assert!(
+        client
+            .send_call_with_targets(
+                &deployer,
+                manogaran_id,
+                &direct_bank_xfer_cd,
+                &[dbs_bank_ledger, registry, seller_2]
+            )
+            .await
+            .unwrap()
+            .status
+    );
+    assert_eq!(
+        read_u64(
+            &client,
+            dbs_bank_ledger,
+            "balanceOf(address)",
+            &[AbiValue::Address(manogaran_id)]
+        )
+        .await,
+        50_000
+    );
+    assert_eq!(
+        read_u64(
+            &client,
+            dbs_bank_ledger,
+            "balanceOf(address)",
+            &[AbiValue::Address(seller_2)]
+        )
+        .await,
+        30_000
+    );
+
+    // Initialize `auth_escrowed_auction` for a Constitution-routed 3-step share transfer auction on `SLX-COMMON`
+    let init_esc_auc_cd = encode_values(
+        "initTransferAuction(address,address,address,address)",
+        &[
+            AbiValue::Address(auth_escrowed_auction),
+            AbiValue::Address(registry),
+            AbiValue::Address(slx_constitution),
+            AbiValue::Address(slx_ledger),
+        ],
+    );
+    assert!(
+        client
+            .send_call_with_targets(
+                &deployer,
+                evelyn_director_id,
+                &init_esc_auc_cd,
+                &[auth_escrowed_auction, registry, slx_constitution, slx_ledger]
+            )
+            .await
+            .unwrap()
+            .status
+    );
+
+    let buy_via_con_cd = |price: u64, qty: u64| -> Vec<u8> {
+        encode_values(
+            "placeBuyOrderViaConstitution(address,address,uint64,uint64)",
+            &[
+                AbiValue::Address(slx_constitution),
+                AbiValue::Address(auth_escrowed_auction),
+                AbiValue::Uint(U256::from(price)),
+                AbiValue::Uint(U256::from(qty)),
+            ],
+        )
+    };
+    let cancel_via_con_cd = |order_idx: u64| -> Vec<u8> {
+        encode_values(
+            "cancelBuyOrderViaConstitution(address,address,uint64)",
+            &[
+                AbiValue::Address(slx_constitution),
+                AbiValue::Address(auth_escrowed_auction),
+                AbiValue::Uint(U256::from(order_idx)),
+            ],
+        )
+    };
+    let sell_via_con_cd = |price: u64, qty: u64| -> Vec<u8> {
+        encode_values(
+            "placeSellOrderViaConstitution(address,address,uint64,uint64)",
+            &[
+                AbiValue::Address(slx_constitution),
+                AbiValue::Address(auth_escrowed_auction),
+                AbiValue::Uint(U256::from(price)),
+                AbiValue::Uint(U256::from(qty)),
+            ],
+        )
+    };
+    let con_buy_targets = vec![
+        slx_constitution,
+        dbs_bank_ledger,
+        clearing_acct_id,
+        auth_escrowed_auction,
+        registry,
+        slx_ledger,
+    ];
+
+    // Negative Test N16: Placing a buy order via `Constitution` when buyer has insufficient bank balance
+    // (`evelyn_director_id` has 300,000 SGD, attempts to buy 4,000 shares @ 100 = 400,000 SGD) MUST revert!
+    let insuff_buy_rcpt = client
+        .send_call_with_targets(
+            &deployer,
+            evelyn_director_id,
+            &buy_via_con_cd(100, 4_000),
+            &con_buy_targets,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !insuff_buy_rcpt.status,
+        "Negative Test N16: Buy order via Constitution with insufficient bank balance MUST revert"
+    );
+
+    // Step 1 via Constitution:
+    // - Order 0: `evelyn_director_id` places buy order for 2,000 shares @ 100 (clears 200,000 SGD -> Evelyn has 100,000, clearing_acct has 200,000)
+    // - Order 1: `third_director_id` places buy order for 1,000 shares @ 100 (clears 100,000 SGD -> Dir3 has 50,000, clearing_acct has 300,000)
+    // - Same-Step Cancellation: `third_director_id` cancels Order 1 during Step 1 -> receives immediate 100,000 SGD refund from `clearing_acct_id`!
+    let step1_con_batch = vec![
+        (
+            evelyn_director_id,
+            buy_via_con_cd(100, 2_000),
+            con_buy_targets.clone(),
+        ),
+        (
+            third_director_id,
+            buy_via_con_cd(100, 1_000),
+            con_buy_targets.clone(),
+        ),
+        (
+            third_director_id,
+            cancel_via_con_cd(1),
+            con_buy_targets.clone(),
+        ),
+    ];
+    let step1_con_rcpts = client
+        .send_call_batch(&deployer, &step1_con_batch)
+        .await
+        .unwrap();
+    assert!(step1_con_rcpts[0].status && step1_con_rcpts[1].status && step1_con_rcpts[2].status);
+    assert!(
+        has_log_topic(
+            &step1_con_rcpts[0],
+            "AuctionBuyOrderCleared(address,address,uint64)"
+        ),
+        "AuctionBuyOrderCleared event must be emitted"
+    );
+    assert!(
+        has_log_topic(
+            &step1_con_rcpts[2],
+            "AuctionBuyOrderRefunded(address,address,uint64)"
+        ),
+        "AuctionBuyOrderRefunded event must be emitted on same-step buy order cancellation"
+    );
+    assert_eq!(
+        read_u64(
+            &client,
+            dbs_bank_ledger,
+            "balanceOf(address)",
+            &[AbiValue::Address(evelyn_director_id)]
+        )
+        .await,
+        100_000
+    );
+    assert_eq!(
+        read_u64(
+            &client,
+            dbs_bank_ledger,
+            "balanceOf(address)",
+            &[AbiValue::Address(third_director_id)]
+        )
+        .await,
+        150_000
+    );
+    assert_eq!(
+        read_u64(
+            &client,
+            dbs_bank_ledger,
+            "balanceOf(address)",
+            &[AbiValue::Address(clearing_acct_id)]
+        )
+        .await,
+        200_000
+    );
+
+    let dls2_raw = client
+        .read_call(
+            None,
+            auth_escrowed_auction,
+            &encode_values("auctionDeadlines()", &[]),
+        )
+        .await
+        .unwrap();
+    let esc_step1_dl = u64::from_be_bytes(dls2_raw[24..32].try_into().unwrap());
+    let esc_step2_dl = u64::from_be_bytes(dls2_raw[56..64].try_into().unwrap());
+    let esc_step3_dl = u64::from_be_bytes(dls2_raw[88..96].try_into().unwrap());
+
+    // Advance into Step 2 (`esc_step1_dl < now <= esc_step2_dl`)
+    while client.block_number().await.unwrap() < esc_step1_dl {
+        let r = client
+            .send_call_with_targets(
+                &deployer,
+                manogaran_id,
+                &sell_via_con_cd(100, 1_500),
+                &[slx_constitution, auth_escrowed_auction, registry, slx_ledger],
+            )
+            .await
+            .unwrap();
+        assert!(!r.status);
+    }
+
+    // Negative Test N17: Attempting to cancel Step 1 Order 0 (`evelyn_director_id`) during Step 2 MUST revert!
+    // And `manogaran_id` places a valid Step 2 sell order for 1,500 shares @ 100 via `Constitution`!
+    let step2_con_batch = vec![
+        (
+            evelyn_director_id,
+            cancel_via_con_cd(0),
+            con_buy_targets.clone(),
+        ),
+        (
+            manogaran_id,
+            sell_via_con_cd(100, 1_500),
+            vec![slx_constitution, auth_escrowed_auction, registry, slx_ledger],
+        ),
+    ];
+    let step2_con_rcpts = client
+        .send_call_batch(&deployer, &step2_con_batch)
+        .await
+        .unwrap();
+    assert!(
+        !step2_con_rcpts[0].status,
+        "Negative Test N17: Cancelling a Step 1 buy order during Step 2 MUST revert"
+    );
+    assert!(step2_con_rcpts[1].status, "Step 2 sell order via Constitution must succeed");
+
+    // Advance into Step 3 (`esc_step2_dl < now <= esc_step3_dl`)
+    while client.block_number().await.unwrap() < esc_step2_dl {
+        let r = client
+            .send_call_with_targets(&deployer, step3_buyer, &buy_via_con_cd(100, 500), &con_buy_targets)
+            .await
+            .unwrap();
+        assert!(!r.status);
+    }
+    // `step3_buyer` places a Step 3 buy order for 500 shares @ 100 (clears 50,000 SGD -> step3_buyer has 50,000, clearing_acct has 250,000)
+    assert!(
+        client
+            .send_call_with_targets(&deployer, step3_buyer, &buy_via_con_cd(100, 500), &con_buy_targets)
+            .await
+            .unwrap()
+            .status
+    );
+    assert_eq!(
+        read_u64(
+            &client,
+            dbs_bank_ledger,
+            "balanceOf(address)",
+            &[AbiValue::Address(clearing_acct_id)]
+        )
+        .await,
+        250_000
+    );
+
+    // Advance past Step 3 (`now > esc_step3_dl`) and settle via `Constitution.settleShareTransferAuction`:
+    // Total buying quantity = 2,000 (Evelyn) + 500 (step3_buyer) = 2,500 > Selling quantity = 1,500 (Manogaran) @ P*=100!
+    // -> Buyers are pro-rated to their buy order quantities (2,000 : 500 = 80% : 20%):
+    //   * `evelyn_director_id` buys 1,200 shares (1,400 -> 2,600 shares) for 120,000 SGD, and receives 80,000 SGD unspent escrow refund (bank balance: 100,000 + 80,000 = 180,000 SGD)!
+    //   * `step3_buyer` buys 300 shares (7,100 -> 7,400 shares) for 30,000 SGD, and receives 20,000 SGD unspent escrow refund (bank balance: 50,000 + 20,000 = 70,000 SGD)!
+    //   * Seller `manogaran_id` sells 1,500 shares (147,500 -> 146,000 shares) and receives 150,000 SGD proceeds (bank balance: 50,000 + 150,000 = 200,000 SGD)!
+    //   * `clearing_acct_id` bank balance returns to 0!
+    let settle_con_cd = encode_values(
+        "settleAuctionViaConstitution(address,address,address)",
+        &[
+            AbiValue::Address(slx_constitution),
+            AbiValue::Address(slx_ledger),
+            AbiValue::Address(auth_escrowed_auction),
+        ],
+    );
+    let settle_con_targets = vec![
+        slx_constitution,
+        slx_ledger,
+        dbs_bank_ledger,
+        clearing_acct_id,
+        auth_escrowed_auction,
+        registry,
+        manogaran_id,
+        evelyn_director_id,
+        third_director_id,
+        step3_buyer,
+    ];
+    while client.block_number().await.unwrap() < esc_step3_dl {
+        let r = client
+            .send_call_with_targets(&deployer, manogaran_id, &settle_con_cd, &settle_con_targets)
+            .await
+            .unwrap();
+        assert!(!r.status);
+    }
+    let settle_con_rcpt = client
+        .send_call_with_targets(&deployer, manogaran_id, &settle_con_cd, &settle_con_targets)
+        .await
+        .unwrap();
+    assert!(
+        settle_con_rcpt.status,
+        "Constitution-routed Share Transfer Auction + Bank Balance DvP settlement must succeed"
+    );
+    assert!(
+        has_log_topic(
+            &settle_con_rcpt,
+            "AuctionCashSettled(address,address,uint64,bool)"
+        ),
+        "AuctionCashSettled event must be emitted for seller proceeds and buyer refunds"
+    );
+
+    assert_eq!(
+        read_u64(
+            &client,
+            slx_ledger,
+            "balanceOf(address)",
+            &[AbiValue::Address(manogaran_id)]
+        )
+        .await,
+        146_000
+    );
+    assert_eq!(
+        read_u64(
+            &client,
+            slx_ledger,
+            "balanceOf(address)",
+            &[AbiValue::Address(evelyn_director_id)]
+        )
+        .await,
+        2_600
+    );
+    assert_eq!(
+        read_u64(
+            &client,
+            slx_ledger,
+            "balanceOf(address)",
+            &[AbiValue::Address(step3_buyer)]
+        )
+        .await,
+        7_400
+    );
+    assert_eq!(
+        read_u64(
+            &client,
+            dbs_bank_ledger,
+            "balanceOf(address)",
+            &[AbiValue::Address(manogaran_id)]
+        )
+        .await,
+        200_000
+    );
+    assert_eq!(
+        read_u64(
+            &client,
+            dbs_bank_ledger,
+            "balanceOf(address)",
+            &[AbiValue::Address(evelyn_director_id)]
+        )
+        .await,
+        180_000
+    );
+    assert_eq!(
+        read_u64(
+            &client,
+            dbs_bank_ledger,
+            "balanceOf(address)",
+            &[AbiValue::Address(step3_buyer)]
+        )
+        .await,
+        70_000
+    );
+    assert_eq!(
+        read_u64(
+            &client,
+            dbs_bank_ledger,
+            "balanceOf(address)",
+            &[AbiValue::Address(clearing_acct_id)]
+        )
+        .await,
+        0
+    );
+    println!(
+        "[11/12] Verified SLX-DBS-SGD Bank Ledger (Board-managed Bank Oracle, client direct transfer, Constitution buy-order escrow, same-step cancellation refund, and DvP cash settlement)."
+    );
+
+    // =========================================================================
+    // 12. Multiple Share-Class Ledgers (`SLX-COMMON` 1:1 + `SLX-SERIES-A` 2:1
+    //     Conversion Ratio to Common Shares) & Cross-Ledger Shareholder Vote Tabulation
+    // =========================================================================
+    // Initialize `SLX-SERIES-A` Preferred Share Ledger where `evelyn_director_id` holds 25,000 Series A
+    // shares with a 2:1 conversion ratio to Common Shares (50,000 common-equivalent votes)
+    let mut sa_alloc_blob = Vec::with_capacity(28);
+    sa_alloc_blob.extend_from_slice(evelyn_director_id.as_bytes());
+    sa_alloc_blob.extend_from_slice(&25_000u64.to_be_bytes());
+
+    let mut sa_perms_blob = Vec::new();
+    for (act, con_addr, pol_id) in [
+        (ACTION_SUPER, slx_constitution, POLICY_SUPER_GOVERNANCE),
+        (ACTION_ISSUE, slx_constitution, POLICY_SHAREHOLDER_SUPERMAJORITY),
+        (ACTION_CANCEL, slx_constitution, POLICY_SHAREHOLDER_SUPERMAJORITY),
+        (ACTION_TRANSFER, slx_constitution, POLICY_SHARE_TRANSFER_AUCTION),
+        (ACTION_APPROVE, H160::zero(), POLICY_HOLDER_SELF),
+    ] {
+        sa_perms_blob.extend_from_slice(&pack_permission(act, con_addr, pol_id));
+    }
+
+    let init_series_a_cd = encode_values(
+        "execute(address,bytes)",
+        &[
+            AbiValue::Address(series_a_ledger),
+            AbiValue::Bytes(encode_values(
+                "initialize(address,string,uint64,bytes,bytes)",
+                &[
+                    AbiValue::Address(registry),
+                    AbiValue::Bytes(b"SLX-SERIES-A".to_vec()),
+                    AbiValue::Uint(U256::from(0u64)),
+                    AbiValue::Bytes(sa_alloc_blob),
+                    AbiValue::Bytes(sa_perms_blob),
+                ],
+            )),
+        ],
+    );
+    assert!(
+        client
+            .send_call_with_targets(
+                &deployer,
+                manogaran_id,
+                &init_series_a_cd,
+                &[series_a_ledger, registry, evelyn_director_id]
+            )
+            .await
+            .unwrap()
+            .status
+    );
+
+    // Register both `SLX-COMMON` (1 vote/share, 1:1 conversion) and `SLX-SERIES-A` (1 vote/converted share, 2:1 conversion)
+    // on `slx_constitution`:
+    // - Total `SLX-COMMON` votes = 200,000 (Manogaran holds 146,000, Evelyn holds 2,600)
+    // - Total `SLX-SERIES-A` votes = 25,000 * (2/1) * 1 = 50,000 (Evelyn holds 25,000 Series A = 50,000 votes)
+    // - Combined Company Voting Power = 250,000 votes; 75% Super-Majority Threshold = 187,500 votes!
+    // - Manogaran's combined voting power = 146,000 votes (< 187,500, so Manogaran CANNOT pass a super-majority resolution alone!)
+    // - Evelyn's combined voting power = 2,600 (Common) + 50,000 (Series A 2:1) = 52,600 votes!
+    // - Together Manogaran + Evelyn = 146,000 + 52,600 = 198,600 >= 187,500 votes -> passes super-majority!
+    let reg_classes_batch = vec![
+        (
+            manogaran_id,
+            encode_values(
+                "registerShareClass(address,address,uint64,uint64,uint64,address)",
+                &[
+                    AbiValue::Address(slx_constitution),
+                    AbiValue::Address(slx_ledger),
+                    AbiValue::Uint(U256::from(1u64)),
+                    AbiValue::Uint(U256::from(1u64)),
+                    AbiValue::Uint(U256::from(1u64)),
+                    AbiValue::Address(H160::zero()),
+                ],
+            ),
+            vec![slx_constitution, registry, slx_ledger],
+        ),
+        (
+            manogaran_id,
+            encode_values(
+                "registerShareClass(address,address,uint64,uint64,uint64,address)",
+                &[
+                    AbiValue::Address(slx_constitution),
+                    AbiValue::Address(series_a_ledger),
+                    AbiValue::Uint(U256::from(1u64)),
+                    AbiValue::Uint(U256::from(2u64)),
+                    AbiValue::Uint(U256::from(1u64)),
+                    AbiValue::Address(H160::zero()),
+                ],
+            ),
+            vec![slx_constitution, registry, series_a_ledger],
+        ),
+    ];
+    for r in client.send_call_batch(&deployer, &reg_classes_batch).await.unwrap() {
+        assert!(r.status, "Registering Common and Series A share classes must succeed");
+    }
+
+    // Initialize `auth_multiclass_res` (`POLICY_SHAREHOLDER_SUPERMAJORITY`) to issue 10,000 Series A shares
+    let h_issue_sa = read_b32(
+        &client,
+        series_a_ledger,
+        "hashIssue(address,uint64)",
+        &[
+            AbiValue::Address(evelyn_director_id),
+            AbiValue::Uint(U256::from(10_000u64)),
+        ],
+    )
+    .await;
+    let init_mc_auth_cd = encode_values(
+        "initConstitutionAuth(address,address,address,address,bytes32,bytes32)",
+        &[
+            AbiValue::Address(auth_multiclass_res),
+            AbiValue::Address(registry),
+            AbiValue::Address(slx_constitution),
+            AbiValue::Address(series_a_ledger),
+            AbiValue::Bytes32(POLICY_SHAREHOLDER_SUPERMAJORITY),
+            AbiValue::Bytes32(h_issue_sa),
+        ],
+    );
+    assert!(
+        client
+            .send_call_with_targets(
+                &deployer,
+                manogaran_id,
+                &init_mc_auth_cd,
+                &[auth_multiclass_res, registry, slx_constitution, series_a_ledger]
+            )
+            .await
+            .unwrap()
+            .status
+    );
+
+    // Manogaran votes first (146,000 / 187,500 votes -> not yet reached threshold!), then Evelyn votes
+    // with her combined Common (2,600) + Series A 2:1 (50,000) = 52,600 votes -> 198,600 >= 187,500 -> finalizes and issues!
+    let mc_vote_targets = vec![
+        auth_multiclass_res,
+        registry,
+        slx_constitution,
+        slx_ledger,
+        series_a_ledger,
+    ];
+    let mc_batch = vec![
+        (
+            manogaran_id,
+            encode_values("approveAuth(address)", &[AbiValue::Address(auth_multiclass_res)]),
+            mc_vote_targets.clone(),
+        ),
+        (
+            evelyn_director_id,
+            encode_values(
+                "approveAndFinalizeAuth(address)",
+                &[AbiValue::Address(auth_multiclass_res)],
+            ),
+            mc_vote_targets.clone(),
+        ),
+        (
+            manogaran_id,
+            encode_values(
+                "issueAsset(address,address,uint64,address)",
+                &[
+                    AbiValue::Address(series_a_ledger),
+                    AbiValue::Address(evelyn_director_id),
+                    AbiValue::Uint(U256::from(10_000u64)),
+                    AbiValue::Address(auth_multiclass_res),
+                ],
+            ),
+            vec![series_a_ledger, auth_multiclass_res, registry, evelyn_director_id],
+        ),
+    ];
+    let mc_rcpts = client.send_call_batch(&deployer, &mc_batch).await.unwrap();
+    assert!(mc_rcpts[0].status && mc_rcpts[1].status && mc_rcpts[2].status);
+    assert_eq!(
+        read_u64(
+            &client,
+            series_a_ledger,
+            "balanceOf(address)",
+            &[AbiValue::Address(evelyn_director_id)]
+        )
+        .await,
+        35_000
+    );
+    println!(
+        "[12/12] Verified Multi-Class Share Ledgers (SLX-COMMON 1:1 + SLX-SERIES-A 2:1 conversion -> 198,600 / 187,500 cross-ledger super-majority vote tabulation). All 12 steps & 17 negative security tests passed!"
     );
 }

@@ -24,12 +24,16 @@ pub const ACTION_APPROVE: [u8; 32] = keccak256(b"APPROVE");
 pub const ACTION_SUPER: [u8; 32] = keccak256(b"SUPER");
 pub const ACTION_ADD_DIRECTOR: [u8; 32] = keccak256(b"ADD_DIRECTOR");
 pub const ACTION_REMOVE_DIRECTOR: [u8; 32] = keccak256(b"REMOVE_DIRECTOR");
+pub const ACTION_SET_BANK_ORACLE: [u8; 32] = keccak256(b"SET_BANK_ORACLE");
+pub const ACTION_SET_CLEARING_ACCOUNT: [u8; 32] = keccak256(b"SET_CLEARING_ACCOUNT");
+pub const ACTION_REGISTER_SHARE_CLASS: [u8; 32] = keccak256(b"REGISTER_SHARE_CLASS");
 
 /// Canonical policy IDs for `Constitution`, `AssetLedger`, and `IdentityRegistry` governance.
 pub const POLICY_SUPER_GOVERNANCE: [u8; 32] = keccak256(b"SUPER_GOVERNANCE");
 pub const POLICY_SHAREHOLDER_SUPERMAJORITY: [u8; 32] = keccak256(b"SHAREHOLDER_SUPERMAJORITY");
 pub const POLICY_BOARD_RESOLUTION: [u8; 32] = keccak256(b"BOARD_RESOLUTION");
 pub const POLICY_SHARE_TRANSFER_AUCTION: [u8; 32] = keccak256(b"SHARE_TRANSFER_AUCTION");
+pub const POLICY_BANK_ORACLE: [u8; 32] = keccak256(b"BANK_ORACLE");
 pub const POLICY_ADMIN_ORACLE: [u8; 32] = keccak256(b"ADMIN_ORACLE");
 /// Dynamic policy sentinel for `ACTION_TRANSFER` / `ACTION_APPROVE` requiring a one-time
 /// `Authorization` object approved & finalized by the debited holder Identity itself.
@@ -61,14 +65,20 @@ pub const ERR_WRONG_AUCTION_STEP: i32 = -74;
 pub const ERR_NOT_EXISTING_SHAREHOLDER: i32 = -75;
 pub const ERR_STEP2_SELLER_INELIGIBLE_STEP3: i32 = -76;
 pub const ERR_NO_CROSSING_ORDERS: i32 = -77;
+pub const ERR_ORDER_NOT_FOUND: i32 = -78;
+pub const ERR_ORDER_ALREADY_CANCELLED: i32 = -79;
+pub const ERR_NOT_ORDER_OWNER: i32 = -80;
 pub const ERR_CONSTITUTION_MISMATCH: i32 = -19;
 
 /// Order side/step tags for `POLICY_SHARE_TRANSFER_AUCTION` 3-step share transfer auctions.
 pub const ORDER_SIDE_BUY_STEP1: u8 = 1;
 pub const ORDER_SIDE_SELL_STEP2: u8 = 2;
 pub const ORDER_SIDE_BUY_STEP3: u8 = 3;
+pub const ORDER_SIDE_CANCELLED: u8 = 4;
 pub const MAX_AUCTION_ORDERS: usize = 64;
 pub const MAX_ENCODED_AUCTION_BOOK_BYTES: usize = 4 + MAX_AUCTION_ORDERS * 37;
+pub const MAX_SHARE_CLASSES: usize = 8;
+pub const MAX_BANK_LEDGERS: usize = 8;
 
 /// Single authorizer entry within a sequential authorization stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -511,6 +521,91 @@ impl AuctionOrder {
     pub const fn is_sell(&self) -> bool {
         self.side == ORDER_SIDE_SELL_STEP2
     }
+
+    pub const fn is_cancelled(&self) -> bool {
+        self.side == ORDER_SIDE_CANCELLED
+    }
+}
+
+/// Share-class descriptor registered on a `Constitution` HPS, defining voting rights and
+/// conversion ratio to Common Shares for a specific share-class `AssetLedger`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShareClassSpec {
+    pub ledger: [u8; 20],
+    pub votes_per_share: u64,
+    pub conversion_numer: u64,
+    pub conversion_denom: u64,
+}
+
+impl Default for ShareClassSpec {
+    fn default() -> Self {
+        Self {
+            ledger: [0u8; 20],
+            votes_per_share: 0,
+            conversion_numer: 1,
+            conversion_denom: 1,
+        }
+    }
+}
+
+impl ShareClassSpec {
+    pub const ENCODED_LEN: usize = 44;
+
+    pub const fn empty() -> Self {
+        Self {
+            ledger: [0u8; 20],
+            votes_per_share: 0,
+            conversion_numer: 1,
+            conversion_denom: 1,
+        }
+    }
+
+    pub fn encode(&self) -> [u8; Self::ENCODED_LEN] {
+        let mut out = [0u8; Self::ENCODED_LEN];
+        out[0..20].copy_from_slice(&self.ledger);
+        out[20..28].copy_from_slice(&self.votes_per_share.to_be_bytes());
+        out[28..36].copy_from_slice(&self.conversion_numer.to_be_bytes());
+        out[36..44].copy_from_slice(&self.conversion_denom.to_be_bytes());
+        out
+    }
+
+    pub fn decode(raw: &[u8]) -> Option<Self> {
+        if raw.len() != Self::ENCODED_LEN {
+            return None;
+        }
+        let mut ledger = [0u8; 20];
+        ledger.copy_from_slice(&raw[0..20]);
+        let mut vp = [0u8; 8];
+        vp.copy_from_slice(&raw[20..28]);
+        let mut cn = [0u8; 8];
+        cn.copy_from_slice(&raw[28..36]);
+        let mut cd = [0u8; 8];
+        cd.copy_from_slice(&raw[36..44]);
+        Some(Self {
+            ledger,
+            votes_per_share: u64::from_be_bytes(vp),
+            conversion_numer: u64::from_be_bytes(cn),
+            conversion_denom: u64::from_be_bytes(cd),
+        })
+    }
+
+    pub const fn converted_common_shares(&self, raw_shares: u64) -> u64 {
+        if self.conversion_denom == 0 {
+            return 0;
+        }
+        (((raw_shares as u128) * (self.conversion_numer as u128)) / (self.conversion_denom as u128))
+            as u64
+    }
+
+    pub const fn voting_power(&self, raw_shares: u64) -> u64 {
+        if self.conversion_denom == 0 || self.votes_per_share == 0 {
+            return 0;
+        }
+        (((raw_shares as u128)
+            * (self.conversion_numer as u128)
+            * (self.votes_per_share as u128))
+            / (self.conversion_denom as u128)) as u64
+    }
 }
 
 /// Fixed-capacity order book collected across the 3 windows of `POLICY_SHARE_TRANSFER_AUCTION`.
@@ -546,10 +641,11 @@ impl AuctionBook {
         if self.order_count >= MAX_AUCTION_ORDERS
             || order.trader == [0u8; 20]
             || order.price == 0
-            || order.quantity == 0
+            || (order.side != ORDER_SIDE_CANCELLED && order.quantity == 0)
             || (order.side != ORDER_SIDE_BUY_STEP1
                 && order.side != ORDER_SIDE_SELL_STEP2
-                && order.side != ORDER_SIDE_BUY_STEP3)
+                && order.side != ORDER_SIDE_BUY_STEP3
+                && order.side != ORDER_SIDE_CANCELLED)
         {
             return false;
         }

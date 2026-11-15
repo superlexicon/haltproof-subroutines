@@ -21,6 +21,7 @@
 #![cfg_attr(target_arch = "wasm32", no_main)]
 
 use hps_sdk::abi::CalldataReader;
+use hps_sdk::call::{self, CallEncoder};
 use hps_sdk::governance::{
     oracle_policy_id, require_valid_identity, verify_and_consume_auction_auth,
     verify_and_consume_auth, ActionHasher, AuctionOrder, ACTION_APPROVE, ACTION_CANCEL,
@@ -28,7 +29,7 @@ use hps_sdk::governance::{
     MAX_AUCTION_ORDERS, POLICY_HOLDER_SELF, POLICY_SHARE_TRANSFER_AUCTION,
 };
 use hps_sdk::storage::KeyBuilder;
-use hps_sdk::{context, event_topic, events, hps_entry, ret, storage};
+use hps_sdk::{context, event_topic, events, hps_entry, ret, selector, storage};
 
 const LEDGER_INITIALIZED: [u8; 32] = event_topic("LedgerInitialized(address,uint64,uint64)");
 const CONSTITUTION_PINNED: [u8; 32] = event_topic("ConstitutionPinned(address)");
@@ -64,6 +65,8 @@ hps_entry! {
     "issue(address,uint64,address)"                         => handle_issue,
     "cancel(address,uint64,address)"                        => handle_cancel,
     "transfer(address,address,uint64,address)"              => handle_transfer,
+    "transferDirect(address,uint64)"                        => handle_transfer_direct,
+    "constitutionClearTransfer(address,address,uint64)"     => handle_constitution_clear_transfer,
     "settleTransferAuction(address)"                        => handle_settle_transfer_auction,
     "approve(address,uint64,address)"                       => handle_approve,
     "transferFrom(address,address,uint64)"                  => handle_transfer_from,
@@ -262,7 +265,10 @@ fn ensure_initialized_and_valid_caller() -> Result<([u8; 20], [u8; 20]), i32> {
     }
     let registry = storage::get_address(KEY_REGISTRY).ok_or(-10)?;
     let caller = context::msg_sender();
-    require_valid_identity(&registry, &caller)?;
+    let pinned_con = storage::get_address(KEY_CONSTITUTION).unwrap_or([0u8; 20]);
+    if !(pinned_con != [0u8; 20] && caller == pinned_con) {
+        require_valid_identity(&registry, &caller)?;
+    }
     Ok((registry, caller))
 }
 
@@ -275,6 +281,19 @@ fn require_and_consume_permission(
     caller_identity: &[u8; 20],
 ) -> Result<(), i32> {
     let rule = load_permission(action_key).ok_or(-13)?; // permission not configured for action
+    if *action_key == ACTION_TRANSFER
+        && rule.constitution == [0u8; 20]
+        && rule.policy_id == POLICY_HOLDER_SELF
+        && *auth_obj == [0u8; 20]
+    {
+        // On bank-account ledgers (`POLICY_HOLDER_SELF`), a verified client Identity can sign and
+        // submit a transfer directly (`authObj == 0x0`) when `caller == fromIdentity`.
+        let holder = subject_holder.ok_or(-13)?;
+        if caller_identity == holder {
+            return Ok(());
+        }
+        return Err(-65);
+    }
     let (expected_con, expected_pol) =
         if rule.constitution == [0u8; 20] && rule.policy_id == POLICY_HOLDER_SELF {
             let holder = subject_holder.ok_or(-13)?;
@@ -543,6 +562,70 @@ fn handle_transfer(args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
+/// Simple client-signed direct transfer (`toIdentity`, `amount`) for bank-account AssetLedgers
+/// where `ACTION_TRANSFER` is governed by `POLICY_HOLDER_SELF`.
+fn handle_transfer_direct(args: &CalldataReader) -> Result<(), i32> {
+    let (registry, caller) = ensure_initialized_and_valid_caller()?;
+    let to_identity = args.address(0).ok_or(-3)?;
+    let amount = args.u64(1).ok_or(-3)?;
+    if amount == 0 || caller == to_identity {
+        return Err(-14);
+    }
+
+    let rule = load_permission(&ACTION_TRANSFER).ok_or(-12)?;
+    if !(rule.constitution == [0u8; 20] && rule.policy_id == POLICY_HOLDER_SELF) {
+        return Err(-13);
+    }
+
+    require_valid_identity(&registry, &to_identity)?;
+    internal_debit(&caller, amount)?;
+    internal_credit(&to_identity, amount)?;
+
+    events::emit(
+        &[TRANSFER_TOPIC, addr_topic(&caller), addr_topic(&to_identity)],
+        &amount.to_be_bytes(),
+    );
+    ret::write_bool(true);
+    Ok(())
+}
+
+/// Clearing & escrow transfer invoked exclusively by this ledger's single `associatedConstitution()`
+/// to move bank-account sub-account balances between buyers, sellers, and the Constitution's
+/// special clearing account during a 3-step share transfer auction.
+fn handle_constitution_clear_transfer(args: &CalldataReader) -> Result<(), i32> {
+    if storage::get_u64(KEY_INIT) != 1 {
+        return Err(-10);
+    }
+    let pinned_con = storage::get_address(KEY_CONSTITUTION).unwrap_or([0u8; 20]);
+    if pinned_con == [0u8; 20] || context::msg_sender() != pinned_con {
+        return Err(ERR_CONSTITUTION_MISMATCH);
+    }
+    let registry = storage::get_address(KEY_REGISTRY).ok_or(-10)?;
+    let from_identity = args.address(0).ok_or(-3)?;
+    let to_identity = args.address(1).ok_or(-3)?;
+    let amount = args.u64(2).ok_or(-3)?;
+    if amount == 0 || from_identity == to_identity {
+        return Err(-14);
+    }
+
+    require_valid_identity(&registry, &from_identity)?;
+    require_valid_identity(&registry, &to_identity)?;
+
+    internal_debit(&from_identity, amount)?;
+    internal_credit(&to_identity, amount)?;
+
+    events::emit(
+        &[
+            TRANSFER_TOPIC,
+            addr_topic(&from_identity),
+            addr_topic(&to_identity),
+        ],
+        &amount.to_be_bytes(),
+    );
+    ret::write_bool(true);
+    Ok(())
+}
+
 /// Settle a finalized 3-step Call-Auction `Authorization` HPS (`POLICY_SHARE_TRANSFER_AUCTION`)
 /// for the AssetLedger's own shares, returning `(uint64 clearingPrice, uint64 matchedQuantity,
 /// uint64 crossingBuyDemand, uint64 crossingSellSupply)`.
@@ -617,6 +700,10 @@ fn execute_transfer_auction_settlement(
     let mut idx = 0usize;
     while idx < book.order_count {
         let ord = book.orders[idx];
+        if ord.is_cancelled() {
+            idx += 1;
+            continue;
+        }
         require_valid_identity(registry, &ord.trader)?;
         if ord.price == 0 || ord.quantity == 0 {
             return Err(-14);
@@ -1013,6 +1100,59 @@ fn execute_transfer_auction_settlement(
             );
         }
         b += 1;
+    }
+
+    // If the bound Constitution escrowed buyer funds in its bank balance ledger (`hasEscrowedAuction(authObj)`),
+    // automatically disburse `clearing_price * fill` to filled sellers and refund any unspent escrow
+    // (`order.price * order.quantity - clearing_price * fill`) back to buyers!
+    if rule.constitution != [0u8; 20] {
+        let q_cd = CallEncoder::<64>::new(selector("hasEscrowedAuction(address)"))
+            .push_address(auth_obj);
+        if let Ok(true) = call::call_bool(&rule.constitution, q_cd.as_slice()) {
+            sl = 0;
+            while sl < sell_count {
+                let fill = sell_fills[sl];
+                if fill > 0 {
+                    let proceeds = clearing_price.checked_mul(fill).ok_or(-15)?;
+                    let pay_cd = CallEncoder::<160>::new(selector(
+                        "disburseAuctionCash(address,address,uint64,bool)",
+                    ))
+                    .push_address(auth_obj)
+                    .push_address(&sell_orders[sl].trader)
+                    .push_u64(proceeds)
+                    .push_bool(true);
+                    let ok = call::call_bool(&rule.constitution, pay_cd.as_slice())?;
+                    if !ok {
+                        return Err(-16);
+                    }
+                }
+                sl += 1;
+            }
+
+            b = 0;
+            while b < buy_count {
+                let escrowed = buy_orders[b]
+                    .price
+                    .checked_mul(buy_orders[b].quantity)
+                    .ok_or(-15)?;
+                let spent = clearing_price.checked_mul(buy_fills[b]).ok_or(-15)?;
+                let refund = escrowed.saturating_sub(spent);
+                if refund > 0 {
+                    let ref_cd = CallEncoder::<160>::new(selector(
+                        "disburseAuctionCash(address,address,uint64,bool)",
+                    ))
+                    .push_address(auth_obj)
+                    .push_address(&buy_orders[b].trader)
+                    .push_u64(refund)
+                    .push_bool(false);
+                    let ok = call::call_bool(&rule.constitution, ref_cd.as_slice())?;
+                    if !ok {
+                        return Err(-16);
+                    }
+                }
+                b += 1;
+            }
+        }
     }
 
     storage::set_u64(KEY_LAST_AUC_PRICE, clearing_price);
@@ -2762,5 +2902,365 @@ mod tests {
         assert_eq!(bal_of(ledger_b, sh_1), 54_000);
         assert_eq!(bal_of(ledger_b, sh_2), 18_000);
         assert_eq!(bal_of(ledger_b, sh_3), 18_000);
+    }
+
+    #[test]
+    fn bank_account_ledgers_and_escrowed_share_transfer_auction_settlement() {
+        use hps_sdk::governance::{
+            POLICY_BANK_ORACLE, POLICY_SHAREHOLDER_SUPERMAJORITY, POLICY_SHARE_TRANSFER_AUCTION,
+            POLICY_SUPER_GOVERNANCE,
+        };
+
+        mod reg_stub_3 {
+            use hps_sdk::abi::CalldataReader;
+            use hps_sdk::{ret, selector};
+            pub fn dispatch(raw: &[u8]) -> i32 {
+                let Some((sel, _args)) = CalldataReader::parse(raw) else { return -1; };
+                if sel == selector("isValidIdentity(address)")
+                    || sel == selector("isValidAuthorizationHps(address)")
+                {
+                    ret::write_bool(true);
+                    return 0;
+                }
+                -2
+            }
+        }
+
+        mod auth_stub_3 {
+            use hps_sdk::abi::CalldataReader;
+            use hps_sdk::{ret, selector, storage};
+            pub fn dispatch(raw: &[u8]) -> i32 {
+                let Some((sel, args)) = CalldataReader::parse(raw) else { return -1; };
+                if sel == selector("arm(address,address,bytes32,bytes32)") {
+                    storage::set_address(b"con", &args.address(1).unwrap());
+                    storage::set(b"pol", &args.bytes32(2).unwrap());
+                    storage::set(b"hash", &args.bytes32(3).unwrap());
+                    storage::set_u64(b"used", 0);
+                    return 0;
+                }
+                if sel == selector("consume(address,bytes32,bytes32,address)") {
+                    if storage::get_u64(b"used") != 0 {
+                        return -68;
+                    }
+                    if args.address(0).unwrap() != storage::get_address(b"con").unwrap()
+                        || args.bytes32(1).unwrap() != storage::get_bytes32(b"pol").unwrap()
+                        || args.bytes32(2).unwrap() != storage::get_bytes32(b"hash").unwrap()
+                    {
+                        return -67;
+                    }
+                    storage::set_u64(b"used", 1);
+                    ret::write_bool(true);
+                    return 0;
+                }
+                -2
+            }
+        }
+
+        mod con_escrow_stub {
+            use hps_sdk::abi::CalldataReader;
+            use hps_sdk::call::{self, CallEncoder};
+            use hps_sdk::{ret, selector, storage};
+
+            pub fn dispatch(raw: &[u8]) -> i32 {
+                let Some((sel, args)) = CalldataReader::parse(raw) else { return -1; };
+                if sel == selector("setup(address,address)") {
+                    storage::set_address(b"bank_led", &args.address(0).unwrap());
+                    storage::set_address(b"clear_acct", &args.address(1).unwrap());
+                    return 0;
+                }
+                if sel == selector("hasEscrowedAuction(address)") {
+                    ret::write_bool(true);
+                    return 0;
+                }
+                if sel == selector("disburseAuctionCash(address,address,uint64,bool)") {
+                    let recipient = args.address(1).unwrap();
+                    let amount = args.u64(2).unwrap();
+                    let bank_led = storage::get_address(b"bank_led").unwrap();
+                    let clear_acct = storage::get_address(b"clear_acct").unwrap();
+                    let xfer = CallEncoder::<128>::new(selector(
+                        "constitutionClearTransfer(address,address,uint64)",
+                    ))
+                    .push_address(&clear_acct)
+                    .push_address(&recipient)
+                    .push_u64(amount);
+                    let ok = call::call_bool(&bank_led, xfer.as_slice()).unwrap_or(false);
+                    if !ok {
+                        return -16;
+                    }
+                    ret::write_bool(true);
+                    return 0;
+                }
+                -2
+            }
+        }
+
+        mod auc_book_stub {
+            use hps_sdk::abi::CalldataReader;
+            use hps_sdk::governance::{
+                AuctionBook, AuctionOrder, MAX_ENCODED_AUCTION_BOOK_BYTES, ORDER_SIDE_BUY_STEP1,
+                ORDER_SIDE_BUY_STEP3, ORDER_SIDE_CANCELLED, ORDER_SIDE_SELL_STEP2,
+            };
+            use hps_sdk::{ret, selector, storage};
+
+            pub fn dispatch(raw: &[u8]) -> i32 {
+                let Some((sel, _args)) = CalldataReader::parse(raw) else { return -1; };
+                if sel == selector("consumeAuction(address,bytes32,address)") {
+                    if storage::get_u64(b"used") != 0 {
+                        return -68;
+                    }
+                    storage::set_u64(b"used", 1);
+                    let mut book = AuctionBook::new();
+                    // Order 0: Cancelled Step 1 buy order (must be ignored by settlement!)
+                    book.push(AuctionOrder {
+                        side: ORDER_SIDE_CANCELLED,
+                        trader: [0xB1; 20],
+                        price: 200,
+                        quantity: 0,
+                    });
+                    // Order 1: Active Step 1 buy order by buyer_1 ([0xB1; 20]) for 6,000 shares @ 110 (escrowed 660,000)
+                    book.push(AuctionOrder {
+                        side: ORDER_SIDE_BUY_STEP1,
+                        trader: [0xB1; 20],
+                        price: 110,
+                        quantity: 6_000,
+                    });
+                    // Order 2: Active Step 2 sell order by sh_1 ([0xA1; 20]) for 5,000 shares @ 100
+                    book.push(AuctionOrder {
+                        side: ORDER_SIDE_SELL_STEP2,
+                        trader: [0xA1; 20],
+                        price: 100,
+                        quantity: 5_000,
+                    });
+                    // Order 3: Active Step 3 buy order by sh_2 ([0xA2; 20]) for 4,000 shares @ 100 (escrowed 400,000)
+                    book.push(AuctionOrder {
+                        side: ORDER_SIDE_BUY_STEP3,
+                        trader: [0xA2; 20],
+                        price: 100,
+                        quantity: 4_000,
+                    });
+                    let mut buf = [0u8; MAX_ENCODED_AUCTION_BOOK_BYTES];
+                    let len = book.encode(&mut buf).unwrap();
+                    ret::write_abi_bytes(&buf[..len]);
+                    return 0;
+                }
+                -2
+            }
+        }
+
+        mock::reset();
+        let reg = [0x10; 20];
+        let con = [0x20; 20];
+        let bank_ledger = [0x31; 20];
+        let share_ledger = [0x32; 20];
+        let oracle_auth_1 = [0x41; 20];
+        let oracle_auth_2 = [0x42; 20];
+        let auc_auth = [0x43; 20];
+        let bank_oracle_id = [0x91; 20];
+        let clearing_acct = [0x99; 20];
+        let sh_1 = [0xA1; 20];
+        let sh_2 = [0xA2; 20];
+        let buyer_1 = [0xB1; 20];
+        let payee_1 = [0xB2; 20];
+
+        mock::register_hps(reg, reg_stub_3::dispatch);
+        mock::register_hps(con, con_escrow_stub::dispatch);
+        mock::register_hps(bank_ledger, dispatch_calldata);
+        mock::register_hps(share_ledger, dispatch_calldata);
+        mock::register_hps(oracle_auth_1, auth_stub_3::dispatch);
+        mock::register_hps(oracle_auth_2, auth_stub_3::dispatch);
+        mock::register_hps(auc_auth, auc_book_stub::dispatch);
+
+        // 1. Initialize Bank Account AssetLedger (`SLX-DBS-SGD`):
+        // - ACTION_ISSUE & ACTION_CANCEL governed by `(con, POLICY_BANK_ORACLE)`
+        // - ACTION_TRANSFER governed by `([0u8; 20], POLICY_HOLDER_SELF)` (simple client-signed transfers!)
+        let init_bank = encode_ledger_init(
+            reg,
+            b"SLX-DBS-SGD",
+            2,
+            &[(buyer_1, 700_000), (sh_2, 500_000)],
+            &[
+                (ACTION_SUPER, con, POLICY_SUPER_GOVERNANCE),
+                (ACTION_ISSUE, con, POLICY_BANK_ORACLE),
+                (ACTION_CANCEL, con, POLICY_BANK_ORACLE),
+                (ACTION_TRANSFER, [0u8; 20], POLICY_HOLDER_SELF),
+                (ACTION_APPROVE, [0u8; 20], POLICY_HOLDER_SELF),
+            ],
+        );
+        mock::transact_as(sh_1, bank_ledger, &init_bank).unwrap();
+
+        let bal_of = |led: [u8; 20], id: [u8; 20]| -> u64 {
+            let cd = CallEncoder::<64>::new(selector("balanceOf(address)")).push_address(&id);
+            let out = mock::transact_as(sh_1, led, cd.as_slice()).unwrap();
+            u64::from_be_bytes(out[24..32].try_into().unwrap())
+        };
+
+        // 2. Bank Oracle (`bank_oracle_id`) credits an incoming deposit of 200,000 to `buyer_1` (`issue`)
+        // and debits an outgoing withdrawal of 40,000 from `buyer_1` (`cancel`):
+        let h_dep: [u8; 32] = mock::transact_as(
+            bank_oracle_id,
+            bank_ledger,
+            CallEncoder::<96>::new(selector("hashIssue(address,uint64)"))
+                .push_address(&buyer_1)
+                .push_u64(200_000)
+                .as_slice(),
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+        mock::transact_as(
+            bank_oracle_id,
+            oracle_auth_1,
+            CallEncoder::<160>::new(selector("arm(address,address,bytes32,bytes32)"))
+                .push_address(&bank_ledger)
+                .push_address(&con)
+                .push_bytes32(&POLICY_BANK_ORACLE)
+                .push_bytes32(&h_dep)
+                .as_slice(),
+        )
+        .unwrap();
+        mock::transact_as(
+            bank_oracle_id,
+            bank_ledger,
+            CallEncoder::<128>::new(selector("issue(address,uint64,address)"))
+                .push_address(&buyer_1)
+                .push_u64(200_000)
+                .push_address(&oracle_auth_1)
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(bal_of(bank_ledger, buyer_1), 900_000);
+
+        let h_wd: [u8; 32] = mock::transact_as(
+            bank_oracle_id,
+            bank_ledger,
+            CallEncoder::<96>::new(selector("hashCancel(address,uint64)"))
+                .push_address(&buyer_1)
+                .push_u64(40_000)
+                .as_slice(),
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+        mock::transact_as(
+            bank_oracle_id,
+            oracle_auth_2,
+            CallEncoder::<160>::new(selector("arm(address,address,bytes32,bytes32)"))
+                .push_address(&bank_ledger)
+                .push_address(&con)
+                .push_bytes32(&POLICY_BANK_ORACLE)
+                .push_bytes32(&h_wd)
+                .as_slice(),
+        )
+        .unwrap();
+        mock::transact_as(
+            bank_oracle_id,
+            bank_ledger,
+            CallEncoder::<128>::new(selector("cancel(address,uint64,address)"))
+                .push_address(&buyer_1)
+                .push_u64(40_000)
+                .push_address(&oracle_auth_2)
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(bal_of(bank_ledger, buyer_1), 860_000);
+
+        // 3. Simple client-signed transfer on `bank_ledger` (`transferDirect` and `transfer(..., 0x0)`):
+        // `buyer_1` signs a direct transfer of 50,000 to `payee_1` without needing an Authorization HPS!
+        mock::transact_as(
+            buyer_1,
+            bank_ledger,
+            CallEncoder::<96>::new(selector("transferDirect(address,uint64)"))
+                .push_address(&payee_1)
+                .push_u64(50_000)
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(bal_of(bank_ledger, buyer_1), 810_000);
+        assert_eq!(bal_of(bank_ledger, payee_1), 50_000);
+
+        // 4. End-of-Auction Share + Bank Balance Settlement:
+        // Setup `con` with `(bank_ledger, clearing_acct)` and clear buyer escrows into `clearing_acct`:
+        // - `buyer_1` escrows `110 * 6,000 = 660,000` (leaving `810,000 - 660,000 = 150,000` in `buyer_1`)
+        // - `sh_2` escrows `100 * 4,000 = 400,000` (leaving `500,000 - 400,000 = 100,000` in `sh_2`)
+        // Total in `clearing_acct` = 1,060,000.
+        mock::transact_as(
+            sh_1,
+            con,
+            CallEncoder::<96>::new(selector("setup(address,address)"))
+                .push_address(&bank_ledger)
+                .push_address(&clearing_acct)
+                .as_slice(),
+        )
+        .unwrap();
+        mock::transact_as(
+            con,
+            bank_ledger,
+            CallEncoder::<128>::new(selector(
+                "constitutionClearTransfer(address,address,uint64)",
+            ))
+            .push_address(&buyer_1)
+            .push_address(&clearing_acct)
+            .push_u64(660_000)
+            .as_slice(),
+        )
+        .unwrap();
+        mock::transact_as(
+            con,
+            bank_ledger,
+            CallEncoder::<128>::new(selector(
+                "constitutionClearTransfer(address,address,uint64)",
+            ))
+            .push_address(&sh_2)
+            .push_address(&clearing_acct)
+            .push_u64(400_000)
+            .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(bal_of(bank_ledger, clearing_acct), 1_060_000);
+
+        // Initialize `share_ledger` (`sh_1` holds 50,000 shares, `sh_2` holds 10,000 shares)
+        let init_shares = encode_ledger_init(
+            reg,
+            b"SLX-COMMON",
+            0,
+            &[(sh_1, 50_000), (sh_2, 10_000)],
+            &[
+                (ACTION_SUPER, con, POLICY_SUPER_GOVERNANCE),
+                (ACTION_ISSUE, con, POLICY_SHAREHOLDER_SUPERMAJORITY),
+                (ACTION_CANCEL, con, POLICY_SHAREHOLDER_SUPERMAJORITY),
+                (ACTION_TRANSFER, con, POLICY_SHARE_TRANSFER_AUCTION),
+                (ACTION_APPROVE, [0u8; 20], POLICY_HOLDER_SELF),
+            ],
+        );
+        mock::transact_as(sh_1, share_ledger, &init_shares).unwrap();
+
+        // Settle auction on `share_ledger`:
+        // - Crossing price P* = 100 (demand = 6,000 + 4,000 = 10,000 > supply = 5,000)
+        // - Buyers pro-rated 60% / 40%:
+        //   * `buyer_1` receives 3,000 shares @ P*=100 (cost = 300,000; refund from 660,000 escrow = 360,000 -> final bank bal = 150,000 + 360,000 = 510,000)
+        //   * `sh_2` receives 2,000 shares @ P*=100 (cost = 200,000; refund from 400,000 escrow = 200,000 -> final bank bal = 100,000 + 200,000 = 300,000)
+        // - Seller `sh_1` sells 5,000 shares @ P*=100 and receives 500,000 in `bank_ledger`!
+        // - `clearing_acct` balance returns to 0!
+        let settle_out = mock::transact_as(
+            sh_1,
+            share_ledger,
+            CallEncoder::<64>::new(selector("settleTransferAuction(address)"))
+                .push_address(&auc_auth)
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(u64::from_be_bytes(settle_out[24..32].try_into().unwrap()), 100);
+        assert_eq!(u64::from_be_bytes(settle_out[56..64].try_into().unwrap()), 5_000);
+
+        // Verify share balances
+        assert_eq!(bal_of(share_ledger, sh_1), 45_000);
+        assert_eq!(bal_of(share_ledger, buyer_1), 3_000);
+        assert_eq!(bal_of(share_ledger, sh_2), 12_000);
+
+        // Verify bank sub-account balances after DvP cash settlement & refunds
+        assert_eq!(bal_of(bank_ledger, sh_1), 500_000);
+        assert_eq!(bal_of(bank_ledger, buyer_1), 510_000);
+        assert_eq!(bal_of(bank_ledger, sh_2), 300_000);
+        assert_eq!(bal_of(bank_ledger, clearing_acct), 0);
     }
 }
