@@ -13,6 +13,7 @@ members = [
     "examples/asset-pair-otc",
     "examples/product-ledger",
     "examples/accounting-ledger",
+    "examples/dex-clob",
 ]
 
 [workspace.package]

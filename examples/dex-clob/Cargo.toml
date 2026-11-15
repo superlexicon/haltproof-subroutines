@@ -1,0 +1,13 @@
+[package]
+name = "dex-clob"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Discrete-Time FIFO Central Limit Orderbook (CLOB) DEX Haltproof Subroutine (HPS) attachable to any AssetLedger"
+
+[[bin]]
+name = "dex_clob"
+path = "src/main.rs"
+
+[dependencies]
+hps-sdk = { path = "../../crates/hps-sdk" }

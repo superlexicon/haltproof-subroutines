@@ -1621,6 +1621,7 @@ async fn product_ledger_and_accounting_ledger_e2e_on_localtestnet() {
     let ledger_wasm = std::fs::read(dist.join("asset_ledger.wasm")).unwrap();
     let product_wasm = std::fs::read(dist.join("product_ledger.wasm")).unwrap();
     let accounting_wasm = std::fs::read(dist.join("accounting_ledger.wasm")).unwrap();
+    let dex_wasm = std::fs::read(dist.join("dex_clob.wasm")).unwrap();
 
     let mut deployer = HpsSigner::from_hex(DEFAULT_DEV_PRIVATE_KEY, DEFAULT_CHAIN_ID).unwrap();
     deployer.default_gas_limit = U256::from(5_000_000u64);
@@ -1632,6 +1633,7 @@ async fn product_ledger_and_accounting_ledger_e2e_on_localtestnet() {
     let led_code = client.store_bytecode(&deployer, &ledger_wasm).await.unwrap();
     let prod_code = client.store_bytecode(&deployer, &product_wasm).await.unwrap();
     let acc_code = client.store_bytecode(&deployer, &accounting_wasm).await.unwrap();
+    let dex_code = client.store_bytecode(&deployer, &dex_wasm).await.unwrap();
 
     // Instantiate: 6 Identities, 1 IdentityRegistry, 1 Constitution, 1 Bank AssetLedger,
     // 1 AccountingLedger, 1 ProductLedger, 2 Authorization instances
@@ -2595,5 +2597,306 @@ async fn product_ledger_and_accounting_ledger_e2e_on_localtestnet() {
         "underwriting beyond 10% converted common-share allowance must revert"
     );
 
-    println!("[ProductLedger, AccountingLedger & Futures Underwriting E2E] All positive & negative checks passed! 100k Pref A @ 50% conversion -> 5,000 futures units created.");
+    // Step 10: Discrete-Time FIFO Central Limit Orderbook (`DexClob`) attached to `futures_ledger`
+    // and `bank_ledger`:
+    //   - Attach `dex_clob` to `futures_ledger` (base asset) and `bank_ledger` (quote cash),
+    //     using `clearing_acct_id` as the DEX escrow Identity.
+    //   - Block N1: `mano_id` places Bid @ 10 SGD for 400 futures units (escrows 4,000 SGD).
+    //   - Block N2 (later block):
+    //       * `evelyn_id` places Bid @ 10 SGD for 200 futures units (same price 10 SGD, later block N2)
+    //       * `catalog_oracle_id` places Bid @ 10 SGD for 600 futures units (same price 10 SGD, same block N2)
+    //       * `buyer2_id` places Bid @ 12 SGD for 200 futures units (higher price 12 SGD, block N2)
+    //       * `buyer1_id` (holder of 5,000 underwritten futures) places Ask @ 10 SGD for 1,000 futures units
+    //   - Block N3: Call `dexMatchBlock`:
+    //       * Single clearing price P* = 10 SGD, matched volume V* = 1,000 units:
+    //       * `buyer2_id` (Bid @ 12, blk N2, qty 200) -> fills 100% = 200 units (price priority!) + 400 SGD refund
+    //       * `mano_id` (Bid @ 10, blk N1, qty 400) -> fills 100% = 400 units (earliest block at price 10!)
+    //       * Marginal cohort `(price = 10, block = N2)` has `evelyn_id` (200) + `catalog_oracle_id` (600) = 800 units
+    //         competing for the remaining 400 units -> equal-priority pro-rata fill (50% each):
+    //           - `evelyn_id` receives 100 futures units
+    //           - `catalog_oracle_id` receives 300 futures units
+    //           - `buyer1_id` (seller) receives 10,000 SGD!
+    let dex_insts = client
+        .instantiate_batch(&deployer, &[(dex_code, Vec::new())])
+        .await
+        .unwrap();
+    let dex_hps = dex_insts[0];
+
+    let init_dex_inner = encode_values(
+        "initialize(address,address,address,address)",
+        &[
+            AbiValue::Address(registry),
+            AbiValue::Address(futures_ledger),
+            AbiValue::Address(bank_ledger),
+            AbiValue::Address(clearing_acct_id),
+        ],
+    );
+
+    let dex_setup_rcpts = client
+        .send_call_batch(
+            &deployer,
+            &[
+                (
+                    mano_id,
+                    encode_values(
+                        "execute(address,bytes)",
+                        &[AbiValue::Address(dex_hps), AbiValue::Bytes(init_dex_inner)],
+                    ),
+                    vec![dex_hps, registry, futures_ledger, bank_ledger, clearing_acct_id],
+                ),
+                (
+                    mano_id,
+                    encode_values(
+                        "setAttachedDex(address,address,address)",
+                        &[
+                            AbiValue::Address(futures_ledger),
+                            AbiValue::Address(dex_hps),
+                            AbiValue::Address(H160::zero()),
+                        ],
+                    ),
+                    vec![futures_ledger, registry, constitution, dex_hps],
+                ),
+                (
+                    mano_id,
+                    encode_values(
+                        "setAttachedDex(address,address,address)",
+                        &[
+                            AbiValue::Address(bank_ledger),
+                            AbiValue::Address(dex_hps),
+                            AbiValue::Address(H160::zero()),
+                        ],
+                    ),
+                    vec![bank_ledger, registry, constitution, dex_hps],
+                ),
+                // Fund `mano_id`, `evelyn_id`, and `catalog_oracle_id` with SGD in `bank_ledger` from `buyer1_id`
+                (
+                    buyer1_id,
+                    encode_values(
+                        "transferBankBalance(address,address,uint64)",
+                        &[
+                            AbiValue::Address(bank_ledger),
+                            AbiValue::Address(mano_id),
+                            AbiValue::Uint(U256::from(5_000u64)),
+                        ],
+                    ),
+                    vec![bank_ledger, registry, buyer1_id, mano_id],
+                ),
+                (
+                    buyer1_id,
+                    encode_values(
+                        "transferBankBalance(address,address,uint64)",
+                        &[
+                            AbiValue::Address(bank_ledger),
+                            AbiValue::Address(evelyn_id),
+                            AbiValue::Uint(U256::from(5_000u64)),
+                        ],
+                    ),
+                    vec![bank_ledger, registry, buyer1_id, evelyn_id],
+                ),
+                (
+                    buyer1_id,
+                    encode_values(
+                        "transferBankBalance(address,address,uint64)",
+                        &[
+                            AbiValue::Address(bank_ledger),
+                            AbiValue::Address(catalog_oracle_id),
+                            AbiValue::Uint(U256::from(10_000u64)),
+                        ],
+                    ),
+                    vec![bank_ledger, registry, buyer1_id, catalog_oracle_id],
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+    for (idx, r) in dex_setup_rcpts.iter().enumerate() {
+        assert!(r.status, "dex setup batch tx {idx} failed");
+    }
+
+    // Block N1: `mano_id` places early Bid @ 10 SGD for 400 futures units
+    let blk1_rcpt = client
+        .send_call_with_targets(
+            &deployer,
+            mano_id,
+            &encode_values(
+                "dexPlaceBid(address,uint64,uint64)",
+                &[
+                    AbiValue::Address(dex_hps),
+                    AbiValue::Uint(U256::from(10u64)),
+                    AbiValue::Uint(U256::from(400u64)),
+                ],
+            ),
+            &[dex_hps, registry, bank_ledger, mano_id, clearing_acct_id],
+        )
+        .await
+        .unwrap();
+    assert!(blk1_rcpt.status, "Block N1 dexPlaceBid failed");
+
+    // Block N2: `evelyn_id` (Bid @ 10, qty 200), `catalog_oracle_id` (Bid @ 10, qty 600),
+    // `buyer2_id` (Bid @ 12, qty 200), and `buyer1_id` (Ask @ 10, qty 1,000) all arrive in the same block!
+    let blk2_rcpts = client
+        .send_call_batch(
+            &deployer,
+            &[
+                (
+                    evelyn_id,
+                    encode_values(
+                        "dexPlaceBid(address,uint64,uint64)",
+                        &[
+                            AbiValue::Address(dex_hps),
+                            AbiValue::Uint(U256::from(10u64)),
+                            AbiValue::Uint(U256::from(200u64)),
+                        ],
+                    ),
+                    vec![dex_hps, registry, bank_ledger, evelyn_id, clearing_acct_id],
+                ),
+                (
+                    catalog_oracle_id,
+                    encode_values(
+                        "dexPlaceBid(address,uint64,uint64)",
+                        &[
+                            AbiValue::Address(dex_hps),
+                            AbiValue::Uint(U256::from(10u64)),
+                            AbiValue::Uint(U256::from(600u64)),
+                        ],
+                    ),
+                    vec![
+                        dex_hps,
+                        registry,
+                        bank_ledger,
+                        catalog_oracle_id,
+                        clearing_acct_id,
+                    ],
+                ),
+                (
+                    buyer2_id,
+                    encode_values(
+                        "dexPlaceBid(address,uint64,uint64)",
+                        &[
+                            AbiValue::Address(dex_hps),
+                            AbiValue::Uint(U256::from(12u64)),
+                            AbiValue::Uint(U256::from(200u64)),
+                        ],
+                    ),
+                    vec![dex_hps, registry, bank_ledger, buyer2_id, clearing_acct_id],
+                ),
+                (
+                    buyer1_id,
+                    encode_values(
+                        "dexPlaceAsk(address,uint64,uint64)",
+                        &[
+                            AbiValue::Address(dex_hps),
+                            AbiValue::Uint(U256::from(10u64)),
+                            AbiValue::Uint(U256::from(1_000u64)),
+                        ],
+                    ),
+                    vec![
+                        dex_hps,
+                        registry,
+                        futures_ledger,
+                        buyer1_id,
+                        clearing_acct_id,
+                    ],
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+    for (idx, r) in blk2_rcpts.iter().enumerate() {
+        assert!(r.status, "Block N2 order batch tx {idx} failed");
+    }
+
+    // Block N3: Execute `dexMatchBlock(dex_hps)` to ingest all orders from Blocks N1 & N2 and clear!
+    let match_rcpt = client
+        .send_call_with_targets(
+            &deployer,
+            mano_id,
+            &encode_values("dexMatchBlock(address)", &[AbiValue::Address(dex_hps)]),
+            &[
+                dex_hps,
+                registry,
+                futures_ledger,
+                bank_ledger,
+                clearing_acct_id,
+                mano_id,
+                evelyn_id,
+                catalog_oracle_id,
+                buyer2_id,
+                buyer1_id,
+            ],
+        )
+        .await
+        .unwrap();
+    assert!(match_rcpt.status, "dexMatchBlock failed");
+
+    // Verify single clearing price (10 SGD) and matched volume (1,000 units)
+    let summary_raw = client
+        .read_call(None, dex_hps, &encode_values("lastMatchSummary()", &[]))
+        .await
+        .unwrap();
+    let clearing_px = u64::from_be_bytes(summary_raw[56..64].try_into().unwrap());
+    let matched_vol = u64::from_be_bytes(summary_raw[88..96].try_into().unwrap());
+    let ingested_cnt = u64::from_be_bytes(summary_raw[120..128].try_into().unwrap());
+    assert_eq!(clearing_px, 10);
+    assert_eq!(matched_vol, 1_000);
+    assert_eq!(ingested_cnt, 5);
+
+    // Verify futures balances after price-first, earliest-block-second, same-block pro-rata matching:
+    // - `buyer2_id` (Bid @ 12, blk N2, qty 200) -> 200 units (100% fill via higher price priority)
+    // - `mano_id` (Bid @ 10, blk N1, qty 400) -> 400 units (100% fill via earliest block at price 10)
+    // - `evelyn_id` (Bid @ 10, blk N2, qty 200) -> 100 units (50% pro-rata fill in marginal block-N2 cohort)
+    // - `catalog_oracle_id` (Bid @ 10, blk N2, qty 600) -> 300 units (50% pro-rata fill in marginal block-N2 cohort)
+    // - `buyer1_id` (Ask @ 10, blk N2, qty 1,000) -> 4,000 remaining futures units (5,000 - 1,000)
+    assert_eq!(
+        read_u64(
+            &client,
+            futures_ledger,
+            "balanceOf(address)",
+            &[AbiValue::Address(buyer2_id)]
+        )
+        .await,
+        200
+    );
+    assert_eq!(
+        read_u64(
+            &client,
+            futures_ledger,
+            "balanceOf(address)",
+            &[AbiValue::Address(mano_id)]
+        )
+        .await,
+        400
+    );
+    assert_eq!(
+        read_u64(
+            &client,
+            futures_ledger,
+            "balanceOf(address)",
+            &[AbiValue::Address(evelyn_id)]
+        )
+        .await,
+        100
+    );
+    assert_eq!(
+        read_u64(
+            &client,
+            futures_ledger,
+            "balanceOf(address)",
+            &[AbiValue::Address(catalog_oracle_id)]
+        )
+        .await,
+        300
+    );
+    assert_eq!(
+        read_u64(
+            &client,
+            futures_ledger,
+            "balanceOf(address)",
+            &[AbiValue::Address(buyer1_id)]
+        )
+        .await,
+        4_000
+    );
+
+    println!("[ProductLedger, AccountingLedger, Futures Underwriting & DEX CLOB E2E] All checks passed! P* = 10 SGD, V* = 1,000 units (200 @ $12 + 400 @ $10 blk N1 + 100/300 pro-rata @ $10 blk N2).");
 }

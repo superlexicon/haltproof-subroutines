@@ -36,6 +36,7 @@ pub const ACTION_REVOKE_ROLE: [u8; 32] = keccak256(b"REVOKE_ROLE");
 pub const ACTION_REGISTER_PRODUCT_LEDGER: [u8; 32] = keccak256(b"REGISTER_PRODUCT_LEDGER");
 pub const ACTION_AUTHORIZE_FUTURES_UNDERWRITING: [u8; 32] =
     keccak256(b"AUTHORIZE_FUTURES_UNDERWRITING");
+pub const ACTION_SET_ATTACHED_DEX: [u8; 32] = keccak256(b"SET_ATTACHED_DEX");
 
 /// Canonical administrative Role IDs assigned by Directors (`POLICY_BOARD_RESOLUTION`) in `Constitution`.
 pub const ROLE_PRODUCT_MANAGER: [u8; 32] = keccak256(b"ROLE_PRODUCT_MANAGER");
@@ -91,6 +92,9 @@ pub const ERR_UNAUTHORIZED_SALES_RECORDER: i32 = -84;
 pub const ERR_MISSING_ROLE: i32 = -85;
 pub const ERR_INVALID_FUTURES_CONFIG: i32 = -86;
 pub const ERR_FUTURES_CAP_EXCEEDED: i32 = -87;
+pub const ERR_DEX_NOT_ATTACHED: i32 = -88;
+pub const ERR_ORDERBOOK_FULL: i32 = -89;
+pub const ERR_INVALID_DEX_ORDER: i32 = -90;
 pub const ERR_CONSTITUTION_MISMATCH: i32 = -19;
 
 /// Order side/step tags for `POLICY_SHARE_TRANSFER_AUCTION` 3-step share transfer auctions.

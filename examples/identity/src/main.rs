@@ -52,6 +52,11 @@ hps_entry! {
     "authorizeFuturesUnderwriting(address,address,uint64,address)"                    => handle_authorize_futures_underwriting,
     "underwriteFutures(address,uint64)"                                               => handle_underwrite_futures,
     "closeUnderwrittenFutures(address,uint64)"                                        => handle_close_underwritten_futures,
+    "setAttachedDex(address,address,address)"                                         => handle_set_attached_dex,
+    "dexPlaceBid(address,uint64,uint64)"                                              => handle_dex_place_bid,
+    "dexPlaceAsk(address,uint64,uint64)"                                              => handle_dex_place_ask,
+    "dexCancelOrder(address,uint64)"                                                  => handle_dex_cancel_order,
+    "dexMatchBlock(address)"                                                          => handle_dex_match_block,
     "upsertProduct(address,bytes32,uint64,uint64,bytes,address)"                      => handle_upsert_product,
     "restockProduct(address,bytes32,uint64,uint64,address)"                           => handle_restock_product,
     "setProductPrice(address,bytes32,uint64,address)"                                 => handle_set_product_price,
@@ -562,6 +567,72 @@ fn handle_close_underwritten_futures(args: &CalldataReader) -> Result<(), i32> {
         .push_u64(amount);
     let rem_underwritten = call::call_u64(&constitution, sub_cd.as_slice())?;
     ret::write_u64_word(rem_underwritten);
+    Ok(())
+}
+
+fn handle_set_attached_dex(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let ledger = args.address(0).ok_or(-3)?;
+    let dex_hps = args.address(1).ok_or(-3)?;
+    let auth_obj = args.address(2).ok_or(-3)?;
+
+    let sub_cd = CallEncoder::<96>::new(const { selector("setAttachedDex(address,address)") })
+        .push_address(&dex_hps)
+        .push_address(&auth_obj);
+    let ok = call::call_bool(&ledger, sub_cd.as_slice())?;
+    if !ok {
+        return Err(-24);
+    }
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_dex_place_bid(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let dex_hps = args.address(0).ok_or(-3)?;
+    let price = args.u64(1).ok_or(-3)?;
+    let quantity = args.u64(2).ok_or(-3)?;
+
+    let sub_cd = CallEncoder::<96>::new(const { selector("placeBid(uint64,uint64)") })
+        .push_u64(price)
+        .push_u64(quantity);
+    let order_id = call::call_u64(&dex_hps, sub_cd.as_slice())?;
+    ret::write_u64_word(order_id);
+    Ok(())
+}
+
+fn handle_dex_place_ask(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let dex_hps = args.address(0).ok_or(-3)?;
+    let price = args.u64(1).ok_or(-3)?;
+    let quantity = args.u64(2).ok_or(-3)?;
+
+    let sub_cd = CallEncoder::<96>::new(const { selector("placeAsk(uint64,uint64)") })
+        .push_u64(price)
+        .push_u64(quantity);
+    let order_id = call::call_u64(&dex_hps, sub_cd.as_slice())?;
+    ret::write_u64_word(order_id);
+    Ok(())
+}
+
+fn handle_dex_cancel_order(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let dex_hps = args.address(0).ok_or(-3)?;
+    let order_id = args.u64(1).ok_or(-3)?;
+
+    let sub_cd = CallEncoder::<64>::new(const { selector("cancelOrder(uint64)") }).push_u64(order_id);
+    let refunded = call::call_u64(&dex_hps, sub_cd.as_slice())?;
+    ret::write_u64_word(refunded);
+    Ok(())
+}
+
+fn handle_dex_match_block(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let dex_hps = args.address(0).ok_or(-3)?;
+
+    let sub_cd = CallEncoder::<16>::new(const { selector("matchBlock()") });
+    let out = call::call_raw(&dex_hps, sub_cd.as_slice())?;
+    ret::write(out);
     Ok(())
 }
 

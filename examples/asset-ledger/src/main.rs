@@ -25,8 +25,9 @@ use hps_sdk::call::{self, CallEncoder};
 use hps_sdk::governance::{
     oracle_policy_id, require_valid_identity, verify_and_consume_auction_auth,
     verify_and_consume_auth, ActionHasher, AuctionOrder, ACTION_APPROVE, ACTION_CANCEL,
-    ACTION_ISSUE, ACTION_SUPER, ACTION_TRANSFER, ERR_CONSTITUTION_MISMATCH, ERR_NO_CROSSING_ORDERS,
-    MAX_AUCTION_ORDERS, POLICY_HOLDER_SELF, POLICY_SHARE_TRANSFER_AUCTION,
+    ACTION_ISSUE, ACTION_SET_ATTACHED_DEX, ACTION_SUPER, ACTION_TRANSFER,
+    ERR_CONSTITUTION_MISMATCH, ERR_DEX_NOT_ATTACHED, ERR_NO_CROSSING_ORDERS, MAX_AUCTION_ORDERS,
+    POLICY_HOLDER_SELF, POLICY_SHARE_TRANSFER_AUCTION,
 };
 use hps_sdk::storage::KeyBuilder;
 use hps_sdk::{context, event_topic, events, hps_entry, ret, selector, storage};
@@ -41,6 +42,7 @@ const TRANSFER_TOPIC: [u8; 32] = event_topic("Transfer(address,address,uint64)")
 const APPROVAL_TOPIC: [u8; 32] = event_topic("Approval(address,address,uint64)");
 const PERMISSION_SET_TOPIC: [u8; 32] =
     event_topic("PermissionUpdated(bytes32,address,bytes32,address)");
+const DEX_ATTACHED_TOPIC: [u8; 32] = event_topic("DexAttached(address,address)");
 const AUCTION_SETTLED_TOPIC: [u8; 32] =
     event_topic("AuctionTransferSettled(address,uint64,uint64,uint64,uint64,uint64,uint64)");
 const AUCTION_BUYER_FILLED: [u8; 32] =
@@ -51,6 +53,7 @@ const AUCTION_SELLER_FILLED: [u8; 32] =
 const KEY_INIT: &[u8] = b"meta:init";
 const KEY_REGISTRY: &[u8] = b"meta:registry";
 const KEY_CONSTITUTION: &[u8] = b"meta:constitution";
+const KEY_ATTACHED_DEX: &[u8] = b"meta:dex";
 const KEY_SYMBOL: &[u8] = b"meta:symbol";
 const KEY_DECIMALS: &[u8] = b"meta:decimals";
 const KEY_SUPPLY: &[u8] = b"meta:supply";
@@ -69,6 +72,8 @@ hps_entry! {
     "constitutionClearTransfer(address,address,uint64)"     => handle_constitution_clear_transfer,
     "constitutionIssue(address,uint64)"                     => handle_constitution_issue,
     "constitutionCancel(address,uint64)"                    => handle_constitution_cancel,
+    "setAttachedDex(address,address)"                       => handle_set_attached_dex,
+    "dexTransfer(address,address,uint64)"                   => handle_dex_transfer,
     "settleTransferAuction(address)"                        => handle_settle_transfer_auction,
     "approve(address,uint64,address)"                       => handle_approve,
     "transferFrom(address,address,uint64)"                  => handle_transfer_from,
@@ -82,6 +87,7 @@ hps_entry! {
     "symbol()"                                              => handle_symbol,
     "identityRegistry()"                                    => handle_identity_registry,
     "associatedConstitution()"                              => handle_associated_constitution,
+    "attachedDex()"                                         => handle_attached_dex,
     "getPermission(bytes32)"                                => handle_get_permission,
     "lastAuctionSettlement()"                               => handle_last_auction_settlement,
     "hashIssue(address,uint64)"                             => handle_hash_issue,
@@ -89,6 +95,7 @@ hps_entry! {
     "hashTransfer(address,address,uint64)"                  => handle_hash_transfer,
     "hashApprove(address,address,uint64)"                   => handle_hash_approve,
     "hashSetPermission(bytes32,address,bytes32)"            => handle_hash_set_permission,
+    "hashSetAttachedDex(address)"                           => handle_hash_set_attached_dex,
 }
 
 #[derive(Clone, Copy)]
@@ -258,6 +265,12 @@ fn compute_set_perm_hash(
         .push_bytes32(action_key)
         .push_address(constitution)
         .push_bytes32(policy_id)
+        .finish()
+}
+
+fn compute_set_attached_dex_hash(dex_hps: &[u8; 20]) -> [u8; 32] {
+    ActionHasher::<128>::new(&context::self_address(), &ACTION_SET_ATTACHED_DEX)
+        .push_address(dex_hps)
         .finish()
 }
 
@@ -713,6 +726,82 @@ fn handle_constitution_cancel(args: &CalldataReader) -> Result<(), i32> {
         &amount.to_be_bytes(),
     );
     ret::write_u64_word(new_bal);
+    Ok(())
+}
+
+/// Attach a `DexClob` matching engine HPS to this `AssetLedger` to turn it into an exchange.
+/// - If no DEX is attached yet (`attachedDex() == 0x0`) and `authObj == 0x0`, any valid caller
+///   Identity (or the pinned `Constitution`) can bootstrap-attach `dexHps`.
+/// - Otherwise, requires and consumes a `SUPER` `Authorization` HPS (`ACTION_SUPER`) matching
+///   `hashSetAttachedDex(dexHps)`.
+fn handle_set_attached_dex(args: &CalldataReader) -> Result<(), i32> {
+    let (registry, caller) = ensure_initialized_and_valid_caller()?;
+    let dex_hps = args.address(0).ok_or(-3)?;
+    let auth_obj = args.address(1).ok_or(-3)?;
+    if dex_hps == [0u8; 20] {
+        return Err(-14);
+    }
+
+    let current_dex = storage::get_address(KEY_ATTACHED_DEX).unwrap_or([0u8; 20]);
+    if !(current_dex == [0u8; 20] && auth_obj == [0u8; 20]) {
+        let action_hash = compute_set_attached_dex_hash(&dex_hps);
+        require_and_consume_permission(
+            &registry,
+            &ACTION_SUPER,
+            None,
+            &action_hash,
+            &auth_obj,
+            &caller,
+        )?;
+    }
+
+    storage::set_address(KEY_ATTACHED_DEX, &dex_hps);
+    events::emit(
+        &[DEX_ATTACHED_TOPIC, addr_topic(&dex_hps), addr_topic(&caller)],
+        &auth_obj,
+    );
+    ret::write_bool(true);
+    Ok(())
+}
+
+/// Execute an atomic order-escrow or order-settlement transfer between two verified Identities,
+/// callable exclusively by this ledger's `attachedDex()` or `associatedConstitution()`.
+fn handle_dex_transfer(args: &CalldataReader) -> Result<(), i32> {
+    if storage::get_u64(KEY_INIT) != 1 {
+        return Err(-10);
+    }
+    let sender = context::msg_sender();
+    let attached_dex = storage::get_address(KEY_ATTACHED_DEX).unwrap_or([0u8; 20]);
+    let pinned_con = storage::get_address(KEY_CONSTITUTION).unwrap_or([0u8; 20]);
+    let authorized = (attached_dex != [0u8; 20] && sender == attached_dex)
+        || (pinned_con != [0u8; 20] && sender == pinned_con);
+    if !authorized {
+        return Err(ERR_DEX_NOT_ATTACHED);
+    }
+
+    let registry = storage::get_address(KEY_REGISTRY).ok_or(-10)?;
+    let from_identity = args.address(0).ok_or(-3)?;
+    let to_identity = args.address(1).ok_or(-3)?;
+    let amount = args.u64(2).ok_or(-3)?;
+    if amount == 0 || from_identity == to_identity {
+        return Err(-14);
+    }
+
+    require_valid_identity(&registry, &from_identity)?;
+    require_valid_identity(&registry, &to_identity)?;
+
+    internal_debit(&from_identity, amount)?;
+    internal_credit(&to_identity, amount)?;
+
+    events::emit(
+        &[
+            TRANSFER_TOPIC,
+            addr_topic(&from_identity),
+            addr_topic(&to_identity),
+        ],
+        &amount.to_be_bytes(),
+    );
+    ret::write_bool(true);
     Ok(())
 }
 
@@ -1432,6 +1521,11 @@ fn handle_associated_constitution(_args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
+fn handle_attached_dex(_args: &CalldataReader) -> Result<(), i32> {
+    ret::write_address(&storage::get_address(KEY_ATTACHED_DEX).unwrap_or([0u8; 20]));
+    Ok(())
+}
+
 fn handle_get_permission(args: &CalldataReader) -> Result<(), i32> {
     let action_key = args.bytes32(0).ok_or(-3)?;
     let mut out = [0u8; 96];
@@ -1489,6 +1583,12 @@ fn handle_hash_set_permission(args: &CalldataReader) -> Result<(), i32> {
     let con = args.address(1).ok_or(-3)?;
     let pol = args.bytes32(2).ok_or(-3)?;
     ret::write_word(&compute_set_perm_hash(&act, &con, &pol));
+    Ok(())
+}
+
+fn handle_hash_set_attached_dex(args: &CalldataReader) -> Result<(), i32> {
+    let dex = args.address(0).ok_or(-3)?;
+    ret::write_word(&compute_set_attached_dex_hash(&dex));
     Ok(())
 }
 
