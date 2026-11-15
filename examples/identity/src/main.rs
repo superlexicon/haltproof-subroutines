@@ -49,6 +49,9 @@ hps_entry! {
     "setProductOracle(address,address,address,uint64,address)"                        => handle_set_product_oracle,
     "setClearingAccount(address,address,address,address)"                             => handle_set_clearing_account,
     "registerShareClass(address,address,uint64,uint64,uint64,address)"                => handle_register_share_class,
+    "authorizeFuturesUnderwriting(address,address,uint64,address)"                    => handle_authorize_futures_underwriting,
+    "underwriteFutures(address,uint64)"                                               => handle_underwrite_futures,
+    "closeUnderwrittenFutures(address,uint64)"                                        => handle_close_underwritten_futures,
     "upsertProduct(address,bytes32,uint64,uint64,bytes,address)"                      => handle_upsert_product,
     "restockProduct(address,bytes32,uint64,uint64,address)"                           => handle_restock_product,
     "setProductPrice(address,bytes32,uint64,address)"                                 => handle_set_product_price,
@@ -517,6 +520,48 @@ fn handle_register_share_class(args: &CalldataReader) -> Result<(), i32> {
     .push_address(&super_auth);
     let count = call::call_u64(&constitution, sub_cd.as_slice())?;
     ret::write_u64_word(count);
+    Ok(())
+}
+
+fn handle_authorize_futures_underwriting(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let constitution = args.address(0).ok_or(-3)?;
+    let futures_ledger = args.address(1).ok_or(-3)?;
+    let underwrite_pct = args.u64(2).ok_or(-3)?;
+    let super_auth = args.address(3).ok_or(-3)?;
+
+    let sub_cd = CallEncoder::<128>::new(const {
+        selector("authorizeFuturesUnderwriting(address,uint64,address)")
+    })
+    .push_address(&futures_ledger)
+    .push_u64(underwrite_pct)
+    .push_address(&super_auth);
+    let cap = call::call_u64(&constitution, sub_cd.as_slice())?;
+    ret::write_u64_word(cap);
+    Ok(())
+}
+
+fn handle_underwrite_futures(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let constitution = args.address(0).ok_or(-3)?;
+    let amount = args.u64(1).ok_or(-3)?;
+
+    let sub_cd = CallEncoder::<64>::new(const { selector("underwriteFutures(uint64)") })
+        .push_u64(amount);
+    let total_underwritten = call::call_u64(&constitution, sub_cd.as_slice())?;
+    ret::write_u64_word(total_underwritten);
+    Ok(())
+}
+
+fn handle_close_underwritten_futures(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let constitution = args.address(0).ok_or(-3)?;
+    let amount = args.u64(1).ok_or(-3)?;
+
+    let sub_cd = CallEncoder::<64>::new(const { selector("closeUnderwrittenFutures(uint64)") })
+        .push_u64(amount);
+    let rem_underwritten = call::call_u64(&constitution, sub_cd.as_slice())?;
+    ret::write_u64_word(rem_underwritten);
     Ok(())
 }
 

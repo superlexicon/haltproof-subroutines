@@ -67,6 +67,8 @@ hps_entry! {
     "transfer(address,address,uint64,address)"              => handle_transfer,
     "transferDirect(address,uint64)"                        => handle_transfer_direct,
     "constitutionClearTransfer(address,address,uint64)"     => handle_constitution_clear_transfer,
+    "constitutionIssue(address,uint64)"                     => handle_constitution_issue,
+    "constitutionCancel(address,uint64)"                    => handle_constitution_cancel,
     "settleTransferAuction(address)"                        => handle_settle_transfer_auction,
     "approve(address,uint64,address)"                       => handle_approve,
     "transferFrom(address,address,uint64)"                  => handle_transfer_from,
@@ -623,6 +625,94 @@ fn handle_constitution_clear_transfer(args: &CalldataReader) -> Result<(), i32> 
         &amount.to_be_bytes(),
     );
     ret::write_bool(true);
+    Ok(())
+}
+
+/// Mint `amount` units to `toIdentity`, invoked exclusively by this ledger's pinned
+/// `associatedConstitution()` (e.g., when a shareholder underwrites futures contracts).
+fn handle_constitution_issue(args: &CalldataReader) -> Result<(), i32> {
+    if storage::get_u64(KEY_INIT) != 1 {
+        return Err(-10);
+    }
+    let pinned_con = storage::get_address(KEY_CONSTITUTION).unwrap_or([0u8; 20]);
+    if pinned_con == [0u8; 20] || context::msg_sender() != pinned_con {
+        return Err(ERR_CONSTITUTION_MISMATCH);
+    }
+    let registry = storage::get_address(KEY_REGISTRY).ok_or(-10)?;
+    let to_identity = args.address(0).ok_or(-3)?;
+    let amount = args.u64(1).ok_or(-3)?;
+    if amount == 0 {
+        return Err(-14);
+    }
+
+    require_valid_identity(&registry, &to_identity)?;
+
+    let new_supply = storage::get_u64(KEY_SUPPLY)
+        .checked_add(amount)
+        .ok_or(-15)?;
+    let new_bal = internal_credit(&to_identity, amount)?;
+    storage::set_u64(KEY_SUPPLY, new_supply);
+
+    let mut ev = [0u8; 24];
+    ev[0..8].copy_from_slice(&amount.to_be_bytes());
+    ev[8..16].copy_from_slice(&new_supply.to_be_bytes());
+    ev[16..24].copy_from_slice(&new_bal.to_be_bytes());
+    events::emit(
+        &[ISSUED_TOPIC, addr_topic(&to_identity), addr_topic(&pinned_con)],
+        &ev,
+    );
+    events::emit(
+        &[TRANSFER_TOPIC, addr_topic(&[0u8; 20]), addr_topic(&to_identity)],
+        &amount.to_be_bytes(),
+    );
+    ret::write_u64_word(new_bal);
+    Ok(())
+}
+
+/// Burn `amount` units from `fromIdentity`, invoked exclusively by this ledger's pinned
+/// `associatedConstitution()` (e.g., when a shareholder closes underwritten futures contracts).
+fn handle_constitution_cancel(args: &CalldataReader) -> Result<(), i32> {
+    if storage::get_u64(KEY_INIT) != 1 {
+        return Err(-10);
+    }
+    let pinned_con = storage::get_address(KEY_CONSTITUTION).unwrap_or([0u8; 20]);
+    if pinned_con == [0u8; 20] || context::msg_sender() != pinned_con {
+        return Err(ERR_CONSTITUTION_MISMATCH);
+    }
+    let registry = storage::get_address(KEY_REGISTRY).ok_or(-10)?;
+    let from_identity = args.address(0).ok_or(-3)?;
+    let amount = args.u64(1).ok_or(-3)?;
+    if amount == 0 {
+        return Err(-14);
+    }
+
+    require_valid_identity(&registry, &from_identity)?;
+
+    let cur_supply = storage::get_u64(KEY_SUPPLY);
+    if cur_supply < amount {
+        return Err(-16);
+    }
+    let new_bal = internal_debit(&from_identity, amount)?;
+    let new_supply = cur_supply - amount;
+    storage::set_u64(KEY_SUPPLY, new_supply);
+
+    let mut ev = [0u8; 24];
+    ev[0..8].copy_from_slice(&amount.to_be_bytes());
+    ev[8..16].copy_from_slice(&new_supply.to_be_bytes());
+    ev[16..24].copy_from_slice(&new_bal.to_be_bytes());
+    events::emit(
+        &[
+            CANCELLED_TOPIC,
+            addr_topic(&from_identity),
+            addr_topic(&pinned_con),
+        ],
+        &ev,
+    );
+    events::emit(
+        &[TRANSFER_TOPIC, addr_topic(&from_identity), addr_topic(&[0u8; 20])],
+        &amount.to_be_bytes(),
+    );
+    ret::write_u64_word(new_bal);
     Ok(())
 }
 

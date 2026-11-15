@@ -2288,5 +2288,312 @@ async fn product_ledger_and_accounting_ledger_e2e_on_localtestnet() {
         .await,
         25_000
     );
-    println!("[ProductLedger & AccountingLedger E2E] All positive & negative checks passed! Total Revenue = 25,000 SGD across 2 sales (9 units).");
+
+    // Step 9: Constitutional Futures Underwriting across share classes:
+    // - `common_ledger`: 100,000 Common Shares (held by `mano_id`, 1:1 voting, 100% conversion to Common).
+    // - `pref_a_ledger`: 100,000 Preferred Shares Class A (held by `buyer1_id`, who holds 0 Common
+    //   Shares; 1:1 voting, 50% conversion rate to Common Shares -> 50,000 common-equivalent).
+    // - Constitutional process authorizes 10% (`underwritePct = 10`) of total outstanding shares
+    //   to be underwritten as a single class of futures contracts (`futures_ledger`).
+    // - `buyer1_id` (with only 100,000 Preferred Shares A @ 50% conversion = 50,000 common-equivalent)
+    //   can therefore create 5,000 units of futures contracts (`10% * 50,000 = 5,000`), and attempting
+    //   to create even 1 extra unit reverts!
+    let fut_insts = client
+        .instantiate_batch(
+            &deployer,
+            &[
+                (led_code, Vec::new()),
+                (led_code, Vec::new()),
+                (led_code, Vec::new()),
+                (auth_code, Vec::new()),
+            ],
+        )
+        .await
+        .unwrap();
+    let common_ledger = fut_insts[0];
+    let pref_a_ledger = fut_insts[1];
+    let futures_ledger = fut_insts[2];
+    let futures_auth = fut_insts[3];
+
+    let mut common_allocs = Vec::new();
+    common_allocs.extend_from_slice(mano_id.as_bytes());
+    common_allocs.extend_from_slice(&100_000u64.to_be_bytes());
+
+    let mut pref_a_allocs = Vec::new();
+    pref_a_allocs.extend_from_slice(buyer1_id.as_bytes());
+    pref_a_allocs.extend_from_slice(&100_000u64.to_be_bytes());
+
+    let mut share_perms = Vec::new();
+    for act in [
+        ACTION_SUPER,
+        ACTION_ISSUE,
+        ACTION_CANCEL,
+        ACTION_TRANSFER,
+        ACTION_APPROVE,
+    ] {
+        share_perms.extend_from_slice(&pack_permission(act, constitution, POLICY_SUPER_GOVERNANCE));
+    }
+
+    let init_common_inner = encode_values(
+        "initialize(address,string,uint64,bytes,bytes)",
+        &[
+            AbiValue::Address(registry),
+            AbiValue::Bytes(b"SLX-COMMON".to_vec()),
+            AbiValue::Uint(U256::from(0u64)),
+            AbiValue::Bytes(common_allocs),
+            AbiValue::Bytes(share_perms.clone()),
+        ],
+    );
+    let init_pref_a_inner = encode_values(
+        "initialize(address,string,uint64,bytes,bytes)",
+        &[
+            AbiValue::Address(registry),
+            AbiValue::Bytes(b"SLX-PREF-A".to_vec()),
+            AbiValue::Uint(U256::from(0u64)),
+            AbiValue::Bytes(pref_a_allocs),
+            AbiValue::Bytes(share_perms.clone()),
+        ],
+    );
+    let init_futures_inner = encode_values(
+        "initialize(address,string,uint64,bytes,bytes)",
+        &[
+            AbiValue::Address(registry),
+            AbiValue::Bytes(b"SLX-FUT-1".to_vec()),
+            AbiValue::Uint(U256::from(0u64)),
+            AbiValue::Bytes(Vec::new()),
+            AbiValue::Bytes(share_perms),
+        ],
+    );
+
+    let setup_rcpts = client
+        .send_call_batch(
+            &deployer,
+            &[
+                (
+                    mano_id,
+                    encode_values(
+                        "execute(address,bytes)",
+                        &[
+                            AbiValue::Address(common_ledger),
+                            AbiValue::Bytes(init_common_inner),
+                        ],
+                    ),
+                    vec![common_ledger, registry, constitution, mano_id],
+                ),
+                (
+                    mano_id,
+                    encode_values(
+                        "execute(address,bytes)",
+                        &[
+                            AbiValue::Address(pref_a_ledger),
+                            AbiValue::Bytes(init_pref_a_inner),
+                        ],
+                    ),
+                    vec![pref_a_ledger, registry, constitution, buyer1_id],
+                ),
+                (
+                    mano_id,
+                    encode_values(
+                        "execute(address,bytes)",
+                        &[
+                            AbiValue::Address(futures_ledger),
+                            AbiValue::Bytes(init_futures_inner),
+                        ],
+                    ),
+                    vec![futures_ledger, registry, constitution],
+                ),
+                (
+                    mano_id,
+                    encode_values(
+                        "registerShareClass(address,address,uint64,uint64,uint64,address)",
+                        &[
+                            AbiValue::Address(constitution),
+                            AbiValue::Address(common_ledger),
+                            AbiValue::Uint(U256::from(1u64)),
+                            AbiValue::Uint(U256::from(1u64)),
+                            AbiValue::Uint(U256::from(1u64)), // 100% conversion (Common Shares)
+                            AbiValue::Address(H160::zero()),
+                        ],
+                    ),
+                    vec![constitution, registry, common_ledger],
+                ),
+                (
+                    mano_id,
+                    encode_values(
+                        "registerShareClass(address,address,uint64,uint64,uint64,address)",
+                        &[
+                            AbiValue::Address(constitution),
+                            AbiValue::Address(pref_a_ledger),
+                            AbiValue::Uint(U256::from(1u64)),
+                            AbiValue::Uint(U256::from(1u64)),
+                            AbiValue::Uint(U256::from(2u64)), // 50% conversion rate to Common Shares
+                            AbiValue::Address(H160::zero()),
+                        ],
+                    ),
+                    vec![constitution, registry, pref_a_ledger],
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+    for (idx, r) in setup_rcpts.iter().enumerate() {
+        assert!(r.status, "futures setup batch tx {idx} failed");
+    }
+
+    let hash_auth_fut = read_b32(
+        &client,
+        constitution,
+        "hashAuthorizeFuturesUnderwriting(address,uint64)",
+        &[
+            AbiValue::Address(futures_ledger),
+            AbiValue::Uint(U256::from(10u64)), // 10%
+        ],
+    )
+    .await;
+
+    let auth_fut_rcpts = client
+        .send_call_batch(
+            &deployer,
+            &[
+                (
+                    mano_id,
+                    encode_values(
+                        "initConstitutionAuth(address,address,address,address,bytes32,bytes32)",
+                        &[
+                            AbiValue::Address(futures_auth),
+                            AbiValue::Address(registry),
+                            AbiValue::Address(constitution),
+                            AbiValue::Address(constitution),
+                            AbiValue::Bytes32(POLICY_SUPER_GOVERNANCE),
+                            AbiValue::Bytes32(hash_auth_fut),
+                        ],
+                    ),
+                    vec![
+                        futures_auth,
+                        registry,
+                        constitution,
+                        mano_id,
+                        evelyn_id,
+                        common_ledger,
+                        pref_a_ledger,
+                    ],
+                ),
+                (
+                    mano_id,
+                    encode_values("approveAuth(address)", &[AbiValue::Address(futures_auth)]),
+                    vec![
+                        futures_auth,
+                        registry,
+                        constitution,
+                        common_ledger,
+                        pref_a_ledger,
+                    ],
+                ),
+                (
+                    buyer1_id,
+                    encode_values(
+                        "approveAndFinalizeAuth(address)",
+                        &[AbiValue::Address(futures_auth)],
+                    ),
+                    vec![
+                        futures_auth,
+                        registry,
+                        constitution,
+                        common_ledger,
+                        pref_a_ledger,
+                    ],
+                ),
+                (
+                    mano_id,
+                    encode_values(
+                        "authorizeFuturesUnderwriting(address,address,uint64,address)",
+                        &[
+                            AbiValue::Address(constitution),
+                            AbiValue::Address(futures_ledger),
+                            AbiValue::Uint(U256::from(10u64)),
+                            AbiValue::Address(futures_auth),
+                        ],
+                    ),
+                    vec![
+                        constitution,
+                        registry,
+                        futures_ledger,
+                        common_ledger,
+                        pref_a_ledger,
+                        futures_auth,
+                    ],
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+    for (idx, r) in auth_fut_rcpts.iter().enumerate() {
+        assert!(r.status, "futures auth batch tx {idx} failed");
+    }
+
+    // `buyer1_id` (100,000 Preferred Shares A @ 50% conversion = 50,000 common-equivalent)
+    // underwrites 5,000 units of the single-class futures contract (`10% * 50,000 = 5,000`)
+    let uw_rcpt = client
+        .send_call_with_targets(
+            &deployer,
+            buyer1_id,
+            &encode_values(
+                "underwriteFutures(address,uint64)",
+                &[
+                    AbiValue::Address(constitution),
+                    AbiValue::Uint(U256::from(5_000u64)),
+                ],
+            ),
+            &[
+                constitution,
+                registry,
+                common_ledger,
+                pref_a_ledger,
+                futures_ledger,
+                buyer1_id,
+            ],
+        )
+        .await
+        .unwrap();
+    assert!(uw_rcpt.status, "underwriteFutures(5000) failed");
+    assert_eq!(
+        read_u64(
+            &client,
+            futures_ledger,
+            "balanceOf(address)",
+            &[AbiValue::Address(buyer1_id)]
+        )
+        .await,
+        5_000
+    );
+
+    // Negative test: `buyer1_id` attempting to underwrite even 1 more unit (5,001 > 5,000) MUST revert!
+    let over_uw_rcpt = client
+        .send_call_with_targets(
+            &deployer,
+            buyer1_id,
+            &encode_values(
+                "underwriteFutures(address,uint64)",
+                &[
+                    AbiValue::Address(constitution),
+                    AbiValue::Uint(U256::from(1u64)),
+                ],
+            ),
+            &[
+                constitution,
+                registry,
+                common_ledger,
+                pref_a_ledger,
+                futures_ledger,
+                buyer1_id,
+            ],
+        )
+        .await
+        .unwrap();
+    assert!(
+        !over_uw_rcpt.status,
+        "underwriting beyond 10% converted common-share allowance must revert"
+    );
+
+    println!("[ProductLedger, AccountingLedger & Futures Underwriting E2E] All positive & negative checks passed! 100k Pref A @ 50% conversion -> 5,000 futures units created.");
 }

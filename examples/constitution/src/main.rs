@@ -17,12 +17,14 @@ use hps_sdk::abi::CalldataReader;
 use hps_sdk::call::{self, CallEncoder};
 use hps_sdk::governance::{
     oracle_policy_id, require_valid_identity, verify_and_consume_auth, ActionHasher, PolicySpec,
-    ShareClassSpec, StageSpec, ACTION_ADD_DIRECTOR, ACTION_GRANT_ROLE, ACTION_REGISTER_SHARE_CLASS,
-    ACTION_REMOVE_DIRECTOR, ACTION_RESTOCK_PRODUCT, ACTION_REVOKE_ROLE, ACTION_SET_BANK_ORACLE,
-    ACTION_SET_CLEARING_ACCOUNT, ACTION_SET_PRODUCT_ORACLE, ACTION_SET_PRODUCT_PRICE,
-    ACTION_UPSERT_PRODUCT, ERR_MISSING_ROLE, ERR_POLICY_INVALID, MAX_ENCODED_POLICY_BYTES,
-    MAX_MEMBERS_PER_STAGE, MAX_SHARE_CLASSES, POLICY_BANK_ORACLE, POLICY_BOARD_RESOLUTION,
-    POLICY_PRODUCT_ORACLE, POLICY_SUPER_GOVERNANCE, ROLE_PRODUCT_MANAGER,
+    ShareClassSpec, StageSpec, ACTION_ADD_DIRECTOR, ACTION_AUTHORIZE_FUTURES_UNDERWRITING,
+    ACTION_GRANT_ROLE, ACTION_REGISTER_SHARE_CLASS, ACTION_REMOVE_DIRECTOR, ACTION_RESTOCK_PRODUCT,
+    ACTION_REVOKE_ROLE, ACTION_SET_BANK_ORACLE, ACTION_SET_CLEARING_ACCOUNT,
+    ACTION_SET_PRODUCT_ORACLE, ACTION_SET_PRODUCT_PRICE, ACTION_UPSERT_PRODUCT,
+    ERR_FUTURES_CAP_EXCEEDED, ERR_INVALID_FUTURES_CONFIG, ERR_MISSING_ROLE, ERR_POLICY_INVALID,
+    MAX_ENCODED_POLICY_BYTES, MAX_MEMBERS_PER_STAGE, MAX_SHARE_CLASSES, POLICY_BANK_ORACLE,
+    POLICY_BOARD_RESOLUTION, POLICY_PRODUCT_ORACLE, POLICY_SHAREHOLDER_SUPERMAJORITY,
+    POLICY_SUPER_GOVERNANCE, ROLE_PRODUCT_MANAGER,
 };
 use hps_sdk::keccak::keccak256;
 use hps_sdk::storage::KeyBuilder;
@@ -48,6 +50,12 @@ const PRODUCT_PAYMENT_CLEARED: [u8; 32] =
     event_topic("ProductPaymentCleared(address,address,uint64)");
 const SHARE_CLASS_REGISTERED: [u8; 32] =
     event_topic("ShareClassRegistered(address,uint64,uint64,uint64)");
+const FUTURES_UNDERWRITING_AUTHORIZED: [u8; 32] =
+    event_topic("FuturesUnderwritingAuthorized(address,uint64,uint64,address)");
+const FUTURES_UNDERWRITTEN: [u8; 32] =
+    event_topic("FuturesUnderwritten(address,address,uint64,uint64,uint64)");
+const FUTURES_CLOSED: [u8; 32] =
+    event_topic("FuturesClosed(address,address,uint64,uint64)");
 
 const TAG_SET_POLICY: [u8; 32] = keccak256(b"CONSTITUTION_SET_POLICY");
 const TAG_DEACTIVATE_POLICY: [u8; 32] = keccak256(b"CONSTITUTION_DEACTIVATE_POLICY");
@@ -59,6 +67,8 @@ const KEY_BOARD_EXPIRY: &[u8] = b"con:board_exp";
 const KEY_CLEARING_ACCOUNT: &[u8] = b"con:clear_acct";
 const KEY_DEFAULT_BANK_LEDGER: &[u8] = b"con:bank_led";
 const KEY_SHARE_CLASSES_BLOB: &[u8] = b"con:sh_classes";
+const KEY_FUTURES_LEDGER: &[u8] = b"con:fut_led";
+const KEY_FUTURES_PCT: &[u8] = b"con:fut_pct";
 
 hps_entry! {
     "initialize(address,bytes)"                                           => handle_initialize,
@@ -95,6 +105,13 @@ hps_entry! {
     "shareClassCount()"                                                   => handle_share_class_count,
     "getShareClass(uint64)"                                               => handle_get_share_class,
     "shareholderVotingPower(address)"                                     => handle_shareholder_voting_power,
+    "authorizeFuturesUnderwriting(address,uint64,address)"                => handle_authorize_futures_underwriting,
+    "underwriteFutures(uint64)"                                           => handle_underwrite_futures,
+    "closeUnderwrittenFutures(uint64)"                                    => handle_close_underwritten_futures,
+    "futuresLedger()"                                                     => handle_futures_ledger,
+    "futuresUnderwritePct()"                                              => handle_futures_underwrite_pct,
+    "futuresUnderwrittenBy(address)"                                      => handle_futures_underwritten_by,
+    "futuresAllowanceOf(address)"                                         => handle_futures_allowance_of,
     "getPolicyRaw(address,bytes32)"                                       => handle_get_policy_raw,
     "hasPolicy(address,bytes32)"                                          => handle_has_policy,
     "identityRegistry()"                                                  => handle_identity_registry,
@@ -108,6 +125,7 @@ hps_entry! {
     "hashSetProductOracle(address,address,uint64)"                        => handle_hash_set_product_oracle,
     "hashSetClearingAccount(address,address)"                             => handle_hash_set_clearing_account,
     "hashRegisterShareClass(address,uint64,uint64,uint64)"                => handle_hash_register_share_class,
+    "hashAuthorizeFuturesUnderwriting(address,uint64)"                    => handle_hash_authorize_futures_underwriting,
 }
 
 fn addr_topic(addr: &[u8; 20]) -> [u8; 32] {
@@ -268,6 +286,61 @@ fn compute_revoke_role_hash(role_id: &[u8; 32], account: &[u8; 20]) -> [u8; 32] 
         .push_bytes32(role_id)
         .push_address(account)
         .finish()
+}
+
+fn compute_authorize_futures_underwriting_hash(
+    futures_ledger: &[u8; 20],
+    underwrite_pct: u64,
+) -> [u8; 32] {
+    ActionHasher::<160>::new(
+        &context::self_address(),
+        &ACTION_AUTHORIZE_FUTURES_UNDERWRITING,
+    )
+    .push_address(futures_ledger)
+    .push_u64(underwrite_pct)
+    .finish()
+}
+
+fn futures_underwritten_key(futures_ledger: &[u8; 20], shareholder: &[u8; 20]) -> KeyBuilder<48> {
+    KeyBuilder::<48>::new()
+        .push(b"fuw:")
+        .push(futures_ledger)
+        .push(shareholder)
+}
+
+/// Apply the authorized futures underwriting percentage (`pct`) to `converted_common_shares`:
+/// - `1..=100` is interpreted as whole percentage `pct / 100` (e.g., `10` = `10%`).
+/// - `101..=10_000` is interpreted as basis points `pct / 10_000` (e.g., `1_000` = `10.00%`).
+fn apply_futures_pct(converted_common_shares: u64, pct: u64) -> u64 {
+    if pct == 0 || converted_common_shares == 0 {
+        return 0;
+    }
+    let denom = if pct <= 100 { 100u128 } else { 10_000u128 };
+    (((converted_common_shares as u128) * (pct as u128)) / denom) as u64
+}
+
+/// Compute `(shareholder_converted_common_shares, company_total_converted_common_shares)` summed
+/// across all registered share classes in this `Constitution`.
+fn compute_converted_common_totals(shareholder: &[u8; 20]) -> (u64, u64) {
+    let mut classes = [ShareClassSpec::empty(); MAX_SHARE_CLASSES];
+    let count = load_share_classes(&mut classes);
+    let mut holder_common = 0u64;
+    let mut total_common = 0u64;
+    let mut i = 0;
+    while i < count {
+        let c = &classes[i];
+        if *shareholder != [0u8; 20] {
+            let bal_cd = CallEncoder::<64>::new(const { selector("balanceOf(address)") })
+                .push_address(shareholder);
+            let bal = call::call_u64(&c.ledger, bal_cd.as_slice()).unwrap_or(0);
+            holder_common = holder_common.saturating_add(c.converted_common_shares(bal));
+        }
+        let sup_cd = CallEncoder::<16>::new(const { selector("totalOutstanding()") });
+        let supply = call::call_u64(&c.ledger, sup_cd.as_slice()).unwrap_or(0);
+        total_common = total_common.saturating_add(c.converted_common_shares(supply));
+        i += 1;
+    }
+    (holder_common, total_common)
 }
 
 fn role_members_key(role_id: &[u8; 32]) -> KeyBuilder<48> {
@@ -1674,6 +1747,224 @@ fn handle_shareholder_voting_power(args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
+/// Constitutional process to authorize a predetermined percentage (`underwritePct`) of total
+/// outstanding shares (converted to common-share equivalents across all registered share classes)
+/// to be underwritten as a single class of futures contracts in `futuresLedger`.
+/// Requires a finalized Shareholder Super-Majority `Authorization` HPS (`POLICY_SUPER_GOVERNANCE`
+/// or `POLICY_SHAREHOLDER_SUPERMAJORITY`).
+fn handle_authorize_futures_underwriting(args: &CalldataReader) -> Result<(), i32> {
+    let (registry, caller) = ensure_initialized_and_valid_caller()?;
+    let futures_ledger = args.address(0).ok_or(-3)?;
+    let underwrite_pct = args.u64(1).ok_or(-3)?;
+    let super_auth = args.address(2).ok_or(-3)?;
+
+    if futures_ledger == [0u8; 20] || underwrite_pct == 0 || underwrite_pct > 10_000 {
+        return Err(ERR_INVALID_FUTURES_CONFIG);
+    }
+
+    let me = context::self_address();
+    let assoc_cd = CallEncoder::<16>::new(const { selector("associatedConstitution()") });
+    let Ok(raw_assoc) = call::call_raw(&futures_ledger, assoc_cd.as_slice()) else {
+        return Err(ERR_INVALID_FUTURES_CONFIG);
+    };
+    if raw_assoc.len() < 32 || raw_assoc[12..32] != me {
+        return Err(ERR_INVALID_FUTURES_CONFIG);
+    }
+
+    let action_hash =
+        compute_authorize_futures_underwriting_hash(&futures_ledger, underwrite_pct);
+    let pid_cd = CallEncoder::<16>::new(const { selector("policyId()") });
+    let expected_pol = if let Ok(raw_pid) = call::call_raw(&super_auth, pid_cd.as_slice()) {
+        if raw_pid.len() >= 32 && raw_pid[..32] == POLICY_SHAREHOLDER_SUPERMAJORITY {
+            POLICY_SHAREHOLDER_SUPERMAJORITY
+        } else {
+            POLICY_SUPER_GOVERNANCE
+        }
+    } else {
+        POLICY_SUPER_GOVERNANCE
+    };
+    verify_and_consume_auth(
+        &registry,
+        &super_auth,
+        &me,
+        &expected_pol,
+        &action_hash,
+        &caller,
+    )?;
+
+    storage::set_address(KEY_FUTURES_LEDGER, &futures_ledger);
+    storage::set_u64(KEY_FUTURES_PCT, underwrite_pct);
+
+    let (_holder_common, total_common) = compute_converted_common_totals(&[0u8; 20]);
+    let company_max_cap = apply_futures_pct(total_common, underwrite_pct);
+
+    let mut ev = [0u8; 16];
+    ev[0..8].copy_from_slice(&underwrite_pct.to_be_bytes());
+    ev[8..16].copy_from_slice(&company_max_cap.to_be_bytes());
+    events::emit(
+        &[
+            FUTURES_UNDERWRITING_AUTHORIZED,
+            addr_topic(&futures_ledger),
+            addr_topic(&super_auth),
+        ],
+        &ev,
+    );
+    ret::write_u64_word(company_max_cap);
+    Ok(())
+}
+
+/// Underwrite (create) `amount` units of the company's single-class futures contract on
+/// `futuresLedger()`.
+/// Enforces that the calling shareholder's cumulative underwritten futures contracts do not exceed
+/// `underwritePct` of their converted common-share holdings across all registered share classes
+/// (e.g., `100,000` Preferred Shares A at `50%` conversion = `50,000` common-equivalent shares;
+/// at `10%` underwriting limit, max `5,000` futures units), and that total outstanding futures
+/// do not exceed `underwritePct` of the company's total converted common shares.
+fn handle_underwrite_futures(args: &CalldataReader) -> Result<(), i32> {
+    let (_registry, caller) = ensure_initialized_and_valid_caller()?;
+    let amount = args.u64(0).ok_or(-3)?;
+    if amount == 0 {
+        return Err(-14);
+    }
+
+    let futures_ledger =
+        storage::get_address(KEY_FUTURES_LEDGER).ok_or(ERR_INVALID_FUTURES_CONFIG)?;
+    let pct = storage::get_u64(KEY_FUTURES_PCT);
+    if pct == 0 {
+        return Err(ERR_INVALID_FUTURES_CONFIG);
+    }
+
+    let (holder_common, total_common) = compute_converted_common_totals(&caller);
+    let holder_max_allowance = apply_futures_pct(holder_common, pct);
+    let company_max_cap = apply_futures_pct(total_common, pct);
+
+    let uk = futures_underwritten_key(&futures_ledger, &caller);
+    let already_underwritten = storage::get_u64(uk.as_slice());
+    let new_underwritten = already_underwritten
+        .checked_add(amount)
+        .ok_or(ERR_FUTURES_CAP_EXCEEDED)?;
+    if new_underwritten > holder_max_allowance {
+        return Err(ERR_FUTURES_CAP_EXCEEDED);
+    }
+
+    let sup_cd = CallEncoder::<16>::new(const { selector("totalOutstanding()") });
+    let cur_futures_supply = call::call_u64(&futures_ledger, sup_cd.as_slice()).unwrap_or(0);
+    if cur_futures_supply.saturating_add(amount) > company_max_cap {
+        return Err(ERR_FUTURES_CAP_EXCEEDED);
+    }
+
+    storage::set_u64(uk.as_slice(), new_underwritten);
+
+    let issue_cd = CallEncoder::<96>::new(const { selector("constitutionIssue(address,uint64)") })
+        .push_address(&caller)
+        .push_u64(amount);
+    let _new_bal = call::call_u64(&futures_ledger, issue_cd.as_slice())?;
+
+    let mut ev = [0u8; 24];
+    ev[0..8].copy_from_slice(&amount.to_be_bytes());
+    ev[8..16].copy_from_slice(&new_underwritten.to_be_bytes());
+    ev[16..24].copy_from_slice(&holder_max_allowance.to_be_bytes());
+    events::emit(
+        &[
+            FUTURES_UNDERWRITTEN,
+            addr_topic(&futures_ledger),
+            addr_topic(&caller),
+        ],
+        &ev,
+    );
+    ret::write_u64_word(new_underwritten);
+    Ok(())
+}
+
+/// Close/burn `amount` units of previously underwritten futures contracts from the caller's
+/// balance in `futuresLedger()`, restoring `amount` of their underwriting allowance.
+fn handle_close_underwritten_futures(args: &CalldataReader) -> Result<(), i32> {
+    let (_registry, caller) = ensure_initialized_and_valid_caller()?;
+    let amount = args.u64(0).ok_or(-3)?;
+    if amount == 0 {
+        return Err(-14);
+    }
+
+    let futures_ledger =
+        storage::get_address(KEY_FUTURES_LEDGER).ok_or(ERR_INVALID_FUTURES_CONFIG)?;
+    let uk = futures_underwritten_key(&futures_ledger, &caller);
+    let already_underwritten = storage::get_u64(uk.as_slice());
+    if already_underwritten < amount {
+        return Err(-16);
+    }
+
+    let cancel_cd =
+        CallEncoder::<96>::new(const { selector("constitutionCancel(address,uint64)") })
+            .push_address(&caller)
+            .push_u64(amount);
+    let _new_bal = call::call_u64(&futures_ledger, cancel_cd.as_slice())?;
+
+    let rem_underwritten = already_underwritten - amount;
+    storage::set_u64(uk.as_slice(), rem_underwritten);
+
+    let mut ev = [0u8; 16];
+    ev[0..8].copy_from_slice(&amount.to_be_bytes());
+    ev[8..16].copy_from_slice(&rem_underwritten.to_be_bytes());
+    events::emit(
+        &[
+            FUTURES_CLOSED,
+            addr_topic(&futures_ledger),
+            addr_topic(&caller),
+        ],
+        &ev,
+    );
+    ret::write_u64_word(rem_underwritten);
+    Ok(())
+}
+
+fn handle_futures_ledger(_args: &CalldataReader) -> Result<(), i32> {
+    let led = storage::get_address(KEY_FUTURES_LEDGER).unwrap_or([0u8; 20]);
+    ret::write_address(&led);
+    Ok(())
+}
+
+fn handle_futures_underwrite_pct(_args: &CalldataReader) -> Result<(), i32> {
+    ret::write_u64_word(storage::get_u64(KEY_FUTURES_PCT));
+    Ok(())
+}
+
+fn handle_futures_underwritten_by(args: &CalldataReader) -> Result<(), i32> {
+    let shareholder = args.address(0).ok_or(-3)?;
+    let Some(futures_ledger) = storage::get_address(KEY_FUTURES_LEDGER) else {
+        ret::write_u64_word(0);
+        return Ok(());
+    };
+    let uk = futures_underwritten_key(&futures_ledger, &shareholder);
+    ret::write_u64_word(storage::get_u64(uk.as_slice()));
+    Ok(())
+}
+
+/// Returns `(uint64 convertedCommonShares, uint64 maxFuturesAllowance, uint64 alreadyUnderwritten,
+/// uint64 remainingAllowance, uint64 companyMaxFuturesCap)` for `shareholder`.
+fn handle_futures_allowance_of(args: &CalldataReader) -> Result<(), i32> {
+    let shareholder = args.address(0).ok_or(-3)?;
+    let pct = storage::get_u64(KEY_FUTURES_PCT);
+    let (holder_common, total_common) = compute_converted_common_totals(&shareholder);
+    let max_allowance = apply_futures_pct(holder_common, pct);
+    let company_cap = apply_futures_pct(total_common, pct);
+    let already_underwritten =
+        if let Some(futures_ledger) = storage::get_address(KEY_FUTURES_LEDGER) {
+            storage::get_u64(futures_underwritten_key(&futures_ledger, &shareholder).as_slice())
+        } else {
+            0
+        };
+    let remaining = max_allowance.saturating_sub(already_underwritten);
+
+    let mut out = [0u8; 160];
+    out[24..32].copy_from_slice(&holder_common.to_be_bytes());
+    out[56..64].copy_from_slice(&max_allowance.to_be_bytes());
+    out[88..96].copy_from_slice(&already_underwritten.to_be_bytes());
+    out[120..128].copy_from_slice(&remaining.to_be_bytes());
+    out[152..160].copy_from_slice(&company_cap.to_be_bytes());
+    ret::write(&out);
+    Ok(())
+}
+
 fn resolve_policy_into(
     target_hps: &[u8; 20],
     policy_id: &[u8; 32],
@@ -1812,6 +2103,16 @@ fn handle_hash_register_share_class(args: &CalldataReader) -> Result<(), i32> {
         votes_per_share,
         conversion_numer,
         conversion_denom,
+    ));
+    Ok(())
+}
+
+fn handle_hash_authorize_futures_underwriting(args: &CalldataReader) -> Result<(), i32> {
+    let futures_ledger = args.address(0).ok_or(-3)?;
+    let underwrite_pct = args.u64(1).ok_or(-3)?;
+    ret::write_word(&compute_authorize_futures_underwriting_hash(
+        &futures_ledger,
+        underwrite_pct,
     ));
     Ok(())
 }
@@ -2812,5 +3113,327 @@ mod tests {
         // After revocation, prod_mgr is rejected with ERR_MISSING_ROLE
         let rev_err = mock::transact_as(prod_mgr, con, upsert_cd.as_slice()).unwrap_err();
         assert_eq!(rev_err, ERR_MISSING_ROLE);
+    }
+
+    #[test]
+    fn constitutional_futures_underwriting_across_share_classes_and_caps() {
+        mock::reset();
+        let reg = [0x10; 20];
+        let con = [0x20; 20];
+        let manogaran = [0xA1; 20];
+        let evelyn = [0xA2; 20];
+        let pref_a_holder = [0xB5; 20];
+        let common_ledger = [0xE1; 20];
+        let pref_a_ledger = [0xE2; 20];
+        let futures_ledger = [0xE3; 20];
+        let super_auth = [0xC9; 20];
+
+        mod super_auth_stub {
+            use hps_sdk::abi::CalldataReader;
+            use hps_sdk::governance::POLICY_SUPER_GOVERNANCE;
+            use hps_sdk::{ret, selector, storage};
+            pub fn dispatch(raw: &[u8]) -> i32 {
+                let Some((sel, args)) = CalldataReader::parse(raw) else { return -1; };
+                if sel == const { selector("arm(bytes32)") } {
+                    storage::set(b"hash", &args.bytes32(0).unwrap());
+                    storage::set_u64(b"used", 0);
+                    return 0;
+                }
+                if sel == const { selector("policyId()") } {
+                    ret::write_word(&POLICY_SUPER_GOVERNANCE);
+                    return 0;
+                }
+                if sel == const { selector("consume(address,bytes32,bytes32,address)") } {
+                    if storage::get_u64(b"used") == 1 {
+                        return -68;
+                    }
+                    let pol = args.bytes32(1).unwrap();
+                    let h = args.bytes32(2).unwrap();
+                    if pol != POLICY_SUPER_GOVERNANCE
+                        || storage::get_bytes32(b"hash").as_ref() != Some(&h)
+                    {
+                        return -67;
+                    }
+                    storage::set_u64(b"used", 1);
+                    ret::write_bool(true);
+                    return 0;
+                }
+                -2
+            }
+        }
+
+        mod share_and_futures_stub {
+            use hps_sdk::abi::CalldataReader;
+            use hps_sdk::storage::KeyBuilder;
+            use hps_sdk::{ret, selector, storage};
+            fn bkey(id: &[u8; 20]) -> KeyBuilder<32> {
+                KeyBuilder::<32>::new().push(b"b:").push(id)
+            }
+            pub fn dispatch(raw: &[u8]) -> i32 {
+                let Some((sel, args)) = CalldataReader::parse(raw) else { return -1; };
+                if sel == const { selector("setCon(address)") } {
+                    storage::set_address(b"con", &args.address(0).unwrap());
+                    return 0;
+                }
+                if sel == const { selector("associatedConstitution()") } {
+                    ret::write_address(&storage::get_address(b"con").unwrap_or([0u8; 20]));
+                    return 0;
+                }
+                if sel == const { selector("setBal(address,uint64,uint64)") } {
+                    let id = args.address(0).unwrap();
+                    let bal = args.u64(1).unwrap();
+                    let sup = args.u64(2).unwrap();
+                    storage::set_u64(bkey(&id).as_slice(), bal);
+                    storage::set_u64(b"sup", sup);
+                    return 0;
+                }
+                if sel == const { selector("balanceOf(address)") } {
+                    let id = args.address(0).unwrap();
+                    ret::write_u64_word(storage::get_u64(bkey(&id).as_slice()));
+                    return 0;
+                }
+                if sel == const { selector("totalOutstanding()") } {
+                    ret::write_u64_word(storage::get_u64(b"sup"));
+                    return 0;
+                }
+                if sel == const { selector("constitutionIssue(address,uint64)") } {
+                    let to = args.address(0).unwrap();
+                    let amt = args.u64(1).unwrap();
+                    let nb = storage::get_u64(bkey(&to).as_slice()) + amt;
+                    storage::set_u64(bkey(&to).as_slice(), nb);
+                    storage::set_u64(b"sup", storage::get_u64(b"sup") + amt);
+                    ret::write_u64_word(nb);
+                    return 0;
+                }
+                if sel == const { selector("constitutionCancel(address,uint64)") } {
+                    let from = args.address(0).unwrap();
+                    let amt = args.u64(1).unwrap();
+                    let cur = storage::get_u64(bkey(&from).as_slice());
+                    if cur < amt {
+                        return -16;
+                    }
+                    let nb = cur - amt;
+                    storage::set_u64(bkey(&from).as_slice(), nb);
+                    storage::set_u64(b"sup", storage::get_u64(b"sup") - amt);
+                    ret::write_u64_word(nb);
+                    return 0;
+                }
+                -2
+            }
+        }
+
+        mock::register_hps(reg, reg_stub::dispatch);
+        mock::register_hps(con, dispatch_calldata);
+        mock::register_hps(super_auth, super_auth_stub::dispatch);
+        mock::set_code_hash(super_auth, [0x99; 32]);
+        mock::register_hps(common_ledger, share_and_futures_stub::dispatch);
+        mock::register_hps(pref_a_ledger, share_and_futures_stub::dispatch);
+        mock::register_hps(futures_ledger, share_and_futures_stub::dispatch);
+
+        let super_spec = PolicySpec::new(100)
+            .add_stage(StageSpec::new(75_000, 50).add_member(manogaran, 75_000).unwrap())
+            .unwrap();
+        let board_spec = PolicySpec::new(100)
+            .add_stage(
+                StageSpec::new(2, 50)
+                    .add_member(manogaran, 1)
+                    .unwrap()
+                    .add_member(evelyn, 1)
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut buf_s = [0u8; 512];
+        let len_s = super_spec.encode(&mut buf_s).unwrap();
+        let mut buf_b = [0u8; 512];
+        let len_b = board_spec.encode(&mut buf_b).unwrap();
+
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&2u16.to_be_bytes());
+        blob.extend_from_slice(&[0u8; 20]);
+        blob.extend_from_slice(&POLICY_SUPER_GOVERNANCE);
+        blob.extend_from_slice(&(len_s as u16).to_be_bytes());
+        blob.extend_from_slice(&buf_s[..len_s]);
+        blob.extend_from_slice(&[0u8; 20]);
+        blob.extend_from_slice(&POLICY_BOARD_RESOLUTION);
+        blob.extend_from_slice(&(len_b as u16).to_be_bytes());
+        blob.extend_from_slice(&buf_b[..len_b]);
+
+        let mut cd = Vec::new();
+        cd.extend_from_slice(&const { selector("initialize(address,bytes)") });
+        let mut rw = [0u8; 32];
+        rw[12..32].copy_from_slice(&reg);
+        cd.extend_from_slice(&rw);
+        let mut off = [0u8; 32];
+        off[31] = 0x40;
+        cd.extend_from_slice(&off);
+        let mut lw = [0u8; 32];
+        lw[24..32].copy_from_slice(&(blob.len() as u64).to_be_bytes());
+        cd.extend_from_slice(&lw);
+        cd.extend_from_slice(&blob);
+        cd.resize(cd.len() + (32 - blob.len() % 32) % 32, 0);
+        mock::transact_as(manogaran, con, &cd).unwrap();
+
+        // Pin futures_ledger to Constitution
+        mock::transact_as(
+            manogaran,
+            futures_ledger,
+            CallEncoder::<64>::new(const { selector("setCon(address)") })
+                .push_address(&con)
+                .as_slice(),
+        )
+        .unwrap();
+
+        // Register 2 share classes:
+        // 1. Common Shares (`common_ledger`): 1:1 voting, 1:1 conversion to common (100,000 total outstanding, Manogaran holds 50,000)
+        // 2. Preferred Shares A (`pref_a_ledger`): 1:1 voting, 50% conversion to common (`conversionNumer = 1, conversionDenom = 2`),
+        //    `pref_a_holder` holds 100,000 Preferred Shares A (and 0 Common Shares)
+        mock::transact_as(
+            manogaran,
+            common_ledger,
+            CallEncoder::<128>::new(const { selector("setBal(address,uint64,uint64)") })
+                .push_address(&manogaran)
+                .push_u64(50_000)
+                .push_u64(100_000)
+                .as_slice(),
+        )
+        .unwrap();
+        mock::transact_as(
+            manogaran,
+            pref_a_ledger,
+            CallEncoder::<128>::new(const { selector("setBal(address,uint64,uint64)") })
+                .push_address(&pref_a_holder)
+                .push_u64(100_000)
+                .push_u64(100_000)
+                .as_slice(),
+        )
+        .unwrap();
+
+        mock::transact_as(
+            manogaran,
+            con,
+            CallEncoder::<192>::new(const {
+                selector("registerShareClass(address,uint64,uint64,uint64,address)")
+            })
+            .push_address(&common_ledger)
+            .push_u64(1)
+            .push_u64(1)
+            .push_u64(1)
+            .push_address(&[0u8; 20])
+            .as_slice(),
+        )
+        .unwrap();
+        mock::transact_as(
+            manogaran,
+            con,
+            CallEncoder::<192>::new(const {
+                selector("registerShareClass(address,uint64,uint64,uint64,address)")
+            })
+            .push_address(&pref_a_ledger)
+            .push_u64(1)
+            .push_u64(1)
+            .push_u64(2) // 50% conversion rate to Common Shares!
+            .push_address(&[0u8; 20])
+            .as_slice(),
+        )
+        .unwrap();
+
+        // Authorize 10% (`underwritePct = 10`) of total outstanding shares to be underwritten as
+        // a single class of futures contracts (`futures_ledger`) via Shareholder Super-Majority Authorization
+        let h_fut: [u8; 32] = mock::transact_as(
+            manogaran,
+            con,
+            CallEncoder::<96>::new(const {
+                selector("hashAuthorizeFuturesUnderwriting(address,uint64)")
+            })
+            .push_address(&futures_ledger)
+            .push_u64(10)
+            .as_slice(),
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+        mock::transact_as(
+            manogaran,
+            super_auth,
+            CallEncoder::<64>::new(const { selector("arm(bytes32)") })
+                .push_bytes32(&h_fut)
+                .as_slice(),
+        )
+        .unwrap();
+        let cap_out = mock::transact_as(
+            manogaran,
+            con,
+            CallEncoder::<128>::new(const {
+                selector("authorizeFuturesUnderwriting(address,uint64,address)")
+            })
+            .push_address(&futures_ledger)
+            .push_u64(10) // 10%
+            .push_address(&super_auth)
+            .as_slice(),
+        )
+        .unwrap();
+        // Total company converted common shares = 100,000 (Common) + 50,000 (100k Pref A @ 50%) = 150,000
+        // 10% of 150,000 = 15,000 company-wide futures cap
+        assert_eq!(u64::from_be_bytes(cap_out[24..32].try_into().unwrap()), 15_000);
+
+        // Verify `pref_a_holder` (with ONLY 100,000 Preferred Shares A @ 50% conversion = 50,000 common-equivalent)
+        // has a max futures underwriting allowance of 10% * 50,000 = 5,000 units!
+        let alw = mock::transact_as(
+            pref_a_holder,
+            con,
+            CallEncoder::<64>::new(const { selector("futuresAllowanceOf(address)") })
+                .push_address(&pref_a_holder)
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(u64::from_be_bytes(alw[24..32].try_into().unwrap()), 50_000); // convertedCommonShares
+        assert_eq!(u64::from_be_bytes(alw[56..64].try_into().unwrap()), 5_000);  // maxFuturesAllowance
+        assert_eq!(u64::from_be_bytes(alw[88..96].try_into().unwrap()), 0);      // alreadyUnderwritten
+        assert_eq!(u64::from_be_bytes(alw[120..128].try_into().unwrap()), 5_000);// remainingAllowance
+        assert_eq!(u64::from_be_bytes(alw[152..160].try_into().unwrap()), 15_000);// companyMaxFuturesCap
+
+        // `pref_a_holder` underwrites 5,000 units of futures contract -> succeeds!
+        let uw_out = mock::transact_as(
+            pref_a_holder,
+            con,
+            CallEncoder::<64>::new(const { selector("underwriteFutures(uint64)") })
+                .push_u64(5_000)
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(u64::from_be_bytes(uw_out[24..32].try_into().unwrap()), 5_000);
+
+        // Verify `pref_a_holder` now holds 5,000 units in `futures_ledger`
+        let fut_bal = mock::transact_as(
+            pref_a_holder,
+            futures_ledger,
+            CallEncoder::<64>::new(const { selector("balanceOf(address)") })
+                .push_address(&pref_a_holder)
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(u64::from_be_bytes(fut_bal[24..32].try_into().unwrap()), 5_000);
+
+        // Negative test: `pref_a_holder` attempting to underwrite even 1 more unit (5,001 > 5,000) MUST revert with ERR_FUTURES_CAP_EXCEEDED (-87)!
+        let over_err = mock::transact_as(
+            pref_a_holder,
+            con,
+            CallEncoder::<64>::new(const { selector("underwriteFutures(uint64)") })
+                .push_u64(1)
+                .as_slice(),
+        )
+        .unwrap_err();
+        assert_eq!(over_err, ERR_FUTURES_CAP_EXCEEDED);
+
+        // Closing 2,000 units burns 2,000 futures contracts and restores 2,000 of allowance
+        let close_out = mock::transact_as(
+            pref_a_holder,
+            con,
+            CallEncoder::<64>::new(const { selector("closeUnderwrittenFutures(uint64)") })
+                .push_u64(2_000)
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(u64::from_be_bytes(close_out[24..32].try_into().unwrap()), 3_000);
     }
 }
