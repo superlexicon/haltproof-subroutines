@@ -56,9 +56,9 @@ use hps_client::{
     compute_hps_address, HpsClient, HpsSigner, TxOutcome, DEFAULT_CHAIN_ID, DEFAULT_DEV_PRIVATE_KEY,
 };
 use hps_sdk::governance::{
-    PolicySpec, StageSpec, ACTION_APPROVE, ACTION_CANCEL, ACTION_ISSUE, ACTION_SUPER,
-    ACTION_TRANSFER, POLICY_BOARD_RESOLUTION, POLICY_HOLDER_SELF,
-    POLICY_SHAREHOLDER_SUPERMAJORITY, POLICY_SUPER_GOVERNANCE,
+    share_transfer_auction_policy_spec, PolicySpec, StageSpec, ACTION_APPROVE, ACTION_CANCEL,
+    ACTION_ISSUE, ACTION_SUPER, ACTION_TRANSFER, POLICY_BOARD_RESOLUTION, POLICY_HOLDER_SELF,
+    POLICY_SHAREHOLDER_SUPERMAJORITY, POLICY_SHARE_TRANSFER_AUCTION, POLICY_SUPER_GOVERNANCE,
 };
 
 const STATE_PENDING: u64 = 1;
@@ -599,8 +599,8 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
     ));
     slx_perms_blob.extend_from_slice(&pack_permission(
         ACTION_TRANSFER,
-        H160::zero(),
-        POLICY_HOLDER_SELF,
+        slx_constitution_expected,
+        POLICY_SHARE_TRANSFER_AUCTION,
     ));
     slx_perms_blob.extend_from_slice(&pack_permission(
         ACTION_APPROVE,
@@ -692,8 +692,14 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
         .unwrap();
     let board_resolution_spec = PolicySpec::new(200).add_stage(board_stage).unwrap();
 
+    // Policy 3: 3-Step Call-Auction Share Transfer Policy (`POLICY_SHARE_TRANSFER_AUCTION`)
+    // Window 1 (buyers) = 3 blocks, Window 2 (existing shareholders sell) = 3 blocks,
+    // Window 3 (non-participating existing shareholders buy) = 3 blocks, overall settlement window = 50 blocks.
+    let transfer_auction_spec =
+        share_transfer_auction_policy_spec(h160_bytes(manogaran_id), 3, 3, 3, 50).unwrap();
+
     let mut con_blob = Vec::new();
-    con_blob.extend_from_slice(&3u16.to_be_bytes());
+    con_blob.extend_from_slice(&4u16.to_be_bytes());
     con_blob.extend_from_slice(&encode_constitution_entry(
         H160::zero(),
         POLICY_SUPER_GOVERNANCE,
@@ -708,6 +714,11 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
         H160::zero(),
         POLICY_BOARD_RESOLUTION,
         &board_resolution_spec,
+    ));
+    con_blob.extend_from_slice(&encode_constitution_entry(
+        slx_ledger,
+        POLICY_SHARE_TRANSFER_AUCTION,
+        &transfer_auction_spec,
     ));
 
     let con_init_cd = encode_values(
@@ -816,10 +827,15 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
     // =========================================================================
     // STEP 4: Batch-Instantiate Authorization HPSes + Malicious Clone for Testing
     // =========================================================================
-    let auth_specs: Vec<_> = (0..4).map(|_| (auth_code, Vec::new())).collect();
+    let auth_specs: Vec<_> = (0..5).map(|_| (auth_code, Vec::new())).collect();
     let auths = client.instantiate_batch(&deployer, &auth_specs).await.unwrap();
-    let (auth_issue_mano, auth_board_wrong_pol, auth_board_transfer, auth_add_director) =
-        (auths[0], auths[1], auths[2], auths[3]);
+    let (
+        auth_issue_mano,
+        auth_board_wrong_pol,
+        auth_board_transfer,
+        auth_add_director,
+        auth_transfer_auction,
+    ) = (auths[0], auths[1], auths[2], auths[3], auths[4]);
 
     // Also deploy a maliciously cloned Authorization WASM (`messaging.wasm` masquerading as an Authorization HPS)
     let clone_deploy = client
@@ -1524,6 +1540,341 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
         3
     );
     println!(
-        "[9/9] Appointed 3rd Director (Dr. Rajesh Nair) via Shareholder Super-Majority Resolution -> directorCount() = 3. All positive & negative tests passed!"
+        "[9/10] Appointed 3rd Director (Dr. Rajesh Nair) via Shareholder Super-Majority Resolution -> directorCount() = 3"
+    );
+
+    // =========================================================================
+    // STEP 10: 3-Step Share Transfer Call-Auction (`POLICY_SHARE_TRANSFER_AUCTION`)
+    //          on `SLX-COMMON` with Clearing Price Discovery & Pro-Rata Allocation
+    // =========================================================================
+    let init_auc_cd = encode_values(
+        "initTransferAuction(address,address,address,address)",
+        &[
+            AbiValue::Address(auth_transfer_auction),
+            AbiValue::Address(registry),
+            AbiValue::Address(slx_constitution),
+            AbiValue::Address(slx_ledger),
+        ],
+    );
+    let init_auc_rcpt = client
+        .send_call_with_targets(
+            &deployer,
+            evelyn_director_id,
+            &init_auc_cd,
+            &[
+                auth_transfer_auction,
+                registry,
+                slx_constitution,
+                slx_ledger,
+            ],
+        )
+        .await
+        .unwrap();
+    assert!(
+        init_auc_rcpt.status,
+        "initializeTransferAuction must succeed"
+    );
+
+    let place_buy_cd = |price: u64, qty: u64| {
+        encode_values(
+            "placeBuyOrder(address,uint64,uint64)",
+            &[
+                AbiValue::Address(auth_transfer_auction),
+                AbiValue::Uint(U256::from(price)),
+                AbiValue::Uint(U256::from(qty)),
+            ],
+        )
+    };
+    let place_sell_cd = |price: u64, qty: u64| {
+        encode_values(
+            "placeSellOrder(address,uint64,uint64)",
+            &[
+                AbiValue::Address(auth_transfer_auction),
+                AbiValue::Uint(U256::from(price)),
+                AbiValue::Uint(U256::from(qty)),
+            ],
+        )
+    };
+
+    // --- Step 1 (Initial Buyers' Window: 3 blocks) ---
+    // Triggered by first potential buyer (`evelyn_director_id` placing buy order for 1,400 shares @ 100),
+    // followed by `third_director_id` placing a buy order for 600 shares @ 100.
+    let step1_buy_batch = vec![
+        (
+            evelyn_director_id,
+            place_buy_cd(100, 1_400),
+            vec![auth_transfer_auction, registry, slx_ledger],
+        ),
+        (
+            third_director_id,
+            place_buy_cd(100, 600),
+            vec![auth_transfer_auction, registry, slx_ledger],
+        ),
+    ];
+    let step1_rcpts = client
+        .send_call_batch(&deployer, &step1_buy_batch)
+        .await
+        .unwrap();
+    assert!(step1_rcpts[0].status && step1_rcpts[1].status);
+    assert!(
+        has_log_topic(
+            &step1_rcpts[0],
+            "AuctionStep1Started(address,uint64,uint64,uint64,uint64,uint64)"
+        ),
+        "AuctionStep1Started event must be emitted by the first buyer"
+    );
+    assert!(
+        has_log_topic(&step1_rcpts[0], "BuyOrderPlaced(address,uint64,uint64,uint64)"),
+        "BuyOrderPlaced event must be emitted"
+    );
+
+    // Read `(step1_dl, step2_dl, step3_dl, overall_dl)`
+    let dls_raw = client
+        .read_call(
+            None,
+            auth_transfer_auction,
+            &encode_values("auctionDeadlines()", &[]),
+        )
+        .await
+        .unwrap();
+    let step1_dl = u64::from_be_bytes(dls_raw[24..32].try_into().unwrap());
+    let step2_dl = u64::from_be_bytes(dls_raw[56..64].try_into().unwrap());
+    let step3_dl = u64::from_be_bytes(dls_raw[88..96].try_into().unwrap());
+
+    // Negative Test N12: Existing shareholder (`manogaran_id`) attempting to place a sell order
+    // during Step 1 (`now <= step1_dl`) MUST revert!
+    while client.block_number().await.unwrap() < step1_dl {
+        let early_sell_rcpt = client
+            .send_call_with_targets(
+                &deployer,
+                manogaran_id,
+                &place_sell_cd(100, 5_000),
+                &[auth_transfer_auction, registry, slx_ledger],
+            )
+            .await
+            .unwrap();
+        assert!(
+            !early_sell_rcpt.status,
+            "Negative Test N12: Sell order during Step 1 MUST revert"
+        );
+    }
+
+    // --- Step 2 (Existing Shareholders' Sell Window: `step1_dl < now <= step2_dl`) ---
+    // Two existing shareholders place identical 5,000-share sell orders @ 100:
+    //   - `manogaran_id` (existing holding = 150,000 shares)
+    //   - `minority_shareholder_ids[2]` (existing holding = 6,000 shares)
+    // Combined existing holding of participating sellers = 156,000 shares (25 : 1 ratio).
+    let seller_2 = minority_shareholder_ids[2];
+    let step2_sell_batch = vec![
+        (
+            manogaran_id,
+            place_sell_cd(100, 5_000),
+            vec![auth_transfer_auction, registry, slx_ledger],
+        ),
+        (
+            seller_2,
+            place_sell_cd(100, 5_000),
+            vec![auth_transfer_auction, registry, slx_ledger],
+        ),
+    ];
+    let step2_rcpts = client
+        .send_call_batch(&deployer, &step2_sell_batch)
+        .await
+        .unwrap();
+    assert!(step2_rcpts[0].status && step2_rcpts[1].status);
+    assert!(
+        has_log_topic(
+            &step2_rcpts[0],
+            "SellOrderPlaced(address,uint64,uint64,uint64)"
+        ),
+        "SellOrderPlaced event must be emitted"
+    );
+
+    // Negative Test N13: Placing a buy order during Step 2 (`step1_dl < now <= step2_dl`) MUST revert!
+    while client.block_number().await.unwrap() < step2_dl {
+        let step2_buy_rcpt = client
+            .send_call_with_targets(
+                &deployer,
+                evelyn_director_id,
+                &place_buy_cd(100, 500),
+                &[auth_transfer_auction, registry, slx_ledger],
+            )
+            .await
+            .unwrap();
+        assert!(
+            !step2_buy_rcpt.status,
+            "Negative Test N13: Buy order during Step 2 MUST revert"
+        );
+    }
+
+    // --- Step 3 (Non-Participating Existing Shareholders' Buy Window: `step2_dl < now <= step3_dl`) ---
+    // Negative Test N14: `manogaran_id` participated as a seller in Step 2 -> ineligible to place a buy order in Step 3!
+    // Positive Step 3 Buy Order: `minority_shareholder_ids[0]` (holding 6,500 shares, did NOT sell in Step 2)
+    // places a buy order for 600 shares @ 100 (bringing total buying quantity to 1,400 + 600 + 600 = 2,600 shares).
+    let step3_buyer = minority_shareholder_ids[0];
+    let step3_batch = vec![
+        (
+            manogaran_id,
+            place_buy_cd(100, 500),
+            vec![auth_transfer_auction, registry, slx_ledger],
+        ),
+        (
+            step3_buyer,
+            place_buy_cd(100, 600),
+            vec![auth_transfer_auction, registry, slx_ledger],
+        ),
+    ];
+    let step3_rcpts = client
+        .send_call_batch(&deployer, &step3_batch)
+        .await
+        .unwrap();
+    assert!(
+        !step3_rcpts[0].status,
+        "Negative Test N14: Step 2 seller attempting to buy in Step 3 MUST revert"
+    );
+    assert!(
+        step3_rcpts[1].status,
+        "Non-participating existing shareholder buy order in Step 3 must succeed"
+    );
+
+    // Negative Test N15: Attempting to settle the auction on `SLX-COMMON` before Step 3 ends (`now <= step3_dl`) MUST revert!
+    let settle_via_transfer_cd = encode_values(
+        "transferAsset(address,address,address,uint64,address)",
+        &[
+            AbiValue::Address(slx_ledger),
+            AbiValue::Address(H160::zero()),
+            AbiValue::Address(H160::zero()),
+            AbiValue::Uint(U256::from(0u64)),
+            AbiValue::Address(auth_transfer_auction),
+        ],
+    );
+    let settle_targets = vec![
+        slx_ledger,
+        auth_transfer_auction,
+        registry,
+        manogaran_id,
+        seller_2,
+        evelyn_director_id,
+        third_director_id,
+        step3_buyer,
+    ];
+    while client.block_number().await.unwrap() < step3_dl {
+        let early_settle_rcpt = client
+            .send_call_with_targets(
+                &deployer,
+                manogaran_id,
+                &settle_via_transfer_cd,
+                &settle_targets,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !early_settle_rcpt.status,
+            "Negative Test N15: Settling auction before Step 3 period ends MUST revert"
+        );
+    }
+
+    // --- Step 4 (After Step 3 Ends: `now > step3_dl`): Finalize & Settle in `SLX-COMMON.transfer` ---
+    let settle_rcpt = client
+        .send_call_with_targets(
+            &deployer,
+            manogaran_id,
+            &settle_via_transfer_cd,
+            &settle_targets,
+        )
+        .await
+        .unwrap();
+    assert!(
+        settle_rcpt.status,
+        "Post-Step-3 Share Transfer Auction settlement via SLX-COMMON.transfer must succeed"
+    );
+    assert!(
+        has_log_topic(
+            &settle_rcpt,
+            "AuctionTransferSettled(address,uint64,uint64,uint64,uint64,uint64,uint64)"
+        ),
+        "AuctionTransferSettled event must be emitted"
+    );
+    assert!(
+        has_log_topic(
+            &settle_rcpt,
+            "AuctionSellerFilled(address,uint64,uint64,uint64,uint64)"
+        ),
+        "AuctionSellerFilled event must be emitted"
+    );
+    assert!(
+        has_log_topic(
+            &settle_rcpt,
+            "AuctionBuyerFilled(address,uint64,uint64,uint64)"
+        ),
+        "AuctionBuyerFilled event must be emitted"
+    );
+
+    // Verify post-auction balances:
+    // Total buying quantity (2,600) < Total selling quantity (10,000) at clearing price 100:
+    // - All 3 buyers fill 100%:
+    //   * `evelyn_director_id`: 0 -> 1,400
+    //   * `third_director_id`: 0 -> 600
+    //   * `step3_buyer` (`minority_shareholder_ids[0]`): 6,500 -> 7,100
+    // - Both sellers are filled pro-rata to their EXISTING SHAREHOLDING (150,000 : 6,000 = 25 : 1),
+    //   NOT their equal 5,000 order quantities:
+    //   * `manogaran_id` sells 2,500 shares (150,000 -> 147,500)
+    //   * `seller_2` (`minority_shareholder_ids[2]`) sells 100 shares (6,000 -> 5,900)
+    assert_eq!(
+        read_u64(
+            &client,
+            slx_ledger,
+            "balanceOf(address)",
+            &[AbiValue::Address(evelyn_director_id)]
+        )
+        .await,
+        1_400
+    );
+    assert_eq!(
+        read_u64(
+            &client,
+            slx_ledger,
+            "balanceOf(address)",
+            &[AbiValue::Address(third_director_id)]
+        )
+        .await,
+        600
+    );
+    assert_eq!(
+        read_u64(
+            &client,
+            slx_ledger,
+            "balanceOf(address)",
+            &[AbiValue::Address(step3_buyer)]
+        )
+        .await,
+        7_100
+    );
+    assert_eq!(
+        read_u64(
+            &client,
+            slx_ledger,
+            "balanceOf(address)",
+            &[AbiValue::Address(manogaran_id)]
+        )
+        .await,
+        147_500
+    );
+    assert_eq!(
+        read_u64(
+            &client,
+            slx_ledger,
+            "balanceOf(address)",
+            &[AbiValue::Address(seller_2)]
+        )
+        .await,
+        5_900
+    );
+    assert_eq!(
+        read_u64(&client, slx_ledger, "totalOutstanding()", &[]).await,
+        200_000
+    );
+    println!(
+        "[10/10] Settled 3-Step Call-Auction on SLX-COMMON at price=100, matched=2,600 shares (pro-rated sellers by existing holdings 150,000:6,000 -> Manogaran -2,500, Shareholder#4 -100; buyers +1,400/+600/+600). All 10 steps & 15 negative security tests passed!"
     );
 }

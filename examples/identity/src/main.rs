@@ -32,9 +32,13 @@ hps_entry! {
     "execute(address,bytes)"                                                          => handle_execute,
     "initConstitutionAuth(address,address,address,address,bytes32,bytes32)"           => handle_init_constitution_auth,
     "initOracleAuth(address,address,address,address,bytes32,uint64)"                  => handle_init_oracle_auth,
+    "initTransferAuction(address,address,address,address)"                            => handle_init_transfer_auction,
     "approveAuth(address)"                                                            => handle_approve_auth,
     "approveAndFinalizeAuth(address)"                                                 => handle_approve_and_finalize_auth,
     "finalizeAuth(address)"                                                           => handle_finalize_auth,
+    "placeBuyOrder(address,uint64,uint64)"                                            => handle_place_buy_order,
+    "placeSellOrder(address,uint64,uint64)"                                           => handle_place_sell_order,
+    "settleTransferAuction(address,address)"                                          => handle_settle_transfer_auction,
     "issueAsset(address,address,uint64,address)"                                      => handle_issue_asset,
     "cancelAsset(address,address,uint64,address)"                                     => handle_cancel_asset,
     "transferAsset(address,address,address,uint64,address)"                           => handle_transfer_asset,
@@ -164,7 +168,11 @@ fn handle_execute(args: &CalldataReader) -> Result<(), i32> {
     }
 
     let sel = [sub_cd[0], sub_cd[1], sub_cd[2], sub_cd[3]];
-    if sel == selector("approve()") || sel == selector("approveAndFinalize()") {
+    if sel == selector("approve()")
+        || sel == selector("approveAndFinalize()")
+        || sel == selector("placeBuyOrder(uint64,uint64)")
+        || sel == selector("placeSellOrder(uint64,uint64)")
+    {
         stamp_auth_approval(&target);
     }
 
@@ -255,6 +263,70 @@ fn handle_finalize_auth(args: &CalldataReader) -> Result<(), i32> {
         return Err(-24);
     }
     ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_init_transfer_auction(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let auth_obj = args.address(0).ok_or(-3)?;
+    let registry = args.address(1).ok_or(-3)?;
+    let constitution = args.address(2).ok_or(-3)?;
+    let target_ledger = args.address(3).ok_or(-3)?;
+
+    let sub_cd = CallEncoder::<128>::new(selector(
+        "initializeTransferAuction(address,address,address)",
+    ))
+    .push_address(&registry)
+    .push_address(&constitution)
+    .push_address(&target_ledger);
+
+    let ok = call::call_bool(&auth_obj, sub_cd.as_slice())?;
+    if !ok {
+        return Err(-24);
+    }
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_place_buy_order(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let auth_obj = args.address(0).ok_or(-3)?;
+    let price = args.u64(1).ok_or(-3)?;
+    let quantity = args.u64(2).ok_or(-3)?;
+
+    stamp_auth_approval(&auth_obj);
+    let sub_cd = CallEncoder::<96>::new(selector("placeBuyOrder(uint64,uint64)"))
+        .push_u64(price)
+        .push_u64(quantity);
+    let order_idx = call::call_u64(&auth_obj, sub_cd.as_slice())?;
+    ret::write_u64_word(order_idx);
+    Ok(())
+}
+
+fn handle_place_sell_order(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let auth_obj = args.address(0).ok_or(-3)?;
+    let price = args.u64(1).ok_or(-3)?;
+    let quantity = args.u64(2).ok_or(-3)?;
+
+    stamp_auth_approval(&auth_obj);
+    let sub_cd = CallEncoder::<96>::new(selector("placeSellOrder(uint64,uint64)"))
+        .push_u64(price)
+        .push_u64(quantity);
+    let order_idx = call::call_u64(&auth_obj, sub_cd.as_slice())?;
+    ret::write_u64_word(order_idx);
+    Ok(())
+}
+
+fn handle_settle_transfer_auction(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let ledger = args.address(0).ok_or(-3)?;
+    let auth_obj = args.address(1).ok_or(-3)?;
+
+    let sub_cd = CallEncoder::<64>::new(selector("settleTransferAuction(address)"))
+        .push_address(&auth_obj);
+    let out = call::call_raw(&ledger, sub_cd.as_slice())?;
+    ret::write(out);
     Ok(())
 }
 

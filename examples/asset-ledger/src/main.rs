@@ -22,9 +22,10 @@
 
 use hps_sdk::abi::CalldataReader;
 use hps_sdk::governance::{
-    oracle_policy_id, require_valid_identity, verify_and_consume_auth, ActionHasher,
-    ACTION_APPROVE, ACTION_CANCEL, ACTION_ISSUE, ACTION_SUPER, ACTION_TRANSFER,
-    ERR_CONSTITUTION_MISMATCH, POLICY_HOLDER_SELF,
+    oracle_policy_id, require_valid_identity, verify_and_consume_auction_auth,
+    verify_and_consume_auth, ActionHasher, AuctionOrder, ACTION_APPROVE, ACTION_CANCEL,
+    ACTION_ISSUE, ACTION_SUPER, ACTION_TRANSFER, ERR_CONSTITUTION_MISMATCH, ERR_NO_CROSSING_ORDERS,
+    MAX_AUCTION_ORDERS, POLICY_HOLDER_SELF, POLICY_SHARE_TRANSFER_AUCTION,
 };
 use hps_sdk::storage::KeyBuilder;
 use hps_sdk::{context, event_topic, events, hps_entry, ret, storage};
@@ -39,6 +40,12 @@ const TRANSFER_TOPIC: [u8; 32] = event_topic("Transfer(address,address,uint64)")
 const APPROVAL_TOPIC: [u8; 32] = event_topic("Approval(address,address,uint64)");
 const PERMISSION_SET_TOPIC: [u8; 32] =
     event_topic("PermissionUpdated(bytes32,address,bytes32,address)");
+const AUCTION_SETTLED_TOPIC: [u8; 32] =
+    event_topic("AuctionTransferSettled(address,uint64,uint64,uint64,uint64,uint64,uint64)");
+const AUCTION_BUYER_FILLED: [u8; 32] =
+    event_topic("AuctionBuyerFilled(address,uint64,uint64,uint64)");
+const AUCTION_SELLER_FILLED: [u8; 32] =
+    event_topic("AuctionSellerFilled(address,uint64,uint64,uint64,uint64)");
 
 const KEY_INIT: &[u8] = b"meta:init";
 const KEY_REGISTRY: &[u8] = b"meta:registry";
@@ -47,12 +54,17 @@ const KEY_SYMBOL: &[u8] = b"meta:symbol";
 const KEY_DECIMALS: &[u8] = b"meta:decimals";
 const KEY_SUPPLY: &[u8] = b"meta:supply";
 const KEY_HOLDER_COUNT: &[u8] = b"meta:holders";
+const KEY_LAST_AUC_PRICE: &[u8] = b"meta:auc_price";
+const KEY_LAST_AUC_QTY: &[u8] = b"meta:auc_qty";
+const KEY_LAST_AUC_BUY_DEMAND: &[u8] = b"meta:auc_buy_q";
+const KEY_LAST_AUC_SELL_SUPPLY: &[u8] = b"meta:auc_sell_q";
 
 hps_entry! {
     "initialize(address,string,uint64,bytes,bytes)"         => handle_initialize,
     "issue(address,uint64,address)"                         => handle_issue,
     "cancel(address,uint64,address)"                        => handle_cancel,
     "transfer(address,address,uint64,address)"              => handle_transfer,
+    "settleTransferAuction(address)"                        => handle_settle_transfer_auction,
     "approve(address,uint64,address)"                       => handle_approve,
     "transferFrom(address,address,uint64)"                  => handle_transfer_from,
     "setPermission(bytes32,address,bytes32,address)"        => handle_set_permission,
@@ -66,6 +78,7 @@ hps_entry! {
     "identityRegistry()"                                    => handle_identity_registry,
     "associatedConstitution()"                              => handle_associated_constitution,
     "getPermission(bytes32)"                                => handle_get_permission,
+    "lastAuctionSettlement()"                               => handle_last_auction_settlement,
     "hashIssue(address,uint64)"                             => handle_hash_issue,
     "hashCancel(address,uint64)"                            => handle_hash_cancel,
     "hashTransfer(address,address,uint64)"                  => handle_hash_transfer,
@@ -478,7 +491,9 @@ fn handle_cancel(args: &CalldataReader) -> Result<(), i32> {
 }
 
 /// Move `amount` units from valid Identity `fromIdentity` to valid Identity `toIdentity`
-/// via `internal_debit` + `internal_credit`.
+/// via `internal_debit` + `internal_credit`, OR settle a finalized 3-step share-transfer auction
+/// when `ACTION_TRANSFER` is governed by `POLICY_SHARE_TRANSFER_AUCTION` (or when `fromIdentity`
+/// and `toIdentity` are zero and `amount == 0`).
 /// Requires a finalized, one-time-use `Authorization` object matching `ACTION_TRANSFER`.
 fn handle_transfer(args: &CalldataReader) -> Result<(), i32> {
     let (registry, caller) = ensure_initialized_and_valid_caller()?;
@@ -486,6 +501,16 @@ fn handle_transfer(args: &CalldataReader) -> Result<(), i32> {
     let to_identity = args.address(1).ok_or(-3)?;
     let amount = args.u64(2).ok_or(-3)?;
     let auth_obj = args.address(3).ok_or(-3)?;
+
+    let rule = load_permission(&ACTION_TRANSFER).ok_or(-12)?;
+    if rule.policy_id == POLICY_SHARE_TRANSFER_AUCTION
+        || (from_identity == [0u8; 20] && to_identity == [0u8; 20] && amount == 0)
+    {
+        execute_transfer_auction_settlement(&registry, &caller, &auth_obj)?;
+        ret::write_bool(true);
+        return Ok(());
+    }
+
     if amount == 0 || from_identity == to_identity {
         return Err(-14);
     }
@@ -516,6 +541,500 @@ fn handle_transfer(args: &CalldataReader) -> Result<(), i32> {
     );
     ret::write_bool(true);
     Ok(())
+}
+
+/// Settle a finalized 3-step Call-Auction `Authorization` HPS (`POLICY_SHARE_TRANSFER_AUCTION`)
+/// for the AssetLedger's own shares, returning `(uint64 clearingPrice, uint64 matchedQuantity,
+/// uint64 crossingBuyDemand, uint64 crossingSellSupply)`.
+fn handle_settle_transfer_auction(args: &CalldataReader) -> Result<(), i32> {
+    let (registry, caller) = ensure_initialized_and_valid_caller()?;
+    let auth_obj = args.address(0).ok_or(-3)?;
+    let (clearing_price, matched_qty, buy_demand, sell_supply) =
+        execute_transfer_auction_settlement(&registry, &caller, &auth_obj)?;
+    let mut out = [0u8; 128];
+    out[24..32].copy_from_slice(&clearing_price.to_be_bytes());
+    out[56..64].copy_from_slice(&matched_qty.to_be_bytes());
+    out[88..96].copy_from_slice(&buy_demand.to_be_bytes());
+    out[120..128].copy_from_slice(&sell_supply.to_be_bytes());
+    ret::write(&out);
+    Ok(())
+}
+
+/// Core single-price call-auction clearing and pro-rata settlement engine:
+/// 1. Consumes the finalized one-time `Authorization` HPS via `verify_and_consume_auction_auth`.
+/// 2. Snapshots every participating seller's pre-settlement shareholding (`balanceOf(seller)`).
+/// 3. Identifies the single best clearing price `P*` that maximizes matched volume
+///    `min(D(P), S(P))` across crossing orders (`buy.price >= P* >= sell.price`).
+/// 4. Allocates fills across crossing buyers and sellers:
+///    - If `crossing_buy_qty > crossing_sell_qty`: all crossing sell orders fill 100%, and crossing
+///      buy orders are filled **pro-rata to their original buy order quantities**.
+///    - If `crossing_sell_qty > crossing_buy_qty`: all crossing buy orders fill 100%, and crossing
+///      sell orders are filled **pro-rata to the percentage of existing holding (`balanceOf(seller)`)
+///      of that particular shareholder (NOT the sell order quantity)**.
+///    - If `crossing_buy_qty == crossing_sell_qty`: all crossing buy and sell orders fill 100%.
+/// 5. Executes `internal_debit` on filled sellers and `internal_credit` on filled buyers, emitting
+///    per-order and summary settlement logs.
+fn execute_transfer_auction_settlement(
+    registry: &[u8; 20],
+    caller: &[u8; 20],
+    auth_obj: &[u8; 20],
+) -> Result<(u64, u64, u64, u64), i32> {
+    let rule = load_permission(&ACTION_TRANSFER).ok_or(-12)?;
+    if !rule.configured || rule.constitution == [0u8; 20] {
+        return Err(-12);
+    }
+    let pinned_con = storage::get_address(KEY_CONSTITUTION).unwrap_or([0u8; 20]);
+    if pinned_con != [0u8; 20] && rule.constitution != pinned_con {
+        return Err(ERR_CONSTITUTION_MISMATCH);
+    }
+
+    let book = verify_and_consume_auction_auth(
+        registry,
+        auth_obj,
+        &rule.constitution,
+        &rule.policy_id,
+        caller,
+    )?;
+
+    if book.order_count == 0 {
+        return Err(ERR_NO_CROSSING_ORDERS);
+    }
+
+    let mut buy_orders = [AuctionOrder::default(); MAX_AUCTION_ORDERS];
+    let mut buy_count = 0usize;
+
+    let mut sell_orders = [AuctionOrder::default(); MAX_AUCTION_ORDERS];
+    let mut sell_holdings = [0u64; MAX_AUCTION_ORDERS];
+    let mut sell_count = 0usize;
+
+    // Track unique sellers' pre-settlement balances and remaining sellable balance so a seller
+    // can never offer more than their actual existing holding.
+    let mut unique_sellers = [[0u8; 20]; MAX_AUCTION_ORDERS];
+    let mut unique_init_bal = [0u64; MAX_AUCTION_ORDERS];
+    let mut unique_rem_bal = [0u64; MAX_AUCTION_ORDERS];
+    let mut unique_seller_count = 0usize;
+
+    let mut idx = 0usize;
+    while idx < book.order_count {
+        let ord = book.orders[idx];
+        require_valid_identity(registry, &ord.trader)?;
+        if ord.price == 0 || ord.quantity == 0 {
+            return Err(-14);
+        }
+        if ord.is_buy() {
+            buy_orders[buy_count] = ord;
+            buy_count += 1;
+        } else if ord.is_sell() {
+            // Find or snapshot this seller's pre-settlement existing holding
+            let mut s_idx = 0usize;
+            while s_idx < unique_seller_count {
+                if unique_sellers[s_idx] == ord.trader {
+                    break;
+                }
+                s_idx += 1;
+            }
+            if s_idx == unique_seller_count {
+                let bk = balance_key(&ord.trader);
+                let bal = storage::get_u64(bk.as_slice());
+                if bal == 0 {
+                    return Err(-16);
+                }
+                unique_sellers[s_idx] = ord.trader;
+                unique_init_bal[s_idx] = bal;
+                unique_rem_bal[s_idx] = bal;
+                unique_seller_count += 1;
+            }
+            let capped_qty = if ord.quantity <= unique_rem_bal[s_idx] {
+                ord.quantity
+            } else {
+                unique_rem_bal[s_idx]
+            };
+            if capped_qty > 0 {
+                unique_rem_bal[s_idx] -= capped_qty;
+                let mut capped_ord = ord;
+                capped_ord.quantity = capped_qty;
+                sell_orders[sell_count] = capped_ord;
+                sell_holdings[sell_count] = unique_init_bal[s_idx];
+                sell_count += 1;
+            }
+        }
+        idx += 1;
+    }
+
+    if buy_count == 0 || sell_count == 0 {
+        return Err(ERR_NO_CROSSING_ORDERS);
+    }
+
+    // Collect sorted unique candidate prices from all buy and sell orders
+    let mut candidates = [0u64; MAX_AUCTION_ORDERS];
+    let mut cand_count = 0usize;
+    let mut i = 0usize;
+    while i < buy_count {
+        let p = buy_orders[i].price;
+        let mut exists = false;
+        let mut k = 0usize;
+        while k < cand_count {
+            if candidates[k] == p {
+                exists = true;
+                break;
+            }
+            k += 1;
+        }
+        if !exists {
+            candidates[cand_count] = p;
+            cand_count += 1;
+        }
+        i += 1;
+    }
+    i = 0;
+    while i < sell_count {
+        let p = sell_orders[i].price;
+        let mut exists = false;
+        let mut k = 0usize;
+        while k < cand_count {
+            if candidates[k] == p {
+                exists = true;
+                break;
+            }
+            k += 1;
+        }
+        if !exists {
+            candidates[cand_count] = p;
+            cand_count += 1;
+        }
+        i += 1;
+    }
+
+    // Insertion-sort candidate prices ascending
+    i = 1;
+    while i < cand_count {
+        let key = candidates[i];
+        let mut j = i;
+        while j > 0 && candidates[j - 1] > key {
+            candidates[j] = candidates[j - 1];
+            j -= 1;
+        }
+        candidates[j] = key;
+        i += 1;
+    }
+
+    // Evaluate aggregate demand D(P), aggregate supply S(P), and matched volume V(P) = min(D(P), S(P))
+    // at each candidate price P to determine the single best clearing price P*:
+    // 1. Maximize matched trade volume V(P) = min(D(P), S(P)).
+    // 2. Among candidate prices achieving max V(P), maximize total crossing participation D(P) + S(P)
+    //    so all crossing buyers/sellers participate in pro-rata allocation.
+    let mut best_vol = 0u64;
+    let mut best_participation = 0u64;
+    let mut best_min_price = 0u64;
+    let mut best_max_price = 0u64;
+    let mut best_demand = 0u64;
+    let mut best_supply = 0u64;
+
+    i = 0;
+    while i < cand_count {
+        let p = candidates[i];
+        let mut d = 0u64;
+        let mut b = 0usize;
+        while b < buy_count {
+            if buy_orders[b].price >= p {
+                d = d.saturating_add(buy_orders[b].quantity);
+            }
+            b += 1;
+        }
+        let mut s = 0u64;
+        let mut sl = 0usize;
+        while sl < sell_count {
+            if sell_orders[sl].price <= p {
+                s = s.saturating_add(sell_orders[sl].quantity);
+            }
+            sl += 1;
+        }
+        let vol = if d < s { d } else { s };
+        if vol > 0 {
+            let part = d.saturating_add(s);
+            if vol > best_vol || (vol == best_vol && part > best_participation) {
+                best_vol = vol;
+                best_participation = part;
+                best_min_price = p;
+                best_max_price = p;
+                best_demand = d;
+                best_supply = s;
+            } else if vol == best_vol && part == best_participation {
+                best_max_price = p;
+            }
+        }
+        i += 1;
+    }
+
+    if best_vol == 0 {
+        return Err(ERR_NO_CROSSING_ORDERS);
+    }
+
+    let clearing_price = if best_demand > best_supply {
+        best_max_price
+    } else if best_supply > best_demand {
+        best_min_price
+    } else {
+        best_min_price + (best_max_price - best_min_price) / 2
+    };
+
+    // Recompute exact crossing sets at `clearing_price`
+    let mut crossing_buy_qty = 0u64;
+    let mut b = 0usize;
+    while b < buy_count {
+        if buy_orders[b].price >= clearing_price {
+            crossing_buy_qty = crossing_buy_qty.saturating_add(buy_orders[b].quantity);
+        }
+        b += 1;
+    }
+    let mut crossing_sell_qty = 0u64;
+    let mut sl = 0usize;
+    while sl < sell_count {
+        if sell_orders[sl].price <= clearing_price {
+            crossing_sell_qty = crossing_sell_qty.saturating_add(sell_orders[sl].quantity);
+        }
+        sl += 1;
+    }
+
+    let matched_qty = if crossing_buy_qty < crossing_sell_qty {
+        crossing_buy_qty
+    } else {
+        crossing_sell_qty
+    };
+    if matched_qty == 0 {
+        return Err(ERR_NO_CROSSING_ORDERS);
+    }
+
+    let mut buy_fills = [0u64; MAX_AUCTION_ORDERS];
+    let mut sell_fills = [0u64; MAX_AUCTION_ORDERS];
+
+    if crossing_buy_qty > crossing_sell_qty {
+        // Total buying quantity > total selling quantity:
+        // 1. Fill all crossing sell orders 100%.
+        sl = 0;
+        while sl < sell_count {
+            if sell_orders[sl].price <= clearing_price {
+                sell_fills[sl] = sell_orders[sl].quantity;
+            }
+            sl += 1;
+        }
+
+        // 2. Fill crossing buy orders pro-rated to their original buy order quantities.
+        let mut allocated = 0u64;
+        let mut remainders = [0u128; MAX_AUCTION_ORDERS];
+        b = 0;
+        while b < buy_count {
+            if buy_orders[b].price >= clearing_price {
+                let num = (matched_qty as u128) * (buy_orders[b].quantity as u128);
+                let den = crossing_buy_qty as u128;
+                let share = (num / den) as u64;
+                buy_fills[b] = share;
+                remainders[b] = num % den;
+                allocated = allocated.saturating_add(share);
+            }
+            b += 1;
+        }
+        let mut rem_shares = matched_qty.saturating_sub(allocated);
+        while rem_shares > 0 {
+            let mut best_b = usize::MAX;
+            let mut best_rem = 0u128;
+            b = 0;
+            while b < buy_count {
+                if buy_orders[b].price >= clearing_price
+                    && buy_fills[b] < buy_orders[b].quantity
+                    && (best_b == usize::MAX || remainders[b] > best_rem)
+                {
+                    best_b = b;
+                    best_rem = remainders[b];
+                }
+                b += 1;
+            }
+            if best_b == usize::MAX {
+                break;
+            }
+            buy_fills[best_b] += 1;
+            remainders[best_b] = 0;
+            rem_shares -= 1;
+        }
+    } else if crossing_sell_qty > crossing_buy_qty {
+        // Total selling quantity > total buying quantity:
+        // 1. Fill all crossing buy orders 100%.
+        b = 0;
+        while b < buy_count {
+            if buy_orders[b].price >= clearing_price {
+                buy_fills[b] = buy_orders[b].quantity;
+            }
+            b += 1;
+        }
+
+        // 2. Fill crossing sell orders pro-rated to the percentage of existing holding
+        //    (`sell_holdings[sl] == balanceOf(seller)`) of that particular shareholder
+        //    (NOT the sell order quantity!), capped at each seller's offered quantity.
+        let mut uncapped = [false; MAX_AUCTION_ORDERS];
+        sl = 0;
+        while sl < sell_count {
+            if sell_orders[sl].price <= clearing_price {
+                uncapped[sl] = true;
+            }
+            sl += 1;
+        }
+
+        let mut rem_to_fill = matched_qty;
+        loop {
+            let mut weight_sum = 0u128;
+            sl = 0;
+            while sl < sell_count {
+                if uncapped[sl] {
+                    weight_sum += sell_holdings[sl] as u128;
+                }
+                sl += 1;
+            }
+            if weight_sum == 0 || rem_to_fill == 0 {
+                break;
+            }
+
+            let mut any_capped = false;
+            sl = 0;
+            while sl < sell_count {
+                if uncapped[sl] {
+                    let provisional =
+                        ((rem_to_fill as u128) * (sell_holdings[sl] as u128)) / weight_sum;
+                    if provisional >= (sell_orders[sl].quantity as u128) {
+                        sell_fills[sl] = sell_orders[sl].quantity;
+                        rem_to_fill = rem_to_fill.saturating_sub(sell_orders[sl].quantity);
+                        uncapped[sl] = false;
+                        any_capped = true;
+                    }
+                }
+                sl += 1;
+            }
+
+            if !any_capped {
+                let mut allocated = 0u64;
+                let mut remainders = [0u128; MAX_AUCTION_ORDERS];
+                sl = 0;
+                while sl < sell_count {
+                    if uncapped[sl] {
+                        let num = (rem_to_fill as u128) * (sell_holdings[sl] as u128);
+                        let share = (num / weight_sum) as u64;
+                        sell_fills[sl] = share;
+                        remainders[sl] = num % weight_sum;
+                        allocated = allocated.saturating_add(share);
+                    }
+                    sl += 1;
+                }
+                let mut rem_shares = rem_to_fill.saturating_sub(allocated);
+                while rem_shares > 0 {
+                    let mut best_sl = usize::MAX;
+                    let mut best_rem = 0u128;
+                    sl = 0;
+                    while sl < sell_count {
+                        if uncapped[sl]
+                            && sell_fills[sl] < sell_orders[sl].quantity
+                            && (best_sl == usize::MAX || remainders[sl] > best_rem)
+                        {
+                            best_sl = sl;
+                            best_rem = remainders[sl];
+                        }
+                        sl += 1;
+                    }
+                    if best_sl == usize::MAX {
+                        break;
+                    }
+                    sell_fills[best_sl] += 1;
+                    remainders[best_sl] = 0;
+                    rem_shares -= 1;
+                }
+                break;
+            }
+        }
+    } else {
+        // Exact match (`crossing_buy_qty == crossing_sell_qty`): fill all crossing orders 100%.
+        b = 0;
+        while b < buy_count {
+            if buy_orders[b].price >= clearing_price {
+                buy_fills[b] = buy_orders[b].quantity;
+            }
+            b += 1;
+        }
+        sl = 0;
+        while sl < sell_count {
+            if sell_orders[sl].price <= clearing_price {
+                sell_fills[sl] = sell_orders[sl].quantity;
+            }
+            sl += 1;
+        }
+    }
+
+    // Debit all filled sellers first
+    let mut filled_seller_count = 0u64;
+    sl = 0;
+    while sl < sell_count {
+        let fill = sell_fills[sl];
+        if fill > 0 {
+            internal_debit(&sell_orders[sl].trader, fill)?;
+            filled_seller_count += 1;
+            let mut log_data = [0u8; 32];
+            log_data[0..8].copy_from_slice(&clearing_price.to_be_bytes());
+            log_data[8..16].copy_from_slice(&sell_orders[sl].quantity.to_be_bytes());
+            log_data[16..24].copy_from_slice(&sell_holdings[sl].to_be_bytes());
+            log_data[24..32].copy_from_slice(&fill.to_be_bytes());
+            events::emit(
+                &[
+                    AUCTION_SELLER_FILLED,
+                    addr_topic(&sell_orders[sl].trader),
+                    addr_topic(auth_obj),
+                ],
+                &log_data,
+            );
+        }
+        sl += 1;
+    }
+
+    // Credit all filled buyers
+    let mut filled_buyer_count = 0u64;
+    b = 0;
+    while b < buy_count {
+        let fill = buy_fills[b];
+        if fill > 0 {
+            internal_credit(&buy_orders[b].trader, fill)?;
+            filled_buyer_count += 1;
+            let mut log_data = [0u8; 24];
+            log_data[0..8].copy_from_slice(&clearing_price.to_be_bytes());
+            log_data[8..16].copy_from_slice(&buy_orders[b].quantity.to_be_bytes());
+            log_data[16..24].copy_from_slice(&fill.to_be_bytes());
+            events::emit(
+                &[
+                    AUCTION_BUYER_FILLED,
+                    addr_topic(&buy_orders[b].trader),
+                    addr_topic(auth_obj),
+                ],
+                &log_data,
+            );
+        }
+        b += 1;
+    }
+
+    storage::set_u64(KEY_LAST_AUC_PRICE, clearing_price);
+    storage::set_u64(KEY_LAST_AUC_QTY, matched_qty);
+    storage::set_u64(KEY_LAST_AUC_BUY_DEMAND, crossing_buy_qty);
+    storage::set_u64(KEY_LAST_AUC_SELL_SUPPLY, crossing_sell_qty);
+
+    let mut summary = [0u8; 48];
+    summary[0..8].copy_from_slice(&clearing_price.to_be_bytes());
+    summary[8..16].copy_from_slice(&matched_qty.to_be_bytes());
+    summary[16..24].copy_from_slice(&crossing_buy_qty.to_be_bytes());
+    summary[24..32].copy_from_slice(&crossing_sell_qty.to_be_bytes());
+    summary[32..40].copy_from_slice(&filled_buyer_count.to_be_bytes());
+    summary[40..48].copy_from_slice(&filled_seller_count.to_be_bytes());
+    events::emit(&[AUCTION_SETTLED_TOPIC, addr_topic(auth_obj)], &summary);
+
+    Ok((
+        clearing_price,
+        matched_qty,
+        crossing_buy_qty,
+        crossing_sell_qty,
+    ))
 }
 
 /// Authorize a settlement contract `spender` (such as `AssetPair_OTC`) to debit up to `amount`
@@ -695,6 +1214,16 @@ fn handle_get_permission(args: &CalldataReader) -> Result<(), i32> {
         out[32..64].copy_from_slice(&rule.policy_id);
         out[95] = u8::from(rule.configured);
     }
+    ret::write(&out);
+    Ok(())
+}
+
+fn handle_last_auction_settlement(_args: &CalldataReader) -> Result<(), i32> {
+    let mut out = [0u8; 128];
+    out[24..32].copy_from_slice(&storage::get_u64(KEY_LAST_AUC_PRICE).to_be_bytes());
+    out[56..64].copy_from_slice(&storage::get_u64(KEY_LAST_AUC_QTY).to_be_bytes());
+    out[88..96].copy_from_slice(&storage::get_u64(KEY_LAST_AUC_BUY_DEMAND).to_be_bytes());
+    out[120..128].copy_from_slice(&storage::get_u64(KEY_LAST_AUC_SELL_SUPPLY).to_be_bytes());
     ret::write(&out);
     Ok(())
 }
@@ -1791,5 +2320,447 @@ mod tests {
         .unwrap();
         assert_eq!(bal_of(ext_treasury_ledger, superlexicon_company_id), 200_000);
         assert_eq!(bal_of(ext_treasury_ledger, recipient_sh), 50_000);
+    }
+
+    #[test]
+    fn three_step_share_transfer_auction_clearing_and_prorata_regimes() {
+        use hps_sdk::governance::{
+            ERR_STEP2_SELLER_INELIGIBLE_STEP3, ERR_WRONG_AUCTION_STEP,
+            POLICY_SHAREHOLDER_SUPERMAJORITY, POLICY_SUPER_GOVERNANCE,
+        };
+
+        mod auc_full_sim {
+            use super::*;
+            use hps_sdk::abi::CalldataReader;
+            use hps_sdk::governance::{
+                share_transfer_auction_policy_spec, AuctionBook, AuctionOrder,
+                ERR_NOT_EXISTING_SHAREHOLDER, ERR_STEP2_SELLER_INELIGIBLE_STEP3,
+                ERR_WRONG_AUCTION_STEP, MAX_ENCODED_AUCTION_BOOK_BYTES, MAX_ENCODED_POLICY_BYTES,
+                ORDER_SIDE_BUY_STEP1, ORDER_SIDE_BUY_STEP3, ORDER_SIDE_SELL_STEP2,
+            };
+            use hps_sdk::storage::KeyBuilder;
+            use hps_sdk::{call, context, ret, selector, storage};
+
+            pub fn reg_dispatch(raw: &[u8]) -> i32 {
+                let Some((sel, args)) = CalldataReader::parse(raw) else { return -1; };
+                if sel == selector("isValidIdentity(address)") {
+                    let id = args.address(0).unwrap();
+                    ret::write_bool(id != [0u8; 20] && id[0] != 0xEE);
+                    return 0;
+                }
+                if sel == selector("isValidAuthorizationHps(address)") {
+                    let au = args.address(0).unwrap();
+                    let expected = hps_sdk::mock::dispatch_code_hash(auction_auth_dispatch);
+                    ret::write_bool(context::code_hash_of(&au) == Some(expected));
+                    return 0;
+                }
+                -2
+            }
+
+            pub fn con_dispatch(raw: &[u8]) -> i32 {
+                let Some((sel, _args)) = CalldataReader::parse(raw) else { return -1; };
+                if sel == selector("getPolicyRaw(address,bytes32)") {
+                    let spec = share_transfer_auction_policy_spec([0xA1; 20], 10, 10, 10, 50).unwrap();
+                    let mut buf = [0u8; MAX_ENCODED_POLICY_BYTES];
+                    let n = spec.encode(&mut buf).unwrap();
+                    ret::write_abi_bytes(&buf[..n]);
+                    return 0;
+                }
+                -2
+            }
+
+            pub fn auction_auth_dispatch(raw: &[u8]) -> i32 {
+                let Some((sel, args)) = CalldataReader::parse(raw) else { return -1; };
+                if sel == selector("initializeTransferAuction(address,address,address)") {
+                    if storage::get_u64(b"state") != 0 {
+                        return -50;
+                    }
+                    let reg = args.address(0).unwrap();
+                    let con = args.address(1).unwrap();
+                    let target = args.address(2).unwrap();
+                    storage::set_address(b"reg", &reg);
+                    storage::set_address(b"con", &con);
+                    storage::set_address(b"target", &target);
+                    storage::set(b"pol", &POLICY_SHARE_TRANSFER_AUCTION);
+                    storage::set_u64(b"state", 1); // PENDING
+                    let book = AuctionBook::new();
+                    let mut bbuf = [0u8; MAX_ENCODED_AUCTION_BOOK_BYTES];
+                    let blen = book.encode(&mut bbuf).unwrap();
+                    storage::set(b"book", &bbuf[..blen]);
+                    ret::write_bool(true);
+                    return 0;
+                }
+                if sel == selector("placeBuyOrder(uint64,uint64)") {
+                    let price = args.u64(0).unwrap();
+                    let qty = args.u64(1).unwrap();
+                    let caller = context::msg_sender();
+                    let now = context::block_number();
+                    let mut bbuf = [0u8; MAX_ENCODED_AUCTION_BOOK_BYTES];
+                    let blen = storage::get_into(b"book", &mut bbuf).unwrap();
+                    let mut book = AuctionBook::decode(&bbuf[..blen]).unwrap();
+
+                    let side = if storage::get_u64(b"started") == 0 {
+                        storage::set_u64(b"started", 1);
+                        storage::set_u64(b"s1", now + 10);
+                        storage::set_u64(b"s2", now + 20);
+                        storage::set_u64(b"s3", now + 30);
+                        storage::set_u64(b"ov", now + 80);
+                        ORDER_SIDE_BUY_STEP1
+                    } else {
+                        let s1 = storage::get_u64(b"s1");
+                        let s2 = storage::get_u64(b"s2");
+                        let s3 = storage::get_u64(b"s3");
+                        if now <= s1 {
+                            ORDER_SIDE_BUY_STEP1
+                        } else if now <= s2 {
+                            return ERR_WRONG_AUCTION_STEP;
+                        } else if now <= s3 {
+                            let sk = KeyBuilder::<32>::new().push(b"s2s:").push(&caller);
+                            if storage::get_u64(sk.as_slice()) != 0 {
+                                return ERR_STEP2_SELLER_INELIGIBLE_STEP3;
+                            }
+                            let target = storage::get_address(b"target").unwrap();
+                            let bal = call::call_u64(
+                                &target,
+                                CallEncoder::<64>::new(selector("balanceOf(address)"))
+                                    .push_address(&caller)
+                                    .as_slice(),
+                            )
+                            .unwrap_or(0);
+                            if bal == 0 {
+                                return ERR_NOT_EXISTING_SHAREHOLDER;
+                            }
+                            ORDER_SIDE_BUY_STEP3
+                        } else {
+                            return ERR_WRONG_AUCTION_STEP;
+                        }
+                    };
+                    let idx = book.order_count as u64;
+                    book.push(AuctionOrder {
+                        side,
+                        trader: caller,
+                        price,
+                        quantity: qty,
+                    });
+                    let n = book.encode(&mut bbuf).unwrap();
+                    storage::set(b"book", &bbuf[..n]);
+                    ret::write_u64_word(idx);
+                    return 0;
+                }
+                if sel == selector("placeSellOrder(uint64,uint64)") {
+                    if storage::get_u64(b"started") == 0 {
+                        return ERR_WRONG_AUCTION_STEP;
+                    }
+                    let price = args.u64(0).unwrap();
+                    let qty = args.u64(1).unwrap();
+                    let caller = context::msg_sender();
+                    let now = context::block_number();
+                    let s1 = storage::get_u64(b"s1");
+                    let s2 = storage::get_u64(b"s2");
+                    if now <= s1 || now > s2 {
+                        return ERR_WRONG_AUCTION_STEP;
+                    }
+                    let target = storage::get_address(b"target").unwrap();
+                    let bal = call::call_u64(
+                        &target,
+                        CallEncoder::<64>::new(selector("balanceOf(address)"))
+                            .push_address(&caller)
+                            .as_slice(),
+                    )
+                    .unwrap_or(0);
+                    if bal == 0 {
+                        return ERR_NOT_EXISTING_SHAREHOLDER;
+                    }
+                    if qty > bal {
+                        return -16;
+                    }
+                    let sk = KeyBuilder::<32>::new().push(b"s2s:").push(&caller);
+                    storage::set_u64(sk.as_slice(), 1);
+                    let mut bbuf = [0u8; MAX_ENCODED_AUCTION_BOOK_BYTES];
+                    let blen = storage::get_into(b"book", &mut bbuf).unwrap();
+                    let mut book = AuctionBook::decode(&bbuf[..blen]).unwrap();
+                    let idx = book.order_count as u64;
+                    book.push(AuctionOrder {
+                        side: ORDER_SIDE_SELL_STEP2,
+                        trader: caller,
+                        price,
+                        quantity: qty,
+                    });
+                    let n = book.encode(&mut bbuf).unwrap();
+                    storage::set(b"book", &bbuf[..n]);
+                    ret::write_u64_word(idx);
+                    return 0;
+                }
+                if sel == selector("consumeAuction(address,bytes32,address)") {
+                    if storage::get_u64(b"used") != 0 {
+                        return -56;
+                    }
+                    if storage::get_u64(b"started") == 0 {
+                        return -57;
+                    }
+                    let now = context::block_number();
+                    if now <= storage::get_u64(b"s3") {
+                        return ERR_WRONG_AUCTION_STEP;
+                    }
+                    if now > storage::get_u64(b"ov") {
+                        return -55;
+                    }
+                    if context::msg_sender() != storage::get_address(b"target").unwrap() {
+                        return -58;
+                    }
+                    if args.address(0).unwrap() != storage::get_address(b"con").unwrap()
+                        || args.bytes32(1).unwrap() != storage::get_bytes32(b"pol").unwrap()
+                    {
+                        return -59;
+                    }
+                    storage::set_u64(b"used", 1);
+                    let mut bbuf = [0u8; MAX_ENCODED_AUCTION_BOOK_BYTES];
+                    let blen = storage::get_into(b"book", &mut bbuf).unwrap();
+                    ret::write_abi_bytes(&bbuf[..blen]);
+                    return 0;
+                }
+                -2
+            }
+        }
+
+        mock::reset();
+        let reg = [0x10; 20];
+        let con = [0x20; 20];
+        let ledger_a = [0x31; 20];
+        let ledger_b = [0x32; 20];
+        let auth_auc_a = [0x41; 20];
+        let auth_auc_b = [0x42; 20];
+
+        mock::register_hps(reg, auc_full_sim::reg_dispatch);
+        mock::register_hps(con, auc_full_sim::con_dispatch);
+        mock::register_hps(ledger_a, dispatch_calldata);
+        mock::register_hps(ledger_b, dispatch_calldata);
+        mock::register_hps(auth_auc_a, auc_full_sim::auction_auth_dispatch);
+        mock::register_hps(auth_auc_b, auc_full_sim::auction_auth_dispatch);
+
+        let bal_of = |ledger: [u8; 20], who: [u8; 20]| -> u64 {
+            let out = mock::transact_as(
+                who,
+                ledger,
+                CallEncoder::<64>::new(selector("balanceOf(address)"))
+                    .push_address(&who)
+                    .as_slice(),
+            )
+            .unwrap();
+            u64::from_be_bytes(out[24..32].try_into().unwrap())
+        };
+
+        // =========================================================================
+        // REGIME A: Total Buying Quantity (20,000) > Total Selling Quantity (10,000)
+        // -> Fill crossing sell orders 100%, and pro-rate crossing buy orders
+        //    proportional to their ORIGINAL BUY ORDER QUANTITIES!
+        // =========================================================================
+        let seller_a = [0xA1; 20]; // 50,000 shares
+        let seller_b = [0xA2; 20]; // 20,000 shares
+        let seller_high = [0xA3; 20]; // 10,000 shares (asks too high a price)
+        let sh_buyer_3 = [0xA4; 20]; // 20,000 shares (does NOT sell in Step 2 -> buys in Step 3)
+        let buyer_1 = [0xB1; 20]; // external investor (0 shares)
+        let buyer_2 = [0xB2; 20]; // external investor (0 shares)
+        let buyer_low = [0xB3; 20]; // external investor (0 shares, bids too low a price)
+
+        let init_a = encode_ledger_init(
+            reg,
+            b"SLX-COMMON",
+            0,
+            &[
+                (seller_a, 50_000),
+                (seller_b, 20_000),
+                (seller_high, 10_000),
+                (sh_buyer_3, 20_000),
+            ],
+            &[
+                (ACTION_SUPER, con, POLICY_SUPER_GOVERNANCE),
+                (ACTION_ISSUE, con, POLICY_SHAREHOLDER_SUPERMAJORITY),
+                (ACTION_CANCEL, con, POLICY_SHAREHOLDER_SUPERMAJORITY),
+                (ACTION_TRANSFER, con, POLICY_SHARE_TRANSFER_AUCTION),
+                (ACTION_APPROVE, [0u8; 20], POLICY_HOLDER_SELF),
+            ],
+        );
+        mock::transact_as(seller_a, ledger_a, &init_a).unwrap();
+
+        mock::set_block_number(100);
+        mock::transact_as(
+            buyer_1,
+            auth_auc_a,
+            CallEncoder::<128>::new(selector(
+                "initializeTransferAuction(address,address,address)",
+            ))
+            .push_address(&reg)
+            .push_address(&con)
+            .push_address(&ledger_a)
+            .as_slice(),
+        )
+        .unwrap();
+
+        let buy_cd = |price: u64, qty: u64| {
+            CallEncoder::<96>::new(selector("placeBuyOrder(uint64,uint64)"))
+                .push_u64(price)
+                .push_u64(qty)
+        };
+        let sell_cd = |price: u64, qty: u64| {
+            CallEncoder::<96>::new(selector("placeSellOrder(uint64,uint64)"))
+                .push_u64(price)
+                .push_u64(qty)
+        };
+
+        // Step 1 (blocks 100..=110): First potential buyer starts clock; interested buyers place orders
+        mock::transact_as(buyer_1, auth_auc_a, buy_cd(120, 6_000).as_slice()).unwrap();
+        mock::set_block_number(105);
+        mock::transact_as(buyer_2, auth_auc_a, buy_cd(110, 8_000).as_slice()).unwrap();
+        mock::transact_as(buyer_low, auth_auc_a, buy_cd(90, 5_000).as_slice()).unwrap();
+
+        // Step 2 (blocks 111..=120): Existing shareholders place sell orders
+        mock::set_block_number(112);
+        mock::transact_as(seller_a, auth_auc_a, sell_cd(100, 6_000).as_slice()).unwrap();
+        mock::transact_as(seller_b, auth_auc_a, sell_cd(110, 4_000).as_slice()).unwrap();
+        mock::transact_as(seller_high, auth_auc_a, sell_cd(140, 3_000).as_slice()).unwrap();
+
+        // Step 3 (blocks 121..=130): Remaining non-selling shareholder `sh_buyer_3` places buy order
+        mock::set_block_number(125);
+        assert_eq!(
+            mock::transact_as(seller_a, auth_auc_a, buy_cd(115, 2_000).as_slice()),
+            Err(ERR_STEP2_SELLER_INELIGIBLE_STEP3)
+        );
+        mock::transact_as(sh_buyer_3, auth_auc_a, buy_cd(115, 6_000).as_slice()).unwrap();
+
+        // Premature settlement before Step 3 ends (block 130 <= 130) MUST revert!
+        mock::set_block_number(130);
+        assert_eq!(
+            mock::transact_as(
+                buyer_1,
+                ledger_a,
+                CallEncoder::<64>::new(selector("settleTransferAuction(address)"))
+                    .push_address(&auth_auc_a)
+                    .as_slice(),
+            ),
+            Err(ERR_WRONG_AUCTION_STEP)
+        );
+
+        // Step 4 (block 131 > 130): Settle auction on `ledger_a`!
+        mock::set_block_number(131);
+        let settle_out = mock::transact_as(
+            buyer_1,
+            ledger_a,
+            CallEncoder::<64>::new(selector("settleTransferAuction(address)"))
+                .push_address(&auth_auc_a)
+                .as_slice(),
+        )
+        .unwrap();
+        let clearing_price_a = u64::from_be_bytes(settle_out[24..32].try_into().unwrap());
+        let matched_qty_a = u64::from_be_bytes(settle_out[56..64].try_into().unwrap());
+        let buy_demand_a = u64::from_be_bytes(settle_out[88..96].try_into().unwrap());
+        let sell_supply_a = u64::from_be_bytes(settle_out[120..128].try_into().unwrap());
+
+        assert_eq!(clearing_price_a, 110);
+        assert_eq!(matched_qty_a, 10_000);
+        assert_eq!(buy_demand_a, 20_000);
+        assert_eq!(sell_supply_a, 10_000);
+
+        // Verify Regime A balances:
+        // - Crossing sellers (`seller_a` 6,000, `seller_b` 4,000) filled 100%
+        // - Non-crossing seller (`seller_high` @ 140) untouched
+        // - Crossing buyers (`buyer_1` 6,000, `buyer_2` 8,000, `sh_buyer_3` 6,000) pro-rated
+        //   by original buy order quantities (30% : 40% : 30% of 10,000 = 3,000 : 4,000 : 3,000)
+        // - Non-crossing buyer (`buyer_low` @ 90) receives 0
+        assert_eq!(bal_of(ledger_a, seller_a), 44_000);
+        assert_eq!(bal_of(ledger_a, seller_b), 16_000);
+        assert_eq!(bal_of(ledger_a, seller_high), 10_000);
+        assert_eq!(bal_of(ledger_a, buyer_1), 3_000);
+        assert_eq!(bal_of(ledger_a, buyer_2), 4_000);
+        assert_eq!(bal_of(ledger_a, sh_buyer_3), 23_000);
+        assert_eq!(bal_of(ledger_a, buyer_low), 0);
+
+        // =========================================================================
+        // REGIME B: Total Selling Quantity (45,000) > Total Buying Quantity (10,000)
+        // -> Fill crossing buy orders 100%, and pro-rate crossing sell orders
+        //    to the PERCENTAGE OF EXISTING HOLDING of each shareholder
+        //    (60,000 : 20,000 : 20,000 = 60% : 20% : 20%), NOT their equal 15,000 order quantities!
+        // =========================================================================
+        let sh_1 = [0xC1; 20]; // holds 60,000 shares (60% of selling shareholders' holdings)
+        let sh_2 = [0xC2; 20]; // holds 20,000 shares (20% of selling shareholders' holdings)
+        let sh_3 = [0xC3; 20]; // holds 20,000 shares (20% of selling shareholders' holdings)
+        let sh_4 = [0xC4; 20]; // holds 10,000 shares (does not sell in Step 2 -> buys in Step 3)
+        let ext_buyer = [0xD1; 20]; // external investor (0 shares)
+
+        let init_b = encode_ledger_init(
+            reg,
+            b"SLX-COMMON",
+            0,
+            &[
+                (sh_1, 60_000),
+                (sh_2, 20_000),
+                (sh_3, 20_000),
+                (sh_4, 10_000),
+            ],
+            &[
+                (ACTION_SUPER, con, POLICY_SUPER_GOVERNANCE),
+                (ACTION_ISSUE, con, POLICY_SHAREHOLDER_SUPERMAJORITY),
+                (ACTION_CANCEL, con, POLICY_SHAREHOLDER_SUPERMAJORITY),
+                (ACTION_TRANSFER, con, POLICY_SHARE_TRANSFER_AUCTION),
+                (ACTION_APPROVE, [0u8; 20], POLICY_HOLDER_SELF),
+            ],
+        );
+        mock::transact_as(sh_1, ledger_b, &init_b).unwrap();
+
+        mock::set_block_number(200);
+        mock::transact_as(
+            ext_buyer,
+            auth_auc_b,
+            CallEncoder::<128>::new(selector(
+                "initializeTransferAuction(address,address,address)",
+            ))
+            .push_address(&reg)
+            .push_address(&con)
+            .push_address(&ledger_b)
+            .as_slice(),
+        )
+        .unwrap();
+
+        // Step 1 (blocks 200..=210): `ext_buyer` places buy order for 7,000 shares @ 100
+        mock::transact_as(ext_buyer, auth_auc_b, buy_cd(100, 7_000).as_slice()).unwrap();
+
+        // Step 2 (blocks 211..=220): `sh_1`, `sh_2`, `sh_3` each place an IDENTICAL sell order
+        // for 15,000 shares @ 100 (total selling quantity = 45,000).
+        mock::set_block_number(215);
+        mock::transact_as(sh_1, auth_auc_b, sell_cd(100, 15_000).as_slice()).unwrap();
+        mock::transact_as(sh_2, auth_auc_b, sell_cd(100, 15_000).as_slice()).unwrap();
+        mock::transact_as(sh_3, auth_auc_b, sell_cd(100, 15_000).as_slice()).unwrap();
+
+        // Step 3 (blocks 221..=230): non-selling shareholder `sh_4` places buy order for 3,000 shares @ 100
+        // (total buying quantity = 7,000 + 3,000 = 10,000 < 45,000 selling quantity).
+        mock::set_block_number(225);
+        mock::transact_as(sh_4, auth_auc_b, buy_cd(100, 3_000).as_slice()).unwrap();
+
+        // Step 4 (block 231 > 230): Pass `auth_auc_b` directly to `ledger_b.transfer(...)`!
+        mock::set_block_number(231);
+        mock::transact_as(
+            sh_1,
+            ledger_b,
+            CallEncoder::<160>::new(selector("transfer(address,address,uint64,address)"))
+                .push_address(&[0u8; 20])
+                .push_address(&[0u8; 20])
+                .push_u64(0)
+                .push_address(&auth_auc_b)
+                .as_slice(),
+        )
+        .unwrap();
+
+        // Verify Regime B balances:
+        // - Crossing buyers filled 100%: `ext_buyer` gets 7,000, `sh_4` gets 3,000 (10,000 -> 13,000).
+        // - Crossing sellers filled pro-rata to EXISTING HOLDING (60,000 : 20,000 : 20,000 = 60% : 20% : 20%),
+        //   NOT their equal 15,000 sell order quantities:
+        //   * `sh_1` sells 6,000 shares (60,000 -> 54,000)
+        //   * `sh_2` sells 2,000 shares (20,000 -> 18,000)
+        //   * `sh_3` sells 2,000 shares (20,000 -> 18,000)
+        assert_eq!(bal_of(ledger_b, ext_buyer), 7_000);
+        assert_eq!(bal_of(ledger_b, sh_4), 13_000);
+        assert_eq!(bal_of(ledger_b, sh_1), 54_000);
+        assert_eq!(bal_of(ledger_b, sh_2), 18_000);
+        assert_eq!(bal_of(ledger_b, sh_3), 18_000);
     }
 }

@@ -29,6 +29,7 @@ pub const ACTION_REMOVE_DIRECTOR: [u8; 32] = keccak256(b"REMOVE_DIRECTOR");
 pub const POLICY_SUPER_GOVERNANCE: [u8; 32] = keccak256(b"SUPER_GOVERNANCE");
 pub const POLICY_SHAREHOLDER_SUPERMAJORITY: [u8; 32] = keccak256(b"SHAREHOLDER_SUPERMAJORITY");
 pub const POLICY_BOARD_RESOLUTION: [u8; 32] = keccak256(b"BOARD_RESOLUTION");
+pub const POLICY_SHARE_TRANSFER_AUCTION: [u8; 32] = keccak256(b"SHARE_TRANSFER_AUCTION");
 pub const POLICY_ADMIN_ORACLE: [u8; 32] = keccak256(b"ADMIN_ORACLE");
 /// Dynamic policy sentinel for `ACTION_TRANSFER` / `ACTION_APPROVE` requiring a one-time
 /// `Authorization` object approved & finalized by the debited holder Identity itself.
@@ -56,7 +57,18 @@ pub const ERR_INVALID_IDENTITY: i32 = -70;
 pub const ERR_AUTH_CONSUME_FAILED: i32 = -71;
 pub const ERR_POLICY_INVALID: i32 = -72;
 pub const ERR_UNAPPROVED_CODE_HASH: i32 = -73;
+pub const ERR_WRONG_AUCTION_STEP: i32 = -74;
+pub const ERR_NOT_EXISTING_SHAREHOLDER: i32 = -75;
+pub const ERR_STEP2_SELLER_INELIGIBLE_STEP3: i32 = -76;
+pub const ERR_NO_CROSSING_ORDERS: i32 = -77;
 pub const ERR_CONSTITUTION_MISMATCH: i32 = -19;
+
+/// Order side/step tags for `POLICY_SHARE_TRANSFER_AUCTION` 3-step share transfer auctions.
+pub const ORDER_SIDE_BUY_STEP1: u8 = 1;
+pub const ORDER_SIDE_SELL_STEP2: u8 = 2;
+pub const ORDER_SIDE_BUY_STEP3: u8 = 3;
+pub const MAX_AUCTION_ORDERS: usize = 64;
+pub const MAX_ENCODED_AUCTION_BOOK_BYTES: usize = 4 + MAX_AUCTION_ORDERS * 37;
 
 /// Single authorizer entry within a sequential authorization stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -446,4 +458,192 @@ pub fn verify_and_consume_auth(
         Err(code) => Err(code),
         Ok(false) => Err(ERR_AUTH_CONSUME_FAILED),
     }
+}
+
+/// Build a 3-stage `PolicySpec` for `POLICY_SHARE_TRANSFER_AUCTION` specifying the predetermined
+/// block windows for:
+/// - `Stage 0` (`step1_window_blocks`): Window 1 — initial buyer order collection (started by the first buyer)
+/// - `Stage 1` (`step2_window_blocks`): Window 2 — existing shareholders' sell order collection
+/// - `Stage 2` (`step3_window_blocks`): Window 3 — remaining non-selling existing shareholders' buy order collection
+/// - `overall_expiry_blocks`: Post-Window-3 settlement window for calling `AssetLedger.transfer`
+pub fn share_transfer_auction_policy_spec(
+    anchor_identity: [u8; 20],
+    step1_window_blocks: u64,
+    step2_window_blocks: u64,
+    step3_window_blocks: u64,
+    overall_expiry_blocks: u64,
+) -> Option<PolicySpec> {
+    let s0 = StageSpec::new(1, step1_window_blocks).add_member(anchor_identity, 1)?;
+    let s1 = StageSpec::new(1, step2_window_blocks).add_member(anchor_identity, 1)?;
+    let s2 = StageSpec::new(1, step3_window_blocks).add_member(anchor_identity, 1)?;
+    PolicySpec::new(overall_expiry_blocks)
+        .add_stage(s0)?
+        .add_stage(s1)?
+        .add_stage(s2)
+}
+
+/// Single buy or sell order recorded inside an `Authorization` HPS running `POLICY_SHARE_TRANSFER_AUCTION`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuctionOrder {
+    /// `ORDER_SIDE_BUY_STEP1 (1)`, `ORDER_SIDE_SELL_STEP2 (2)`, or `ORDER_SIDE_BUY_STEP3 (3)`.
+    pub side: u8,
+    pub trader: [u8; 20],
+    pub price: u64,
+    pub quantity: u64,
+}
+
+impl Default for AuctionOrder {
+    fn default() -> Self {
+        Self {
+            side: 0,
+            trader: [0u8; 20],
+            price: 0,
+            quantity: 0,
+        }
+    }
+}
+
+impl AuctionOrder {
+    pub const fn is_buy(&self) -> bool {
+        self.side == ORDER_SIDE_BUY_STEP1 || self.side == ORDER_SIDE_BUY_STEP3
+    }
+
+    pub const fn is_sell(&self) -> bool {
+        self.side == ORDER_SIDE_SELL_STEP2
+    }
+}
+
+/// Fixed-capacity order book collected across the 3 windows of `POLICY_SHARE_TRANSFER_AUCTION`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuctionBook {
+    pub order_count: usize,
+    pub orders: [AuctionOrder; MAX_AUCTION_ORDERS],
+}
+
+impl Default for AuctionBook {
+    fn default() -> Self {
+        Self {
+            order_count: 0,
+            orders: [AuctionOrder::default(); MAX_AUCTION_ORDERS],
+        }
+    }
+}
+
+impl AuctionBook {
+    pub const fn new() -> Self {
+        Self {
+            order_count: 0,
+            orders: [AuctionOrder {
+                side: 0,
+                trader: [0u8; 20],
+                price: 0,
+                quantity: 0,
+            }; MAX_AUCTION_ORDERS],
+        }
+    }
+
+    pub fn push(&mut self, order: AuctionOrder) -> bool {
+        if self.order_count >= MAX_AUCTION_ORDERS
+            || order.trader == [0u8; 20]
+            || order.price == 0
+            || order.quantity == 0
+            || (order.side != ORDER_SIDE_BUY_STEP1
+                && order.side != ORDER_SIDE_SELL_STEP2
+                && order.side != ORDER_SIDE_BUY_STEP3)
+        {
+            return false;
+        }
+        self.orders[self.order_count] = order;
+        self.order_count += 1;
+        true
+    }
+
+    /// Encode into `out`:
+    /// `[version = 1 (1B)][reserved = 0 (1B)][order_count: u16 BE (2B)]`
+    /// followed by `order_count * 37` bytes of `[side (1B)][trader (20B)][price (8B BE)][quantity (8B BE)]`.
+    pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+        let total = 4 + self.order_count * 37;
+        if self.order_count > MAX_AUCTION_ORDERS || out.len() < total {
+            return None;
+        }
+        out[0] = 1;
+        out[1] = 0;
+        out[2..4].copy_from_slice(&(self.order_count as u16).to_be_bytes());
+        let mut pos = 4usize;
+        let mut i = 0;
+        while i < self.order_count {
+            let o = &self.orders[i];
+            out[pos] = o.side;
+            out[pos + 1..pos + 21].copy_from_slice(&o.trader);
+            out[pos + 21..pos + 29].copy_from_slice(&o.price.to_be_bytes());
+            out[pos + 29..pos + 37].copy_from_slice(&o.quantity.to_be_bytes());
+            pos += 37;
+            i += 1;
+        }
+        Some(pos)
+    }
+
+    pub fn decode(raw: &[u8]) -> Option<Self> {
+        if raw.len() < 4 || raw[0] != 1 {
+            return None;
+        }
+        let count = u16::from_be_bytes([raw[2], raw[3]]) as usize;
+        if count > MAX_AUCTION_ORDERS || raw.len() != 4 + count * 37 {
+            return None;
+        }
+        let mut book = Self::new();
+        let mut pos = 4usize;
+        let mut i = 0;
+        while i < count {
+            let side = raw[pos];
+            let mut trader = [0u8; 20];
+            trader.copy_from_slice(&raw[pos + 1..pos + 21]);
+            let mut pb = [0u8; 8];
+            pb.copy_from_slice(&raw[pos + 21..pos + 29]);
+            let mut qb = [0u8; 8];
+            qb.copy_from_slice(&raw[pos + 29..pos + 37]);
+            pos += 37;
+            if !book.push(AuctionOrder {
+                side,
+                trader,
+                price: u64::from_be_bytes(pb),
+                quantity: u64::from_be_bytes(qb),
+            }) {
+                return None;
+            }
+            i += 1;
+        }
+        Some(book)
+    }
+}
+
+/// Verify `auth_obj` is an approved `Authorization` HPS in `IdentityRegistry`, atomically mark
+/// it as **consumed** via `consumeAuction(address,bytes32,address)`, and decode its finalized
+/// 3-step `AuctionBook`.
+pub fn verify_and_consume_auction_auth(
+    registry: &[u8; 20],
+    auth_obj: &[u8; 20],
+    expected_constitution: &[u8; 20],
+    expected_policy_id: &[u8; 32],
+    caller_identity: &[u8; 20],
+) -> Result<AuctionBook, i32> {
+    if *registry == [0u8; 20] || *auth_obj == [0u8; 20] {
+        return Err(ERR_AUTH_CONSUME_FAILED);
+    }
+    require_valid_authorization_hps(registry, auth_obj)?;
+    let cd = CallEncoder::<128>::new(selector("consumeAuction(address,bytes32,address)"))
+        .push_address(expected_constitution)
+        .push_bytes32(expected_policy_id)
+        .push_address(caller_identity);
+    let ret = call::call_raw(auth_obj, cd.as_slice())?;
+    if ret.len() < 64 {
+        return Err(ERR_AUTH_CONSUME_FAILED);
+    }
+    let mut len_bytes = [0u8; 8];
+    len_bytes.copy_from_slice(&ret[56..64]);
+    let len = u64::from_be_bytes(len_bytes) as usize;
+    if 64 + len > ret.len() {
+        return Err(ERR_AUTH_CONSUME_FAILED);
+    }
+    AuctionBook::decode(&ret[64..64 + len]).ok_or(ERR_POLICY_INVALID)
 }

@@ -67,7 +67,12 @@ fn policy_key(target_hps: &[u8; 20], policy_id: &[u8; 32]) -> KeyBuilder<64> {
         .push(policy_id)
 }
 
-fn validate_and_verify_spec(registry: &[u8; 20], raw_spec: &[u8]) -> Result<PolicySpec, i32> {
+fn validate_and_verify_spec_cached(
+    registry: &[u8; 20],
+    raw_spec: &[u8],
+    verified: &mut [[u8; 20]; MAX_MEMBERS_PER_STAGE],
+    verified_len: &mut usize,
+) -> Result<PolicySpec, i32> {
     if raw_spec.is_empty() || raw_spec.len() > MAX_ENCODED_POLICY_BYTES {
         return Err(ERR_POLICY_INVALID);
     }
@@ -77,12 +82,34 @@ fn validate_and_verify_spec(registry: &[u8; 20], raw_spec: &[u8]) -> Result<Poli
         let st = &spec.stages[s];
         let mut m = 0;
         while m < st.member_count {
-            require_valid_identity(registry, &st.members[m].identity)?;
+            let id = &st.members[m].identity;
+            let mut seen = false;
+            let mut k = 0;
+            while k < *verified_len {
+                if &verified[k] == id {
+                    seen = true;
+                    break;
+                }
+                k += 1;
+            }
+            if !seen {
+                require_valid_identity(registry, id)?;
+                if *verified_len < MAX_MEMBERS_PER_STAGE {
+                    verified[*verified_len] = *id;
+                    *verified_len += 1;
+                }
+            }
             m += 1;
         }
         s += 1;
     }
     Ok(spec)
+}
+
+fn validate_and_verify_spec(registry: &[u8; 20], raw_spec: &[u8]) -> Result<PolicySpec, i32> {
+    let mut verified = [[0u8; 20]; MAX_MEMBERS_PER_STAGE];
+    let mut verified_len = 0usize;
+    validate_and_verify_spec_cached(registry, raw_spec, &mut verified, &mut verified_len)
 }
 
 fn store_policy(target_hps: &[u8; 20], policy_id: &[u8; 32], raw_spec: &[u8], spec: &PolicySpec) {
@@ -207,6 +234,9 @@ fn handle_initialize(args: &CalldataReader) -> Result<(), i32> {
 
     let me = context::self_address();
     let mut has_super = false;
+    let mut verified = [[0u8; 20]; MAX_MEMBERS_PER_STAGE];
+    verified[0] = caller;
+    let mut verified_len = 1usize;
     let mut pos = 2usize;
     let mut i = 0usize;
     while i < count {
@@ -226,7 +256,8 @@ fn handle_initialize(args: &CalldataReader) -> Result<(), i32> {
         let raw_spec = &blob[pos..pos + spec_len];
         pos += spec_len;
 
-        let spec = validate_and_verify_spec(&registry, raw_spec)?;
+        let spec =
+            validate_and_verify_spec_cached(&registry, raw_spec, &mut verified, &mut verified_len)?;
         store_policy(&target_hps, &policy_id, raw_spec, &spec);
 
         if policy_id == POLICY_BOARD_RESOLUTION && spec.stage_count > 0 {
