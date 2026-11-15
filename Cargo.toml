@@ -4,7 +4,6 @@ members = [
     "crates/hps-sdk",
     "crates/hps-client",
     "crates/cargo-hps",
-    "examples/counter-registry",
     "examples/messaging",
     "examples/identity-registry",
     "examples/identity",

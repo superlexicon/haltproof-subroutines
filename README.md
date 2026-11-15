@@ -13,7 +13,6 @@ Zero C++/RocksDB dependencies are required to build Haltproof Subroutines or run
 | `crates/hps-sdk/` | `#![no_std]` guest Rust SDK for `wasm32-unknown-unknown` Haltproof Subroutines. Wraps persistent state (`storage`), execution context (`context::msg_sender`, `context::self_address`, `context::block_number`), synchronous cross-HPS calls (`call`), institutional governance & sequential/weighted policy codecs (`governance`), ABI calldata decoding/encoding (`abi`, `call::CallEncoder`), structured return payloads (`ret`), event logs (`events`), compile-time `selector()` / `event_topic()`, `hps_entry!`, and a multi-HPS native `mock` host so `cargo test` runs in milliseconds. |
 | `crates/hps-client/` | Pure-Rust client library implementing Lexicon's 10-field EIP-155 RLP transaction signing (including multi-HPS `target_addresses`), 1-call 2-step WASM deployment (`deploy_hps`), content-addressed `store_bytecode` + pipelined `instantiate_batch`, human-readable ABI call encoding, `read_call` (`eth_call`) queries, and cross-subnet `subnet_sendTransaction`. |
 | `crates/cargo-hps/` | Developer CLI (`cargo hps` / `cargo-hps`): scaffolds new Haltproof Subroutines (`new`), compiles & strips WASM zero-data segments (`build`), deploys in 1 command (`deploy`), submits stateful single- or multi-HPS invocations (`send` / `--touch`), executes instant read queries (`call`), and manages keys (`keygen`). |
-| `examples/counter-registry/` | Starter reference HPS (`4.7 KB` WASM) demonstrating counters, dynamic string storage, indexed events, read calls, and native unit tests. |
 | `examples/messaging/` | High-TPS channel messaging HPS (`4.5 KB` WASM) 100% ABI-, storage-key-, event-, and wire-compatible with Lexicon's maximum-TPS benchmark (`postMessage(bytes32,bytes)`, `getMessages(bytes32,uint64)`). |
 | `examples/identity/` | On-chain Identity HPS (`16.3 KB` WASM) controlled by an EOA owner + optional delegates. All state-changing interactions with `IdentityRegistry`, `Constitution`, `Authorization`, `AssetLedger`, and `AssetPair_OTC` flow through verified `Identity` HPS instances (`execute`, `initConstitutionAuth`, `initOracleAuth`, `approveAuth`, `approveAndFinalizeAuth`, `issueAsset`, `cancelAsset`, `transferAsset`, `approveAsset`). |
 | `examples/identity-registry/` | Verified Identity Register HPS (`14.7 KB` WASM) tracking active/suspended/revoked `Identity` HPS addresses (`isValidIdentity`, `registerIdentity`, `suspendIdentity`, `reinstateIdentity`, `revokeIdentity`, `rotateAdmin`, `setGovernancePolicy`), gated by one-time `Authorization` objects (starting with a single-account admin/oracle policy and upgradable to a `Constitution` policy). |
@@ -79,17 +78,17 @@ cargo install --path crates/cargo-hps
 cargo test --workspace
 ```
 
-### 3. Build All 8 Reference Haltproof Subroutines
+### 3. Build All 7 Reference Haltproof Subroutines
 
 ```bash
-for pkg in counter-registry messaging identity-registry identity constitution authorization asset-ledger asset-pair-otc; do
+for pkg in messaging identity-registry identity constitution authorization asset-ledger asset-pair-otc; do
   cargo hps build -p "$pkg"
 done
 ```
 
 ### 4. Run Full Live Wasmtime End-to-End Governance + Ledger + OTC Suite
 
-With `lexicon-node` installed, run the automated live chain test (spawns an isolated `lexicon-node --localtestnet` on port `18555` and exercises all 8 subroutines, out-of-order rejection, block expiry, replay rejection, `SUPER` governance rotation, and atomic OTC settlement):
+With `lexicon-node` installed, run the automated live chain test (spawns an isolated `lexicon-node --localtestnet` on port `18555` and exercises the full governance + asset ledger + OTC suite, out-of-order rejection, block expiry, replay rejection, `SUPER` governance rotation, and atomic OTC settlement):
 
 ```bash
 cargo test -p hps-client --test live_governance_e2e -- --ignored --nocapture

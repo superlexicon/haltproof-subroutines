@@ -58,7 +58,7 @@ enum Commands {
 
     /// Execute Lexicon's 2-step HPS deployment (store_bytecode + instantiate) in a single command
     Deploy {
-        /// Path to the compiled .wasm artifact (e.g. dist/counter_registry.wasm)
+        /// Path to the compiled .wasm artifact (e.g. dist/messaging.wasm)
         wasm_path: PathBuf,
         /// JSON-RPC endpoint URL
         #[arg(long, env = "LEXICON_RPC_URL", default_value = "http://127.0.0.1:8545")]

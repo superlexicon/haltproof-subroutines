@@ -1,6 +1,6 @@
 # End-to-End Haltproof Subroutine (HPS) & Institutional Governance Guide
 
-This guide walks through developing, testing, compiling, deploying, and integrating **Haltproof Subroutine-driven applications** on Lexicon using `haltproof-subroutines` (`cargo hps`) and `lexicon-node --localtestnet` — from single-subroutine state machines to the complete **8-subroutine institutional governance, sequential/weighted authorization, verified identity register, asset ledger, and atomic OTC stack**.
+This guide walks through developing, testing, compiling, deploying, and integrating **Haltproof Subroutine-driven applications** on Lexicon using `haltproof-subroutines` (`cargo hps`) and `lexicon-node --localtestnet` — from single-subroutine state machines to the complete **7-subroutine institutional governance, sequential/weighted authorization, verified identity register, asset ledger, OTC, and high-TPS messaging stack**.
 
 ---
 
@@ -78,11 +78,11 @@ git clone https://github.com/superlexicon/lexicon-bin.git
 rustup target add wasm32-unknown-unknown
 cargo install --path crates/cargo-hps
 
-# 3. Run offline native unit tests across all 10 crates (< 0.1s)
+# 3. Run offline native unit tests across all workspace crates (< 0.1s)
 cargo test --workspace
 
-# 4. Build all 8 WASM Haltproof Subroutines into dist/
-for pkg in counter-registry messaging identity-registry identity constitution authorization asset-ledger asset-pair-otc; do
+# 4. Build all 7 WASM Haltproof Subroutines into dist/
+for pkg in messaging identity-registry identity constitution authorization asset-ledger asset-pair-otc; do
   cargo hps build -p "$pkg"
 done
 ```
@@ -189,5 +189,5 @@ async fn main() -> anyhow::Result<()> {
 
 When moving from `--localtestnet` to a live Semtech LR2021 FLRC subnet, **zero HPS or ABI changes are required**:
 1. **Confirmation Cadence:** `--localtestnet` confirms blocks every `4s`; a live 3–8 validator radio subnet confirms blocks every `~5–9s` across the 4-phase TDMA window, so keep receipt polling timeouts at `>= 30s`.
-2. **Compact Bytecode:** Always compile with `cargo hps build` (`4–23 KB` across all 8 reference subroutines, well under the `100 KB` radio limit).
+2. **Compact Bytecode:** Always compile with `cargo hps build` (`4.5–23.2 KB` across all 7 reference subroutines, well under the `100 KB` radio limit).
 3. **Nonce Horizon (`max_nonce_gap`):** Live radio subnets enforce a default future-nonce horizon of `10` in-flight transactions per sender address (`256` on `--localtestnet`).
