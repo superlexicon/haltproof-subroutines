@@ -19,8 +19,9 @@ use hps_sdk::governance::{
     oracle_policy_id, require_valid_identity, verify_and_consume_auth, ActionHasher, PolicySpec,
     ShareClassSpec, StageSpec, ACTION_ADD_DIRECTOR, ACTION_REGISTER_SHARE_CLASS,
     ACTION_REMOVE_DIRECTOR, ACTION_SET_BANK_ORACLE, ACTION_SET_CLEARING_ACCOUNT,
-    ERR_POLICY_INVALID, MAX_ENCODED_POLICY_BYTES, MAX_MEMBERS_PER_STAGE, MAX_SHARE_CLASSES,
-    POLICY_BANK_ORACLE, POLICY_BOARD_RESOLUTION, POLICY_SUPER_GOVERNANCE,
+    ACTION_SET_PRODUCT_ORACLE, ERR_POLICY_INVALID, MAX_ENCODED_POLICY_BYTES, MAX_MEMBERS_PER_STAGE,
+    MAX_SHARE_CLASSES, POLICY_BANK_ORACLE, POLICY_BOARD_RESOLUTION, POLICY_PRODUCT_ORACLE,
+    POLICY_SUPER_GOVERNANCE,
 };
 use hps_sdk::keccak::keccak256;
 use hps_sdk::storage::KeyBuilder;
@@ -32,6 +33,7 @@ const POLICY_DEACTIVATED: [u8; 32] = event_topic("PolicyDeactivated(address,byte
 const DIRECTOR_ADDED: [u8; 32] = event_topic("DirectorAdded(address,uint64,address)");
 const DIRECTOR_REMOVED: [u8; 32] = event_topic("DirectorRemoved(address,uint64,address)");
 const BANK_ORACLE_SET: [u8; 32] = event_topic("BankOracleSet(address,address,address)");
+const PRODUCT_ORACLE_SET: [u8; 32] = event_topic("ProductOracleSet(address,address,address)");
 const CLEARING_ACCOUNT_SET: [u8; 32] = event_topic("ClearingAccountSet(address,address)");
 const AUCTION_BUY_ORDER_CLEARED: [u8; 32] =
     event_topic("AuctionBuyOrderCleared(address,address,uint64)");
@@ -39,6 +41,8 @@ const AUCTION_BUY_ORDER_REFUNDED: [u8; 32] =
     event_topic("AuctionBuyOrderRefunded(address,address,uint64)");
 const AUCTION_CASH_SETTLED: [u8; 32] =
     event_topic("AuctionCashSettled(address,address,uint64,bool)");
+const PRODUCT_PAYMENT_CLEARED: [u8; 32] =
+    event_topic("ProductPaymentCleared(address,address,uint64)");
 const SHARE_CLASS_REGISTERED: [u8; 32] =
     event_topic("ShareClassRegistered(address,uint64,uint64,uint64)");
 
@@ -62,10 +66,13 @@ hps_entry! {
     "isDirector(address)"                                                 => handle_is_director,
     "directorCount()"                                                     => handle_director_count,
     "setBankOracle(address,address,uint64,address)"                       => handle_set_bank_oracle,
+    "setProductOracle(address,address,uint64,address)"                    => handle_set_product_oracle,
     "setClearingAccount(address,address,address)"                         => handle_set_clearing_account,
     "bankOracleOf(address)"                                               => handle_bank_oracle_of,
+    "productOracleOf(address)"                                            => handle_product_oracle_of,
     "clearingAccount()"                                                   => handle_clearing_account,
     "defaultBankLedger()"                                                 => handle_default_bank_ledger,
+    "settleProductPayment(address,uint64)"                                => handle_settle_product_payment,
     "placeBuyOrder(address,uint64,uint64)"                                => handle_place_buy_order,
     "cancelBuyOrder(address,uint64)"                                      => handle_cancel_buy_order,
     "placeSellOrder(address,uint64,uint64)"                               => handle_place_sell_order,
@@ -85,6 +92,7 @@ hps_entry! {
     "hashAddDirector(address)"                                            => handle_hash_add_director,
     "hashRemoveDirector(address)"                                         => handle_hash_remove_director,
     "hashSetBankOracle(address,address,uint64)"                           => handle_hash_set_bank_oracle,
+    "hashSetProductOracle(address,address,uint64)"                        => handle_hash_set_product_oracle,
     "hashSetClearingAccount(address,address)"                             => handle_hash_set_clearing_account,
     "hashRegisterShareClass(address,uint64,uint64,uint64)"                => handle_hash_register_share_class,
 }
@@ -199,6 +207,18 @@ fn compute_set_bank_oracle_hash(
         .finish()
 }
 
+fn compute_set_product_oracle_hash(
+    product_ledger: &[u8; 20],
+    oracle_identity: &[u8; 20],
+    expiry_blocks: u64,
+) -> [u8; 32] {
+    ActionHasher::<160>::new(&context::self_address(), &ACTION_SET_PRODUCT_ORACLE)
+        .push_address(product_ledger)
+        .push_address(oracle_identity)
+        .push_u64(expiry_blocks)
+        .finish()
+}
+
 fn compute_set_clearing_account_hash(
     bank_ledger: &[u8; 20],
     clearing_account: &[u8; 20],
@@ -225,6 +245,10 @@ fn compute_register_share_class_hash(
 
 fn bank_oracle_key(bank_ledger: &[u8; 20]) -> KeyBuilder<32> {
     KeyBuilder::<32>::new().push(b"bora:").push(bank_ledger)
+}
+
+fn product_oracle_key(product_ledger: &[u8; 20]) -> KeyBuilder<32> {
+    KeyBuilder::<32>::new().push(b"pora:").push(product_ledger)
 }
 
 fn auc_escrow_key(auth_obj: &[u8; 20]) -> KeyBuilder<32> {
@@ -735,6 +759,117 @@ fn handle_bank_oracle_of(args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
+/// Appoint or rotate the Product Catalog Manager / Oracle `Identity` (`oracleIdentity`) authorized
+/// to manage products, inventory units, and prices in a company `ProductLedger` (`productLedger`).
+/// Requires a finalized **Board Resolution** (`POLICY_BOARD_RESOLUTION`) `Authorization` HPS object.
+fn handle_set_product_oracle(args: &CalldataReader) -> Result<(), i32> {
+    let (registry, caller) = ensure_initialized_and_valid_caller()?;
+    let product_ledger = args.address(0).ok_or(-3)?;
+    let oracle_identity = args.address(1).ok_or(-3)?;
+    let expiry_blocks = args.u64(2).ok_or(-3)?;
+    let board_auth = args.address(3).ok_or(-3)?;
+    if product_ledger == [0u8; 20] || oracle_identity == [0u8; 20] {
+        return Err(-59);
+    }
+
+    require_valid_identity(&registry, &oracle_identity)?;
+
+    let action_hash =
+        compute_set_product_oracle_hash(&product_ledger, &oracle_identity, expiry_blocks);
+    let me = context::self_address();
+    verify_and_consume_auth(
+        &registry,
+        &board_auth,
+        &me,
+        &POLICY_BOARD_RESOLUTION,
+        &action_hash,
+        &caller,
+    )?;
+
+    let exp = if expiry_blocks == 0 { 50 } else { expiry_blocks };
+    let stage = StageSpec::new(1, exp)
+        .add_member(oracle_identity, 1)
+        .ok_or(ERR_POLICY_INVALID)?;
+    let spec = PolicySpec::new(exp.saturating_mul(2))
+        .add_stage(stage)
+        .ok_or(ERR_POLICY_INVALID)?;
+    let mut enc = [0u8; MAX_ENCODED_POLICY_BYTES];
+    let enc_len = spec.encode(&mut enc).ok_or(ERR_POLICY_INVALID)?;
+
+    store_policy(&product_ledger, &POLICY_PRODUCT_ORACLE, &enc[..enc_len], &spec);
+    let dyn_pol = oracle_policy_id(&oracle_identity);
+    store_policy(&product_ledger, &dyn_pol, &enc[..enc_len], &spec);
+
+    let pk = product_oracle_key(&product_ledger);
+    storage::set_address(pk.as_slice(), &oracle_identity);
+
+    events::emit(
+        &[
+            PRODUCT_ORACLE_SET,
+            addr_topic(&product_ledger),
+            addr_topic(&oracle_identity),
+            addr_topic(&board_auth),
+        ],
+        &exp.to_be_bytes(),
+    );
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_product_oracle_of(args: &CalldataReader) -> Result<(), i32> {
+    let product_ledger = args.address(0).ok_or(-3)?;
+    let pk = product_oracle_key(&product_ledger);
+    let oracle = storage::get_address(pk.as_slice()).unwrap_or([0u8; 20]);
+    ret::write_address(&oracle);
+    Ok(())
+}
+
+/// Invoked by an owned `ProductLedger` during `buyProduct` to atomically clear `totalCost` from
+/// `buyer`'s sub-account in the company's Bank Balance `AssetLedger` into the Constitution's
+/// clearing/revenue account. Reverts if the buyer has insufficient bank balance.
+fn handle_settle_product_payment(args: &CalldataReader) -> Result<(), i32> {
+    if storage::get_u64(KEY_INIT) != 1 {
+        return Err(-57);
+    }
+    let buyer = args.address(0).ok_or(-3)?;
+    let total_cost = args.u64(1).ok_or(-3)?;
+    if buyer == [0u8; 20] || total_cost == 0 {
+        return Err(-59);
+    }
+
+    // Verify caller is a registered ProductLedger controlled by this Constitution
+    let product_ledger = context::msg_sender();
+    let pk = product_oracle_key(&product_ledger);
+    if storage::get_address(pk.as_slice()).is_none() {
+        return Err(-62);
+    }
+
+    let bank_ledger = storage::get_address(KEY_DEFAULT_BANK_LEDGER).ok_or(-63)?;
+    let clearing_acct = storage::get_address(KEY_CLEARING_ACCOUNT).ok_or(-63)?;
+
+    let xfer_cd = CallEncoder::<128>::new(const {
+        const { selector("constitutionClearTransfer(address,address,uint64)") }
+    })
+    .push_address(&buyer)
+    .push_address(&clearing_acct)
+    .push_u64(total_cost);
+    let ok = call::call_bool(&bank_ledger, xfer_cd.as_slice())?;
+    if !ok {
+        return Err(-16);
+    }
+
+    events::emit(
+        &[
+            PRODUCT_PAYMENT_CLEARED,
+            addr_topic(&product_ledger),
+            addr_topic(&buyer),
+        ],
+        &total_cost.to_be_bytes(),
+    );
+    ret::write_bool(true);
+    Ok(())
+}
+
 fn handle_clearing_account(_args: &CalldataReader) -> Result<(), i32> {
     let acct = storage::get_address(KEY_CLEARING_ACCOUNT).unwrap_or([0u8; 20]);
     ret::write_address(&acct);
@@ -768,9 +903,7 @@ fn handle_place_buy_order(args: &CalldataReader) -> Result<(), i32> {
     let clearing_acct = storage::get_address(KEY_CLEARING_ACCOUNT).ok_or(-63)?;
 
     // 1. Clear required balance from buyer's bank account into Constitution's clearing account
-    let clear_cd = CallEncoder::<128>::new(selector(
-        "constitutionClearTransfer(address,address,uint64)",
-    ))
+    let clear_cd = CallEncoder::<128>::new(const { selector("constitutionClearTransfer(address,address,uint64)") })
     .push_address(&buyer)
     .push_address(&clearing_acct)
     .push_u64(escrow_cash);
@@ -845,9 +978,7 @@ fn handle_cancel_buy_order(args: &CalldataReader) -> Result<(), i32> {
     }
     storage::set_u64(ek.as_slice(), cur_escrow - refund_cash);
 
-    let refund_cd = CallEncoder::<128>::new(selector(
-        "constitutionClearTransfer(address,address,uint64)",
-    ))
+    let refund_cd = CallEncoder::<128>::new(const { selector("constitutionClearTransfer(address,address,uint64)") })
     .push_address(&clearing_acct)
     .push_address(&buyer)
     .push_u64(refund_cash);
@@ -960,9 +1091,7 @@ fn handle_disburse_auction_cash(args: &CalldataReader) -> Result<(), i32> {
     }
     storage::set_u64(ek.as_slice(), cur_escrow - amount);
 
-    let xfer_cd = CallEncoder::<128>::new(selector(
-        "constitutionClearTransfer(address,address,uint64)",
-    ))
+    let xfer_cd = CallEncoder::<128>::new(const { selector("constitutionClearTransfer(address,address,uint64)") })
     .push_address(&clearing_acct)
     .push_address(&recipient)
     .push_u64(amount);
@@ -1228,6 +1357,18 @@ fn handle_hash_set_bank_oracle(args: &CalldataReader) -> Result<(), i32> {
     let expiry_blocks = args.u64(2).ok_or(-3)?;
     ret::write_word(&compute_set_bank_oracle_hash(
         &bank_ledger,
+        &oracle_identity,
+        expiry_blocks,
+    ));
+    Ok(())
+}
+
+fn handle_hash_set_product_oracle(args: &CalldataReader) -> Result<(), i32> {
+    let product_ledger = args.address(0).ok_or(-3)?;
+    let oracle_identity = args.address(1).ok_or(-3)?;
+    let expiry_blocks = args.u64(2).ok_or(-3)?;
+    ret::write_word(&compute_set_product_oracle_hash(
+        &product_ledger,
         &oracle_identity,
         expiry_blocks,
     ));
@@ -1717,9 +1858,7 @@ mod tests {
         mock::transact_as(
             manogaran,
             con,
-            CallEncoder::<160>::new(selector(
-                "setBankOracle(address,address,uint64,address)",
-            ))
+            CallEncoder::<160>::new(const { selector("setBankOracle(address,address,uint64,address)") })
             .push_address(&bank_ledger)
             .push_address(&bank_oracle_1)
             .push_u64(40)
@@ -1869,9 +2008,7 @@ mod tests {
         mock::transact_as(
             common_ledger,
             con,
-            CallEncoder::<160>::new(selector(
-                "disburseAuctionCash(address,address,uint64,bool)",
-            ))
+            CallEncoder::<160>::new(const { selector("disburseAuctionCash(address,address,uint64,bool)") })
             .push_address(&auc_auth)
             .push_address(&seller_1)
             .push_u64(400_000)
@@ -1901,9 +2038,7 @@ mod tests {
             mock::transact_as(
                 manogaran,
                 con,
-                CallEncoder::<192>::new(selector(
-                    "registerShareClass(address,uint64,uint64,uint64,address)",
-                ))
+                CallEncoder::<192>::new(const { selector("registerShareClass(address,uint64,uint64,uint64,address)") })
                 .push_address(&led)
                 .push_u64(vps)
                 .push_u64(cn)

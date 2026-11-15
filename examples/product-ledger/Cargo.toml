@@ -1,0 +1,13 @@
+[package]
+name = "product-ledger"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Product Inventory & Catalog Ledger Haltproof Subroutine (HPS) with immediate-fulfilment buy orders"
+
+[[bin]]
+name = "product_ledger"
+path = "src/main.rs"
+
+[dependencies]
+hps-sdk = { path = "../../crates/hps-sdk" }

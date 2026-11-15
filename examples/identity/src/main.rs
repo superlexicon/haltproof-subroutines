@@ -46,8 +46,13 @@ hps_entry! {
     "settleAuctionViaConstitution(address,address,address)"                           => handle_settle_auction_via_con,
     "transferBankBalance(address,address,uint64)"                                     => handle_transfer_bank_balance,
     "setBankOracle(address,address,address,uint64,address)"                           => handle_set_bank_oracle,
+    "setProductOracle(address,address,address,uint64,address)"                        => handle_set_product_oracle,
     "setClearingAccount(address,address,address,address)"                             => handle_set_clearing_account,
     "registerShareClass(address,address,uint64,uint64,uint64,address)"                => handle_register_share_class,
+    "upsertProduct(address,bytes32,uint64,uint64,bytes,address)"                      => handle_upsert_product,
+    "restockProduct(address,bytes32,uint64,uint64,address)"                           => handle_restock_product,
+    "setProductPrice(address,bytes32,uint64,address)"                                 => handle_set_product_price,
+    "buyProduct(address,bytes32,uint64)"                                              => handle_buy_product,
     "issueAsset(address,address,uint64,address)"                                      => handle_issue_asset,
     "cancelAsset(address,address,uint64,address)"                                     => handle_cancel_asset,
     "transferAsset(address,address,address,uint64,address)"                           => handle_transfer_asset,
@@ -200,9 +205,7 @@ fn handle_init_constitution_auth(args: &CalldataReader) -> Result<(), i32> {
     let policy_id = args.bytes32(4).ok_or(-3)?;
     let action_hash = args.bytes32(5).ok_or(-3)?;
 
-    let sub_cd = CallEncoder::<192>::new(selector(
-        "initializeFromConstitution(address,address,address,bytes32,bytes32)",
-    ))
+    let sub_cd = CallEncoder::<192>::new(const { selector("initializeFromConstitution(address,address,address,bytes32,bytes32)") })
     .push_address(&registry)
     .push_address(&constitution)
     .push_address(&target_hps)
@@ -226,9 +229,7 @@ fn handle_init_oracle_auth(args: &CalldataReader) -> Result<(), i32> {
     let action_hash = args.bytes32(4).ok_or(-3)?;
     let expiry_blocks = args.u64(5).ok_or(-3)?;
 
-    let sub_cd = CallEncoder::<192>::new(selector(
-        "initializeOracle(address,address,address,bytes32,uint64)",
-    ))
+    let sub_cd = CallEncoder::<192>::new(const { selector("initializeOracle(address,address,address,bytes32,uint64)") })
     .push_address(&registry)
     .push_address(&oracle_id)
     .push_address(&target_hps)
@@ -282,9 +283,7 @@ fn handle_init_transfer_auction(args: &CalldataReader) -> Result<(), i32> {
     let constitution = args.address(2).ok_or(-3)?;
     let target_ledger = args.address(3).ok_or(-3)?;
 
-    let sub_cd = CallEncoder::<128>::new(selector(
-        "initializeTransferAuction(address,address,address)",
-    ))
+    let sub_cd = CallEncoder::<128>::new(const { selector("initializeTransferAuction(address,address,address)") })
     .push_address(&registry)
     .push_address(&constitution)
     .push_address(&target_ledger);
@@ -405,9 +404,7 @@ fn handle_settle_auction_via_con(args: &CalldataReader) -> Result<(), i32> {
     let share_ledger = args.address(1).ok_or(-3)?;
     let auth_obj = args.address(2).ok_or(-3)?;
 
-    let sub_cd = CallEncoder::<96>::new(selector(
-        "settleShareTransferAuction(address,address)",
-    ))
+    let sub_cd = CallEncoder::<96>::new(const { selector("settleShareTransferAuction(address,address)") })
     .push_address(&share_ledger)
     .push_address(&auth_obj);
     let out = call::call_raw(&constitution, sub_cd.as_slice())?;
@@ -440,10 +437,33 @@ fn handle_set_bank_oracle(args: &CalldataReader) -> Result<(), i32> {
     let expiry_blocks = args.u64(3).ok_or(-3)?;
     let board_auth = args.address(4).ok_or(-3)?;
 
-    let sub_cd = CallEncoder::<160>::new(selector(
-        "setBankOracle(address,address,uint64,address)",
-    ))
+    let sub_cd = CallEncoder::<160>::new(const {
+        const { selector("setBankOracle(address,address,uint64,address)") }
+    })
     .push_address(&bank_ledger)
+    .push_address(&oracle_identity)
+    .push_u64(expiry_blocks)
+    .push_address(&board_auth);
+    let ok = call::call_bool(&constitution, sub_cd.as_slice())?;
+    if !ok {
+        return Err(-24);
+    }
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_set_product_oracle(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let constitution = args.address(0).ok_or(-3)?;
+    let product_ledger = args.address(1).ok_or(-3)?;
+    let oracle_identity = args.address(2).ok_or(-3)?;
+    let expiry_blocks = args.u64(3).ok_or(-3)?;
+    let board_auth = args.address(4).ok_or(-3)?;
+
+    let sub_cd = CallEncoder::<160>::new(const {
+        const { selector("setProductOracle(address,address,uint64,address)") }
+    })
+    .push_address(&product_ledger)
     .push_address(&oracle_identity)
     .push_u64(expiry_blocks)
     .push_address(&board_auth);
@@ -462,9 +482,9 @@ fn handle_set_clearing_account(args: &CalldataReader) -> Result<(), i32> {
     let clearing_account = args.address(2).ok_or(-3)?;
     let board_auth = args.address(3).ok_or(-3)?;
 
-    let sub_cd = CallEncoder::<128>::new(selector(
-        "setClearingAccount(address,address,address)",
-    ))
+    let sub_cd = CallEncoder::<128>::new(const {
+        const { selector("setClearingAccount(address,address,address)") }
+    })
     .push_address(&bank_ledger)
     .push_address(&clearing_account)
     .push_address(&board_auth);
@@ -485,9 +505,9 @@ fn handle_register_share_class(args: &CalldataReader) -> Result<(), i32> {
     let conversion_denom = args.u64(4).ok_or(-3)?;
     let super_auth = args.address(5).ok_or(-3)?;
 
-    let sub_cd = CallEncoder::<192>::new(selector(
-        "registerShareClass(address,uint64,uint64,uint64,address)",
-    ))
+    let sub_cd = CallEncoder::<192>::new(const {
+        const { selector("registerShareClass(address,uint64,uint64,uint64,address)") }
+    })
     .push_address(&share_ledger)
     .push_u64(votes_per_share)
     .push_u64(conversion_numer)
@@ -495,6 +515,87 @@ fn handle_register_share_class(args: &CalldataReader) -> Result<(), i32> {
     .push_address(&super_auth);
     let count = call::call_u64(&constitution, sub_cd.as_slice())?;
     ret::write_u64_word(count);
+    Ok(())
+}
+
+fn handle_upsert_product(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let product_ledger = args.address(0).ok_or(-3)?;
+    let product_id = args.bytes32(1).ok_or(-3)?;
+    let units_available = args.u64(2).ok_or(-3)?;
+    let latest_price = args.u64(3).ok_or(-3)?;
+    let name = args.dynamic_bytes(4).ok_or(-3)?;
+    let auth_obj = args.address(5).ok_or(-3)?;
+
+    let sub_cd = CallEncoder::<256>::new(const {
+        selector("upsertProduct(bytes32,uint64,uint64,bytes,address)")
+    })
+    .push_bytes32(&product_id)
+    .push_u64(units_available)
+    .push_u64(latest_price)
+    .push_u64(160)
+    .push_address(&auth_obj)
+    .push_dynamic_bytes_tail(name);
+    let ok = call::call_bool(&product_ledger, sub_cd.as_slice())?;
+    if !ok {
+        return Err(-24);
+    }
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_restock_product(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let product_ledger = args.address(0).ok_or(-3)?;
+    let product_id = args.bytes32(1).ok_or(-3)?;
+    let additional_units = args.u64(2).ok_or(-3)?;
+    let new_price = args.u64(3).ok_or(-3)?;
+    let auth_obj = args.address(4).ok_or(-3)?;
+
+    let sub_cd = CallEncoder::<160>::new(const {
+        const { selector("restockProduct(bytes32,uint64,uint64,address)") }
+    })
+    .push_bytes32(&product_id)
+    .push_u64(additional_units)
+    .push_u64(new_price)
+    .push_address(&auth_obj);
+    let new_units = call::call_u64(&product_ledger, sub_cd.as_slice())?;
+    ret::write_u64_word(new_units);
+    Ok(())
+}
+
+fn handle_set_product_price(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let product_ledger = args.address(0).ok_or(-3)?;
+    let product_id = args.bytes32(1).ok_or(-3)?;
+    let new_price = args.u64(2).ok_or(-3)?;
+    let auth_obj = args.address(3).ok_or(-3)?;
+
+    let sub_cd = CallEncoder::<128>::new(const {
+        const { selector("setProductPrice(bytes32,uint64,address)") }
+    })
+    .push_bytes32(&product_id)
+    .push_u64(new_price)
+    .push_address(&auth_obj);
+    let ok = call::call_bool(&product_ledger, sub_cd.as_slice())?;
+    if !ok {
+        return Err(-24);
+    }
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_buy_product(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let product_ledger = args.address(0).ok_or(-3)?;
+    let product_id = args.bytes32(1).ok_or(-3)?;
+    let quantity = args.u64(2).ok_or(-3)?;
+
+    let sub_cd = CallEncoder::<96>::new(const { selector("buyProduct(bytes32,uint64)") })
+        .push_bytes32(&product_id)
+        .push_u64(quantity);
+    let sale_idx = call::call_u64(&product_ledger, sub_cd.as_slice())?;
+    ret::write_u64_word(sale_idx);
     Ok(())
 }
 

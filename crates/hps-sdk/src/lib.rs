@@ -550,6 +550,18 @@ pub mod call {
             self.push_word(b)
         }
 
+        pub fn push_dynamic_bytes_tail(mut self, data: &[u8]) -> Self {
+            let mut len_word = [0u8; 32];
+            len_word[24..32].copy_from_slice(&(data.len() as u64).to_be_bytes());
+            self = self.push_word(&len_word);
+            let padded = (data.len() + 31) & !31;
+            if self.len + padded <= CAP {
+                self.buf[self.len..self.len + data.len()].copy_from_slice(data);
+                self.len += padded;
+            }
+            self
+        }
+
         pub fn as_slice(&self) -> &[u8] {
             &self.buf[..self.len]
         }

@@ -1159,9 +1159,7 @@ mod tests {
 
         mock::set_block_number(100);
         let act_hash = [0x77; 32];
-        let init_cd = CallEncoder::<192>::new(selector(
-            "initializeFromConstitution(address,address,address,bytes32,bytes32)",
-        ))
+        let init_cd = CallEncoder::<192>::new(const { selector("initializeFromConstitution(address,address,address,bytes32,bytes32)") })
         .push_address(&reg)
         .push_address(&con)
         .push_address(&ledger)
@@ -1290,9 +1288,7 @@ mod tests {
         mock::register_hps(auth_auc, dispatch_calldata);
 
         mock::set_block_number(500);
-        let init_cd = CallEncoder::<128>::new(selector(
-            "initializeTransferAuction(address,address,address)",
-        ))
+        let init_cd = CallEncoder::<128>::new(const { selector("initializeTransferAuction(address,address,address)") })
         .push_address(&reg)
         .push_address(&con)
         .push_address(&ledger);
@@ -1408,9 +1404,7 @@ mod tests {
         assert_eq!(book, Err(ERR_WRONG_TARGET));
 
         // Target `ledger` consumes `auth_auc` once and receives all 5 orders!
-        let raw_consume = CallEncoder::<128>::new(selector(
-            "consumeAuction(address,bytes32,address)",
-        ))
+        let raw_consume = CallEncoder::<128>::new(const { selector("consumeAuction(address,bytes32,address)") })
         .push_address(&con)
         .push_bytes32(&POLICY_SHARE_TRANSFER_AUCTION)
         .push_address(&sh_nonseller);
@@ -1538,9 +1532,7 @@ mod tests {
         mock::transact_as(
             buyer_1,
             auth_auc,
-            CallEncoder::<128>::new(selector(
-                "initializeTransferAuction(address,address,address)",
-            ))
+            CallEncoder::<128>::new(const { selector("initializeTransferAuction(address,address,address)") })
             .push_address(&reg)
             .push_address(&con)
             .push_address(&ledger)
@@ -1674,9 +1666,7 @@ mod tests {
 
         // Consume after Step 3 ends (block 531 > 530) and verify orders 0 and 3 are marked cancelled
         mock::set_block_number(531);
-        let raw_consume = CallEncoder::<128>::new(selector(
-            "consumeAuction(address,bytes32,address)",
-        ))
+        let raw_consume = CallEncoder::<128>::new(const { selector("consumeAuction(address,bytes32,address)") })
         .push_address(&con)
         .push_bytes32(&POLICY_SHARE_TRANSFER_AUCTION)
         .push_address(&sh_1);
@@ -1700,9 +1690,7 @@ mod tests {
         mock::transact_as(
             sh_1,
             auth_res,
-            CallEncoder::<192>::new(selector(
-                "initializeFromConstitution(address,address,address,bytes32,bytes32)",
-            ))
+            CallEncoder::<192>::new(const { selector("initializeFromConstitution(address,address,address,bytes32,bytes32)") })
             .push_address(&reg)
             .push_address(&con)
             .push_address(&ledger)

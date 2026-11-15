@@ -1,0 +1,13 @@
+[package]
+name = "accounting-ledger"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Sales & Revenue Accounting Ledger Haltproof Subroutine (HPS) tracking all product sales and total revenue"
+
+[[bin]]
+name = "accounting_ledger"
+path = "src/main.rs"
+
+[dependencies]
+hps-sdk = { path = "../../crates/hps-sdk" }

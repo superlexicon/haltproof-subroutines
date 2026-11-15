@@ -27,13 +27,18 @@ pub const ACTION_REMOVE_DIRECTOR: [u8; 32] = keccak256(b"REMOVE_DIRECTOR");
 pub const ACTION_SET_BANK_ORACLE: [u8; 32] = keccak256(b"SET_BANK_ORACLE");
 pub const ACTION_SET_CLEARING_ACCOUNT: [u8; 32] = keccak256(b"SET_CLEARING_ACCOUNT");
 pub const ACTION_REGISTER_SHARE_CLASS: [u8; 32] = keccak256(b"REGISTER_SHARE_CLASS");
+pub const ACTION_SET_PRODUCT_ORACLE: [u8; 32] = keccak256(b"SET_PRODUCT_ORACLE");
+pub const ACTION_UPSERT_PRODUCT: [u8; 32] = keccak256(b"UPSERT_PRODUCT");
+pub const ACTION_RESTOCK_PRODUCT: [u8; 32] = keccak256(b"RESTOCK_PRODUCT");
+pub const ACTION_SET_PRODUCT_PRICE: [u8; 32] = keccak256(b"SET_PRODUCT_PRICE");
 
-/// Canonical policy IDs for `Constitution`, `AssetLedger`, and `IdentityRegistry` governance.
+/// Canonical policy IDs for `Constitution`, `AssetLedger`, `ProductLedger`, and `IdentityRegistry` governance.
 pub const POLICY_SUPER_GOVERNANCE: [u8; 32] = keccak256(b"SUPER_GOVERNANCE");
 pub const POLICY_SHAREHOLDER_SUPERMAJORITY: [u8; 32] = keccak256(b"SHAREHOLDER_SUPERMAJORITY");
 pub const POLICY_BOARD_RESOLUTION: [u8; 32] = keccak256(b"BOARD_RESOLUTION");
 pub const POLICY_SHARE_TRANSFER_AUCTION: [u8; 32] = keccak256(b"SHARE_TRANSFER_AUCTION");
 pub const POLICY_BANK_ORACLE: [u8; 32] = keccak256(b"BANK_ORACLE");
+pub const POLICY_PRODUCT_ORACLE: [u8; 32] = keccak256(b"PRODUCT_ORACLE");
 pub const POLICY_ADMIN_ORACLE: [u8; 32] = keccak256(b"ADMIN_ORACLE");
 /// Dynamic policy sentinel for `ACTION_TRANSFER` / `ACTION_APPROVE` requiring a one-time
 /// `Authorization` object approved & finalized by the debited holder Identity itself.
@@ -68,6 +73,10 @@ pub const ERR_NO_CROSSING_ORDERS: i32 = -77;
 pub const ERR_ORDER_NOT_FOUND: i32 = -78;
 pub const ERR_ORDER_ALREADY_CANCELLED: i32 = -79;
 pub const ERR_NOT_ORDER_OWNER: i32 = -80;
+pub const ERR_PRODUCT_NOT_FOUND: i32 = -81;
+pub const ERR_INSUFFICIENT_PRODUCT_UNITS: i32 = -82;
+pub const ERR_INVALID_PRODUCT_PARAMS: i32 = -83;
+pub const ERR_UNAUTHORIZED_SALES_RECORDER: i32 = -84;
 pub const ERR_CONSTITUTION_MISMATCH: i32 = -19;
 
 /// Order side/step tags for `POLICY_SHARE_TRANSFER_AUCTION` 3-step share transfer auctions.

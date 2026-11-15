@@ -1114,9 +1114,7 @@ fn execute_transfer_auction_settlement(
                 let fill = sell_fills[sl];
                 if fill > 0 {
                     let proceeds = clearing_price.checked_mul(fill).ok_or(-15)?;
-                    let pay_cd = CallEncoder::<160>::new(selector(
-                        "disburseAuctionCash(address,address,uint64,bool)",
-                    ))
+                    let pay_cd = CallEncoder::<160>::new(const { selector("disburseAuctionCash(address,address,uint64,bool)") })
                     .push_address(auth_obj)
                     .push_address(&sell_orders[sl].trader)
                     .push_u64(proceeds)
@@ -1138,9 +1136,7 @@ fn execute_transfer_auction_settlement(
                 let spent = clearing_price.checked_mul(buy_fills[b]).ok_or(-15)?;
                 let refund = escrowed.saturating_sub(spent);
                 if refund > 0 {
-                    let ref_cd = CallEncoder::<160>::new(selector(
-                        "disburseAuctionCash(address,address,uint64,bool)",
-                    ))
+                    let ref_cd = CallEncoder::<160>::new(const { selector("disburseAuctionCash(address,address,uint64,bool)") })
                     .push_address(auth_obj)
                     .push_address(&buy_orders[b].trader)
                     .push_u64(refund)
@@ -2727,9 +2723,7 @@ mod tests {
         mock::transact_as(
             buyer_1,
             auth_auc_a,
-            CallEncoder::<128>::new(selector(
-                "initializeTransferAuction(address,address,address)",
-            ))
+            CallEncoder::<128>::new(const { selector("initializeTransferAuction(address,address,address)") })
             .push_address(&reg)
             .push_address(&con)
             .push_address(&ledger_a)
@@ -2851,9 +2845,7 @@ mod tests {
         mock::transact_as(
             ext_buyer,
             auth_auc_b,
-            CallEncoder::<128>::new(selector(
-                "initializeTransferAuction(address,address,address)",
-            ))
+            CallEncoder::<128>::new(const { selector("initializeTransferAuction(address,address,address)") })
             .push_address(&reg)
             .push_address(&con)
             .push_address(&ledger_b)
@@ -2977,9 +2969,7 @@ mod tests {
                     let amount = args.u64(2).unwrap();
                     let bank_led = storage::get_address(b"bank_led").unwrap();
                     let clear_acct = storage::get_address(b"clear_acct").unwrap();
-                    let xfer = CallEncoder::<128>::new(selector(
-                        "constitutionClearTransfer(address,address,uint64)",
-                    ))
+                    let xfer = CallEncoder::<128>::new(const { selector("constitutionClearTransfer(address,address,uint64)") })
                     .push_address(&clear_acct)
                     .push_address(&recipient)
                     .push_u64(amount);
@@ -3195,9 +3185,7 @@ mod tests {
         mock::transact_as(
             con,
             bank_ledger,
-            CallEncoder::<128>::new(selector(
-                "constitutionClearTransfer(address,address,uint64)",
-            ))
+            CallEncoder::<128>::new(const { selector("constitutionClearTransfer(address,address,uint64)") })
             .push_address(&buyer_1)
             .push_address(&clearing_acct)
             .push_u64(660_000)
@@ -3207,9 +3195,7 @@ mod tests {
         mock::transact_as(
             con,
             bank_ledger,
-            CallEncoder::<128>::new(selector(
-                "constitutionClearTransfer(address,address,uint64)",
-            ))
+            CallEncoder::<128>::new(const { selector("constitutionClearTransfer(address,address,uint64)") })
             .push_address(&sh_2)
             .push_address(&clearing_acct)
             .push_u64(400_000)

@@ -11,6 +11,8 @@ members = [
     "examples/authorization",
     "examples/asset-ledger",
     "examples/asset-pair-otc",
+    "examples/product-ledger",
+    "examples/accounting-ledger",
 ]
 
 [workspace.package]

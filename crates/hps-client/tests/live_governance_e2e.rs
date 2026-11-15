@@ -1598,3 +1598,645 @@ async fn simplex_hps_gas_usage_profile_on_localtestnet() {
         );
     }
 }
+
+#[tokio::test]
+#[ignore = "requires local lexicon-node binary; run with --ignored"]
+async fn product_ledger_and_accounting_ledger_e2e_on_localtestnet() {
+    let _node = spawn_isolated_localtestnet();
+    let rpc_url = format!("http://127.0.0.1:{TEST_RPC_PORT}");
+    let client = HpsClient::new(&rpc_url);
+
+    for _ in 0..40 {
+        if client.block_number().await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    let dist = workspace_root().join("dist");
+    let identity_wasm = std::fs::read(dist.join("identity.wasm")).unwrap();
+    let registry_wasm = std::fs::read(dist.join("identity_registry.wasm")).unwrap();
+    let constitution_wasm = std::fs::read(dist.join("constitution.wasm")).unwrap();
+    let auth_wasm = std::fs::read(dist.join("authorization.wasm")).unwrap();
+    let ledger_wasm = std::fs::read(dist.join("asset_ledger.wasm")).unwrap();
+    let product_wasm = std::fs::read(dist.join("product_ledger.wasm")).unwrap();
+    let accounting_wasm = std::fs::read(dist.join("accounting_ledger.wasm")).unwrap();
+
+    let mut deployer = HpsSigner::from_hex(DEFAULT_DEV_PRIVATE_KEY, DEFAULT_CHAIN_ID).unwrap();
+    deployer.default_gas_limit = U256::from(5_000_000u64);
+
+    let id_code = client.store_bytecode(&deployer, &identity_wasm).await.unwrap();
+    let reg_code = client.store_bytecode(&deployer, &registry_wasm).await.unwrap();
+    let con_code = client.store_bytecode(&deployer, &constitution_wasm).await.unwrap();
+    let auth_code = client.store_bytecode(&deployer, &auth_wasm).await.unwrap();
+    let led_code = client.store_bytecode(&deployer, &ledger_wasm).await.unwrap();
+    let prod_code = client.store_bytecode(&deployer, &product_wasm).await.unwrap();
+    let acc_code = client.store_bytecode(&deployer, &accounting_wasm).await.unwrap();
+
+    // Instantiate: 6 Identities, 1 IdentityRegistry, 1 Constitution, 1 Bank AssetLedger,
+    // 1 AccountingLedger, 1 ProductLedger, 2 Authorization instances
+    let insts = client
+        .instantiate_batch(
+            &deployer,
+            &[
+                (id_code, Vec::new()),
+                (id_code, Vec::new()),
+                (id_code, Vec::new()),
+                (id_code, Vec::new()),
+                (id_code, Vec::new()),
+                (id_code, Vec::new()),
+                (reg_code, Vec::new()),
+                (con_code, Vec::new()),
+                (led_code, Vec::new()),
+                (acc_code, Vec::new()),
+                (prod_code, Vec::new()),
+                (auth_code, Vec::new()),
+                (auth_code, Vec::new()),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let mano_id = insts[0];
+    let evelyn_id = insts[1];
+    let catalog_oracle_id = insts[2];
+    let clearing_acct_id = insts[3];
+    let buyer1_id = insts[4];
+    let buyer2_id = insts[5];
+    let registry = insts[6];
+    let constitution = insts[7];
+    let bank_ledger = insts[8];
+    let accounting_ledger = insts[9];
+    let product_ledger = insts[10];
+    let board_auth = insts[11];
+    let restock_auth = insts[12];
+
+    // Step 1: Initialize Identities + IdentityRegistry
+    let mut id_bytes = Vec::new();
+    for id in [mano_id, evelyn_id, catalog_oracle_id, clearing_acct_id, buyer1_id, buyer2_id] {
+        id_bytes.extend_from_slice(id.as_bytes());
+    }
+    client
+        .send_call_batch(
+            &deployer,
+            &[
+                (
+                    mano_id,
+                    encode_values(
+                        "initialize(address,string)",
+                        &[
+                            AbiValue::Address(deployer.address()),
+                            AbiValue::Bytes(b"id:mano".to_vec()),
+                        ],
+                    ),
+                    vec![],
+                ),
+                (
+                    evelyn_id,
+                    encode_values(
+                        "initialize(address,string)",
+                        &[
+                            AbiValue::Address(deployer.address()),
+                            AbiValue::Bytes(b"id:evelyn".to_vec()),
+                        ],
+                    ),
+                    vec![],
+                ),
+                (
+                    catalog_oracle_id,
+                    encode_values(
+                        "initialize(address,string)",
+                        &[
+                            AbiValue::Address(deployer.address()),
+                            AbiValue::Bytes(b"id:catalog-oracle".to_vec()),
+                        ],
+                    ),
+                    vec![],
+                ),
+                (
+                    clearing_acct_id,
+                    encode_values(
+                        "initialize(address,string)",
+                        &[
+                            AbiValue::Address(deployer.address()),
+                            AbiValue::Bytes(b"id:slx-clearing".to_vec()),
+                        ],
+                    ),
+                    vec![],
+                ),
+                (
+                    buyer1_id,
+                    encode_values(
+                        "initialize(address,string)",
+                        &[
+                            AbiValue::Address(deployer.address()),
+                            AbiValue::Bytes(b"id:buyer1".to_vec()),
+                        ],
+                    ),
+                    vec![],
+                ),
+                (
+                    buyer2_id,
+                    encode_values(
+                        "initialize(address,string)",
+                        &[
+                            AbiValue::Address(deployer.address()),
+                            AbiValue::Bytes(b"id:buyer2".to_vec()),
+                        ],
+                    ),
+                    vec![],
+                ),
+                (
+                    registry,
+                    encode_values(
+                        "initialize(address,bytes32,bytes32,bytes)",
+                        &[
+                            AbiValue::Address(mano_id),
+                            AbiValue::Bytes32(id_code.0),
+                            AbiValue::Bytes32(auth_code.0),
+                            AbiValue::Bytes(id_bytes),
+                        ],
+                    ),
+                    vec![mano_id, evelyn_id, catalog_oracle_id, clearing_acct_id, buyer1_id, buyer2_id],
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+
+    // Step 2: Initialize Constitution (2 directors: Manogaran + Evelyn), Bank AssetLedger, AccountingLedger, ProductLedger
+    let board_stage = StageSpec::new(2, 40)
+        .add_member(h160_bytes(mano_id), 1)
+        .unwrap()
+        .add_member(h160_bytes(evelyn_id), 1)
+        .unwrap();
+    let board_spec = PolicySpec::new(80).add_stage(board_stage).unwrap();
+    let mut con_entries = Vec::new();
+    con_entries.extend_from_slice(&(2u16).to_be_bytes());
+    con_entries.extend_from_slice(&encode_constitution_entry(
+        H160::zero(),
+        POLICY_SUPER_GOVERNANCE,
+        &board_spec,
+    ));
+    con_entries.extend_from_slice(&encode_constitution_entry(
+        H160::zero(),
+        hps_sdk::governance::POLICY_BOARD_RESOLUTION,
+        &board_spec,
+    ));
+
+    // Bank allocations: buyer1 = 50,000 SGD, buyer2 = 25,000 SGD
+    let mut bank_allocs = Vec::new();
+    for (id, bal) in [(buyer1_id, 50_000u64), (buyer2_id, 25_000u64)] {
+        bank_allocs.extend_from_slice(id.as_bytes());
+        bank_allocs.extend_from_slice(&bal.to_be_bytes());
+    }
+    let mut bank_perms = Vec::new();
+    for act in [ACTION_SUPER, ACTION_ISSUE, ACTION_CANCEL, ACTION_APPROVE] {
+        bank_perms.extend_from_slice(&pack_permission(act, constitution, POLICY_SUPER_GOVERNANCE));
+    }
+    bank_perms.extend_from_slice(&pack_permission(
+        ACTION_TRANSFER,
+        H160::zero(),
+        POLICY_HOLDER_SELF,
+    ));
+
+    // Seed 2 products in ProductLedger:
+    // 1. SLX-LR2021-RADIO: 10 units @ 2,500 SGD
+    // 2. SLX-VALIDATOR-NODE: 3 units @ 15,000 SGD
+    let sku_radio = hps_client::abi::keccak256(b"SLX-LR2021-RADIO");
+    let sku_validator = hps_client::abi::keccak256(b"SLX-VALIDATOR-NODE");
+    let pack_prod = |sku: [u8; 32], units: u64, price: u64, label: &[u8]| -> Vec<u8> {
+        let mut v = vec![0u8; 80];
+        v[0..32].copy_from_slice(&sku);
+        v[32..40].copy_from_slice(&units.to_be_bytes());
+        v[40..48].copy_from_slice(&price.to_be_bytes());
+        v[48..48 + label.len()].copy_from_slice(label);
+        v
+    };
+    let mut init_products = Vec::new();
+    init_products.extend_from_slice(&pack_prod(sku_radio, 10, 2_500, b"SLX-LR2021-RADIO"));
+    init_products.extend_from_slice(&pack_prod(sku_validator, 3, 15_000, b"SLX-VALIDATOR-NODE"));
+
+    let init_con_inner = encode_values(
+        "initialize(address,bytes)",
+        &[AbiValue::Address(registry), AbiValue::Bytes(con_entries)],
+    );
+    let init_bank_inner = encode_values(
+        "initialize(address,string,uint64,bytes,bytes)",
+        &[
+            AbiValue::Address(registry),
+            AbiValue::Bytes(b"SLX-DBS-SGD".to_vec()),
+            AbiValue::Uint(U256::from(2u64)),
+            AbiValue::Bytes(bank_allocs),
+            AbiValue::Bytes(bank_perms),
+        ],
+    );
+    let init_acc_inner = encode_values(
+        "initialize(address,address,address)",
+        &[
+            AbiValue::Address(registry),
+            AbiValue::Address(constitution),
+            AbiValue::Address(product_ledger),
+        ],
+    );
+    let init_prod_inner = encode_values(
+        "initialize(address,address,address,bytes)",
+        &[
+            AbiValue::Address(registry),
+            AbiValue::Address(constitution),
+            AbiValue::Address(accounting_ledger),
+            AbiValue::Bytes(init_products),
+        ],
+    );
+
+    client
+        .send_call_batch(
+            &deployer,
+            &[
+                (
+                    mano_id,
+                    encode_values(
+                        "execute(address,bytes)",
+                        &[AbiValue::Address(constitution), AbiValue::Bytes(init_con_inner)],
+                    ),
+                    vec![constitution, registry, mano_id, evelyn_id],
+                ),
+                (
+                    mano_id,
+                    encode_values(
+                        "execute(address,bytes)",
+                        &[AbiValue::Address(bank_ledger), AbiValue::Bytes(init_bank_inner)],
+                    ),
+                    vec![bank_ledger, registry, constitution, buyer1_id, buyer2_id],
+                ),
+                (
+                    mano_id,
+                    encode_values(
+                        "setClearingAccount(address,address,address,address)",
+                        &[
+                            AbiValue::Address(constitution),
+                            AbiValue::Address(bank_ledger),
+                            AbiValue::Address(clearing_acct_id),
+                            AbiValue::Address(H160::zero()),
+                        ],
+                    ),
+                    vec![constitution, registry, bank_ledger, clearing_acct_id],
+                ),
+                (
+                    mano_id,
+                    encode_values(
+                        "execute(address,bytes)",
+                        &[AbiValue::Address(accounting_ledger), AbiValue::Bytes(init_acc_inner)],
+                    ),
+                    vec![accounting_ledger, registry, constitution, product_ledger],
+                ),
+                (
+                    mano_id,
+                    encode_values(
+                        "execute(address,bytes)",
+                        &[AbiValue::Address(product_ledger), AbiValue::Bytes(init_prod_inner)],
+                    ),
+                    vec![product_ledger, registry, constitution, accounting_ledger],
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+
+    // Step 3: Appoint `catalog_oracle_id` via Board Resolution (`setProductOracle`)
+    let hash_prod_ora = read_b32(
+        &client,
+        constitution,
+        "hashSetProductOracle(address,address,uint64)",
+        &[
+            AbiValue::Address(product_ledger),
+            AbiValue::Address(catalog_oracle_id),
+            AbiValue::Uint(U256::from(50u64)),
+        ],
+    )
+    .await;
+
+    client
+        .send_call_batch(
+            &deployer,
+            &[
+                (
+                    mano_id,
+                    encode_values(
+                        "initConstitutionAuth(address,address,address,address,bytes32,bytes32)",
+                        &[
+                            AbiValue::Address(board_auth),
+                            AbiValue::Address(registry),
+                            AbiValue::Address(constitution),
+                            AbiValue::Address(constitution),
+                            AbiValue::Bytes32(hps_sdk::governance::POLICY_BOARD_RESOLUTION),
+                            AbiValue::Bytes32(hash_prod_ora),
+                        ],
+                    ),
+                    vec![board_auth, registry, constitution, mano_id, evelyn_id],
+                ),
+                (
+                    mano_id,
+                    encode_values("approveAuth(address)", &[AbiValue::Address(board_auth)]),
+                    vec![board_auth, registry, constitution],
+                ),
+                (
+                    evelyn_id,
+                    encode_values(
+                        "approveAndFinalizeAuth(address)",
+                        &[AbiValue::Address(board_auth)],
+                    ),
+                    vec![board_auth, registry, constitution],
+                ),
+                (
+                    mano_id,
+                    encode_values(
+                        "setProductOracle(address,address,address,uint64,address)",
+                        &[
+                            AbiValue::Address(constitution),
+                            AbiValue::Address(product_ledger),
+                            AbiValue::Address(catalog_oracle_id),
+                            AbiValue::Uint(U256::from(50u64)),
+                            AbiValue::Address(board_auth),
+                        ],
+                    ),
+                    vec![constitution, registry, product_ledger, catalog_oracle_id, board_auth],
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+
+    // Step 4: Buyer 1 places immediate-fulfilment buy order for 4 units of SLX-LR2021-RADIO @ 2,500 = 10,000 SGD
+    let buy1_rcpt = client
+        .send_call_with_targets(
+            &deployer,
+            buyer1_id,
+            &encode_values(
+                "buyProduct(address,bytes32,uint64)",
+                &[
+                    AbiValue::Address(product_ledger),
+                    AbiValue::Bytes32(sku_radio),
+                    AbiValue::Uint(U256::from(4u64)),
+                ],
+            ),
+            &[
+                product_ledger,
+                constitution,
+                accounting_ledger,
+                bank_ledger,
+                registry,
+                clearing_acct_id,
+            ],
+        )
+        .await
+        .unwrap();
+    assert!(buy1_rcpt.status, "buyer1 buyProduct failed");
+    println!(
+        "[ProductLedger E2E] Buyer 1 purchased 4x SLX-LR2021-RADIO (gas_used = {})",
+        buy1_rcpt.gas_used
+    );
+
+    assert_eq!(
+        read_u64(
+            &client,
+            product_ledger,
+            "unitsAvailableOf(bytes32)",
+            &[AbiValue::Bytes32(sku_radio)]
+        )
+        .await,
+        6
+    );
+    assert_eq!(
+        read_u64(
+            &client,
+            bank_ledger,
+            "balanceOf(address)",
+            &[AbiValue::Address(buyer1_id)]
+        )
+        .await,
+        40_000
+    );
+    assert_eq!(
+        read_u64(
+            &client,
+            bank_ledger,
+            "balanceOf(address)",
+            &[AbiValue::Address(clearing_acct_id)]
+        )
+        .await,
+        10_000
+    );
+    assert_eq!(
+        read_u64(&client, accounting_ledger, "totalRevenue()", &[]).await,
+        10_000
+    );
+
+    // Step 5: Negative test — Buyer 1 tries to buy 4 units of SLX-VALIDATOR-NODE when only 3 are available -> MUST revert!
+    let neg_stock_rcpt = client
+        .send_call_with_targets(
+            &deployer,
+            buyer1_id,
+            &encode_values(
+                "buyProduct(address,bytes32,uint64)",
+                &[
+                    AbiValue::Address(product_ledger),
+                    AbiValue::Bytes32(sku_validator),
+                    AbiValue::Uint(U256::from(4u64)),
+                ],
+            ),
+            &[
+                product_ledger,
+                constitution,
+                accounting_ledger,
+                bank_ledger,
+                registry,
+                clearing_acct_id,
+            ],
+        )
+        .await
+        .unwrap();
+    assert!(
+        !neg_stock_rcpt.status,
+        "buying more than available units must revert"
+    );
+
+    // Step 6: Negative test — Buyer 2 (25,000 SGD) tries to buy 2 units of SLX-VALIDATOR-NODE (30,000 SGD) -> MUST revert!
+    let neg_bal_rcpt = client
+        .send_call_with_targets(
+            &deployer,
+            buyer2_id,
+            &encode_values(
+                "buyProduct(address,bytes32,uint64)",
+                &[
+                    AbiValue::Address(product_ledger),
+                    AbiValue::Bytes32(sku_validator),
+                    AbiValue::Uint(U256::from(2u64)),
+                ],
+            ),
+            &[
+                product_ledger,
+                constitution,
+                accounting_ledger,
+                bank_ledger,
+                registry,
+                clearing_acct_id,
+            ],
+        )
+        .await
+        .unwrap();
+    assert!(
+        !neg_bal_rcpt.status,
+        "buying with insufficient bank balance must revert"
+    );
+
+    // Step 7: Catalog Oracle restocks +4 units of SLX-LR2021-RADIO (6 -> 10) and updates price to 3,000 SGD
+    // using a one-time `POLICY_PRODUCT_ORACLE` Authorization HPS object (`restock_auth`)
+    let hash_restock = read_b32(
+        &client,
+        product_ledger,
+        "hashRestockProduct(bytes32,uint64,uint64)",
+        &[
+            AbiValue::Bytes32(sku_radio),
+            AbiValue::Uint(U256::from(4u64)),
+            AbiValue::Uint(U256::from(3_000u64)),
+        ],
+    )
+    .await;
+
+    client
+        .send_call_batch(
+            &deployer,
+            &[
+                (
+                    catalog_oracle_id,
+                    encode_values(
+                        "initConstitutionAuth(address,address,address,address,bytes32,bytes32)",
+                        &[
+                            AbiValue::Address(restock_auth),
+                            AbiValue::Address(registry),
+                            AbiValue::Address(constitution),
+                            AbiValue::Address(product_ledger),
+                            AbiValue::Bytes32(hps_sdk::governance::POLICY_PRODUCT_ORACLE),
+                            AbiValue::Bytes32(hash_restock),
+                        ],
+                    ),
+                    vec![restock_auth, registry, constitution, product_ledger, catalog_oracle_id],
+                ),
+                (
+                    catalog_oracle_id,
+                    encode_values(
+                        "approveAndFinalizeAuth(address)",
+                        &[AbiValue::Address(restock_auth)],
+                    ),
+                    vec![restock_auth, registry, constitution],
+                ),
+                (
+                    catalog_oracle_id,
+                    encode_values(
+                        "restockProduct(address,bytes32,uint64,uint64,address)",
+                        &[
+                            AbiValue::Address(product_ledger),
+                            AbiValue::Bytes32(sku_radio),
+                            AbiValue::Uint(U256::from(4u64)),
+                            AbiValue::Uint(U256::from(3_000u64)),
+                            AbiValue::Address(restock_auth),
+                        ],
+                    ),
+                    vec![product_ledger, registry, constitution, restock_auth],
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        read_u64(
+            &client,
+            product_ledger,
+            "unitsAvailableOf(bytes32)",
+            &[AbiValue::Bytes32(sku_radio)]
+        )
+        .await,
+        10
+    );
+    assert_eq!(
+        read_u64(
+            &client,
+            product_ledger,
+            "latestPriceOf(bytes32)",
+            &[AbiValue::Bytes32(sku_radio)]
+        )
+        .await,
+        3_000
+    );
+
+    // Step 8: Buyer 2 buys 5 units of SLX-LR2021-RADIO @ new price 3,000 = 15,000 SGD
+    let buy2_rcpt = client
+        .send_call_with_targets(
+            &deployer,
+            buyer2_id,
+            &encode_values(
+                "buyProduct(address,bytes32,uint64)",
+                &[
+                    AbiValue::Address(product_ledger),
+                    AbiValue::Bytes32(sku_radio),
+                    AbiValue::Uint(U256::from(5u64)),
+                ],
+            ),
+            &[
+                product_ledger,
+                constitution,
+                accounting_ledger,
+                bank_ledger,
+                registry,
+                clearing_acct_id,
+            ],
+        )
+        .await
+        .unwrap();
+    assert!(buy2_rcpt.status, "buyer2 buyProduct failed");
+    println!(
+        "[ProductLedger E2E] Buyer 2 purchased 5x SLX-LR2021-RADIO @ 3,000 SGD (gas_used = {})",
+        buy2_rcpt.gas_used
+    );
+
+    // Verify final ProductLedger & AccountingLedger states:
+    // - SLX-LR2021-RADIO remaining units = 10 - 5 = 5
+    // - Total sales recorded = 2
+    // - Total revenue = 10,000 + 15,000 = 25,000 SGD
+    // - Clearing account balance = 25,000 SGD
+    assert_eq!(
+        read_u64(
+            &client,
+            product_ledger,
+            "unitsAvailableOf(bytes32)",
+            &[AbiValue::Bytes32(sku_radio)]
+        )
+        .await,
+        5
+    );
+    assert_eq!(
+        read_u64(&client, accounting_ledger, "saleCount()", &[]).await,
+        2
+    );
+    assert_eq!(
+        read_u64(&client, accounting_ledger, "totalUnitsSold()", &[]).await,
+        9
+    );
+    assert_eq!(
+        read_u64(&client, accounting_ledger, "totalRevenue()", &[]).await,
+        25_000
+    );
+    assert_eq!(
+        read_u64(
+            &client,
+            bank_ledger,
+            "balanceOf(address)",
+            &[AbiValue::Address(clearing_acct_id)]
+        )
+        .await,
+        25_000
+    );
+    println!("[ProductLedger & AccountingLedger E2E] All positive & negative checks passed! Total Revenue = 25,000 SGD across 2 sales (9 units).");
+}
