@@ -1285,3 +1285,316 @@ async fn full_institutional_governance_ledger_and_otc_on_localtestnet() {
     );
     println!("[10/10] AssetPair_OTC DvP trade settled atomically! Seller=(980 GOLD, 9000 USD), Buyer=(245 GOLD, 46000 USD)");
 }
+
+fn calc_intrinsic(cd: &[u8]) -> u64 {
+    let mut g = 21_000u64;
+    for &b in cd {
+        g += if b == 0 { 4 } else { 16 };
+    }
+    g
+}
+
+#[tokio::test]
+#[ignore = "requires local lexicon-node binary; run with --ignored"]
+async fn simplex_hps_gas_usage_profile_on_localtestnet() {
+    let _node = spawn_isolated_localtestnet();
+    let rpc_url = format!("http://127.0.0.1:{TEST_RPC_PORT}");
+    let client = HpsClient::new(&rpc_url);
+
+    for _ in 0..40 {
+        if client.block_number().await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    let dist = workspace_root().join("dist");
+    let identity_wasm = std::fs::read(dist.join("identity.wasm")).unwrap();
+    let registry_wasm = std::fs::read(dist.join("identity_registry.wasm")).unwrap();
+    let constitution_wasm = std::fs::read(dist.join("constitution.wasm")).unwrap();
+    let auth_wasm = std::fs::read(dist.join("authorization.wasm")).unwrap();
+    let ledger_wasm = std::fs::read(dist.join("asset_ledger.wasm")).unwrap();
+    let messaging_wasm = std::fs::read(dist.join("messaging.wasm")).unwrap();
+
+    let mut deployer = HpsSigner::from_hex(DEFAULT_DEV_PRIVATE_KEY, DEFAULT_CHAIN_ID).unwrap();
+    deployer.default_gas_limit = U256::from(5_000_000u64);
+
+    let id_code = client.store_bytecode(&deployer, &identity_wasm).await.unwrap();
+    let reg_code = client.store_bytecode(&deployer, &registry_wasm).await.unwrap();
+    let con_code = client.store_bytecode(&deployer, &constitution_wasm).await.unwrap();
+    let auth_code = client.store_bytecode(&deployer, &auth_wasm).await.unwrap();
+    let led_code = client.store_bytecode(&deployer, &ledger_wasm).await.unwrap();
+    let msg_code = client.store_bytecode(&deployer, &messaging_wasm).await.unwrap();
+
+    let insts = client
+        .instantiate_batch(
+            &deployer,
+            &[
+                (id_code, Vec::new()),
+                (id_code, Vec::new()),
+                (reg_code, Vec::new()),
+                (con_code, Vec::new()),
+                (auth_code, Vec::new()),
+                (led_code, Vec::new()),
+                (msg_code, Vec::new()),
+            ],
+        )
+        .await
+        .unwrap();
+    let alice_id = insts[0];
+    let bob_id = insts[1];
+    let registry = insts[2];
+    let constitution = insts[3];
+    let auth_hps = insts[4];
+    let bank_ledger = insts[5];
+    let msg_hps = insts[6];
+
+    // Batch 1: Initialize Alice & Bob Identity HPSes + Messaging postMessage + pure view/hash calls as transactions
+    let cd_init_alice = encode_values(
+        "initialize(address,string)",
+        &[
+            AbiValue::Address(deployer.address()),
+            AbiValue::Bytes(b"alice.id".to_vec()),
+        ],
+    );
+    let cd_init_bob = encode_values(
+        "initialize(address,string)",
+        &[
+            AbiValue::Address(deployer.address()),
+            AbiValue::Bytes(b"bob.id".to_vec()),
+        ],
+    );
+    let cd_post_msg = encode_values(
+        "postMessage(bytes32,bytes)",
+        &[
+            AbiValue::Bytes32([0xAA; 32]),
+            AbiValue::Bytes(b"hello".to_vec()),
+        ],
+    );
+    let b1 = client
+        .send_call_batch(
+            &deployer,
+            &[
+                (alice_id, cd_init_alice.clone(), vec![]),
+                (bob_id, cd_init_bob.clone(), vec![]),
+                (msg_hps, cd_post_msg.clone(), vec![]),
+            ],
+        )
+        .await
+        .unwrap();
+
+    // Batch 2: Simple calls on Identity (`owner()`, `isAuthorized(address)`, `setDelegate(address,bool)` cold, `transferOwnership(address)`)
+    // + Initialize IdentityRegistry
+    let cd_id_owner = encode_values("owner()", &[]);
+    let cd_id_is_auth = encode_values("isAuthorized(address)", &[AbiValue::Address(deployer.address())]);
+    let cd_id_set_del = encode_values(
+        "setDelegate(address,bool)",
+        &[AbiValue::Address(H160::repeat_byte(0x77)), AbiValue::Bool(true)],
+    );
+    let cd_reg_init = encode_values(
+        "initialize(address,bytes32,bytes32,bytes)",
+        &[
+            AbiValue::Address(alice_id),
+            AbiValue::Bytes32(*id_code.as_fixed_bytes()),
+            AbiValue::Bytes32(*auth_code.as_fixed_bytes()),
+            AbiValue::Bytes(bob_id.as_bytes().to_vec()),
+        ],
+    );
+    let b2 = client
+        .send_call_batch(
+            &deployer,
+            &[
+                (alice_id, cd_id_owner.clone(), vec![]),
+                (alice_id, cd_id_is_auth.clone(), vec![]),
+                (alice_id, cd_id_set_del.clone(), vec![]),
+                (registry, cd_reg_init.clone(), vec![alice_id, bob_id]),
+            ],
+        )
+        .await
+        .unwrap();
+
+    // Batch 3: Simple calls on Identity (`setDelegate` warm modify), IdentityRegistry (`activeCount()`, `isValidIdentity(address)`, `isValidAuthorizationHps(address)`),
+    // Constitution (`initialize`, `hashAddDirector(address)`), and Bank AssetLedger (`initialize`)
+    let cd_id_set_del_warm = encode_values(
+        "setDelegate(address,bool)",
+        &[AbiValue::Address(H160::repeat_byte(0x77)), AbiValue::Bool(false)],
+    );
+    let cd_reg_active = encode_values("activeCount()", &[]);
+    let cd_reg_valid_id = encode_values("isValidIdentity(address)", &[AbiValue::Address(alice_id)]);
+    let cd_reg_valid_auth = encode_values("isValidAuthorizationHps(address)", &[AbiValue::Address(auth_hps)]);
+
+    let super_spec = PolicySpec::new(100)
+        .add_stage(StageSpec::new(1, 50).add_member(h160_bytes(alice_id), 1).unwrap())
+        .unwrap();
+    let mut con_blob = Vec::new();
+    con_blob.extend_from_slice(&1u16.to_be_bytes());
+    con_blob.extend_from_slice(&encode_constitution_entry(
+        H160::zero(),
+        POLICY_SUPER_GOVERNANCE,
+        &super_spec,
+    ));
+    let cd_con_init = encode_values(
+        "execute(address,bytes)",
+        &[
+            AbiValue::Address(constitution),
+            AbiValue::Bytes(encode_values(
+                "initialize(address,bytes)",
+                &[AbiValue::Address(registry), AbiValue::Bytes(con_blob)],
+            )),
+        ],
+    );
+
+    let mut bank_alloc = Vec::with_capacity(56);
+    bank_alloc.extend_from_slice(alice_id.as_bytes());
+    bank_alloc.extend_from_slice(&10_000u64.to_be_bytes());
+    bank_alloc.extend_from_slice(bob_id.as_bytes());
+    bank_alloc.extend_from_slice(&5_000u64.to_be_bytes());
+    let mut bank_perms = Vec::new();
+    for (act, con_a, pol) in [
+        (ACTION_SUPER, constitution, POLICY_SUPER_GOVERNANCE),
+        (ACTION_ISSUE, constitution, POLICY_SUPER_GOVERNANCE),
+        (ACTION_CANCEL, constitution, POLICY_SUPER_GOVERNANCE),
+        (ACTION_TRANSFER, H160::zero(), POLICY_HOLDER_SELF),
+        (ACTION_APPROVE, H160::zero(), POLICY_HOLDER_SELF),
+    ] {
+        bank_perms.extend_from_slice(&pack_permission(act, con_a, pol));
+    }
+    let cd_led_init = encode_values(
+        "execute(address,bytes)",
+        &[
+            AbiValue::Address(bank_ledger),
+            AbiValue::Bytes(encode_values(
+                "initialize(address,string,uint64,bytes,bytes)",
+                &[
+                    AbiValue::Address(registry),
+                    AbiValue::Bytes(b"SGD".to_vec()),
+                    AbiValue::Uint(U256::from(2u64)),
+                    AbiValue::Bytes(bank_alloc),
+                    AbiValue::Bytes(bank_perms),
+                ],
+            )),
+        ],
+    );
+
+    let b3 = client
+        .send_call_batch(
+            &deployer,
+            &[
+                (alice_id, cd_id_set_del_warm.clone(), vec![]),
+                (registry, cd_reg_active.clone(), vec![]),
+                (registry, cd_reg_valid_id.clone(), vec![alice_id]),
+                (registry, cd_reg_valid_auth.clone(), vec![auth_hps]),
+                (alice_id, cd_con_init.clone(), vec![constitution, registry]),
+                (alice_id, cd_led_init.clone(), vec![bank_ledger, registry, bob_id]),
+            ],
+        )
+        .await
+        .unwrap();
+
+    // Batch 4: Simplest calls on Constitution (`directorCount()`, `hasPolicy`, `hashAddDirector`),
+    // Authorization (`initConstitutionAuth`, `state()`), and AssetLedger (`totalOutstanding()`, `balanceOf(address)`,
+    // and `transferBankBalance` / `transferDirect` between existing holders!)
+    let cd_con_dircount = encode_values("directorCount()", &[]);
+    let cd_con_haspol = encode_values(
+        "hasPolicy(address,bytes32)",
+        &[
+            AbiValue::Address(H160::zero()),
+            AbiValue::Bytes32(POLICY_SUPER_GOVERNANCE),
+        ],
+    );
+    let cd_con_hash_add = encode_values("hashAddDirector(address)", &[AbiValue::Address(bob_id)]);
+    let cd_led_supply = encode_values("totalOutstanding()", &[]);
+    let cd_led_bal = encode_values("balanceOf(address)", &[AbiValue::Address(alice_id)]);
+    let cd_bank_xfer_warm = encode_values(
+        "transferBankBalance(address,address,uint64)",
+        &[
+            AbiValue::Address(bank_ledger),
+            AbiValue::Address(bob_id),
+            AbiValue::Uint(U256::from(100u64)),
+        ],
+    );
+    let cd_auth_init = encode_values(
+        "initConstitutionAuth(address,address,address,address,bytes32,bytes32)",
+        &[
+            AbiValue::Address(auth_hps),
+            AbiValue::Address(registry),
+            AbiValue::Address(constitution),
+            AbiValue::Address(constitution),
+            AbiValue::Bytes32(POLICY_SUPER_GOVERNANCE),
+            AbiValue::Bytes32([0x55; 32]),
+        ],
+    );
+
+    let b4 = client
+        .send_call_batch(
+            &deployer,
+            &[
+                (constitution, cd_con_dircount.clone(), vec![]),
+                (constitution, cd_con_haspol.clone(), vec![]),
+                (constitution, cd_con_hash_add.clone(), vec![]),
+                (bank_ledger, cd_led_supply.clone(), vec![]),
+                (bank_ledger, cd_led_bal.clone(), vec![]),
+                (alice_id, cd_bank_xfer_warm.clone(), vec![bank_ledger, registry, bob_id]),
+                (alice_id, cd_auth_init.clone(), vec![auth_hps, registry, constitution]),
+            ],
+        )
+        .await
+        .unwrap();
+
+    // Batch 5: Authorization `status()` + `approveAndFinalizeAuth` + Constitution `clearingAccount()`
+    let cd_auth_state = encode_values("status()", &[]);
+    let cd_con_clearing = encode_values("clearingAccount()", &[]);
+    let cd_auth_approve_fin = encode_values("approveAndFinalizeAuth(address)", &[AbiValue::Address(auth_hps)]);
+    let b5 = client
+        .send_call_batch(
+            &deployer,
+            &[
+                (auth_hps, cd_auth_state.clone(), vec![]),
+                (alice_id, cd_auth_approve_fin.clone(), vec![auth_hps, registry, constitution]),
+                (constitution, cd_con_clearing.clone(), vec![]),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let rows = vec![
+        ("Identity", "owner() [view]", &cd_id_owner, &b2[0]),
+        ("Identity", "isAuthorized(address) [view]", &cd_id_is_auth, &b2[1]),
+        ("Identity", "initialize(address,string) [cold 3 slots + event]", &cd_init_alice, &b1[0]),
+        ("Identity", "setDelegate(address,bool) [cold new slot + event]", &cd_id_set_del, &b2[2]),
+        ("Identity", "setDelegate(address,bool) [warm slot modify + event]", &cd_id_set_del_warm, &b3[0]),
+        ("IdentityRegistry", "activeCount() [view]", &cd_reg_active, &b3[1]),
+        ("IdentityRegistry", "isValidIdentity(address) [status + code_hash check]", &cd_reg_valid_id, &b3[2]),
+        ("IdentityRegistry", "isValidAuthorizationHps(address) [code_hash check]", &cd_reg_valid_auth, &b3[3]),
+        ("IdentityRegistry", "initialize(admin,idCode,authCode,1 id)", &cd_reg_init, &b2[3]),
+        ("Constitution", "clearingAccount() [view]", &cd_con_clearing, &b5[2]),
+        ("Constitution", "directorCount() [view]", &cd_con_dircount, &b4[0]),
+        ("Constitution", "hasPolicy(address,bytes32) [view]", &cd_con_haspol, &b4[1]),
+        ("Constitution", "hashAddDirector(address) [pure Keccak256]", &cd_con_hash_add, &b4[2]),
+        ("Constitution", "initialize(registry, 1 policy) [via Identity]", &cd_con_init, &b3[4]),
+        ("Authorization", "status() [view]", &cd_auth_state, &b5[0]),
+        ("Authorization", "initConstitutionAuth(...) [via Identity]", &cd_auth_init, &b4[6]),
+        ("Authorization", "approveAndFinalizeAuth(...) [1-stage via Identity]", &cd_auth_approve_fin, &b5[1]),
+        ("AssetLedger", "totalOutstanding() [view]", &cd_led_supply, &b4[3]),
+        ("AssetLedger", "balanceOf(address) [view]", &cd_led_bal, &b4[4]),
+        ("AssetLedger", "transferBankBalance / transferDirect [warm via Identity]", &cd_bank_xfer_warm, &b4[5]),
+        ("AssetLedger", "initialize(SGD, 2 holders, 5 perms) [via Identity]", &cd_led_init, &b3[5]),
+        ("Messaging", "postMessage(bytes32, \"hello\")", &cd_post_msg, &b1[2]),
+    ];
+
+    println!("\n=== HALTPROOF SUBROUTINES GAS USAGE PROFILE ===");
+    println!(
+        "| {:<18} | {:<52} | {:>10} | {:>10} | {:>10} |",
+        "Subroutine", "Function / Call Path", "Intrinsic", "WASM+Host", "Total Gas"
+    );
+    println!("|--------------------|------------------------------------------------------|------------|------------|------------|");
+    for (hps_name, fn_name, cd, rcpt) in rows {
+        assert!(rcpt.status, "{hps_name}::{fn_name} failed");
+        let intr = calc_intrinsic(cd);
+        let exec = rcpt.gas_used.saturating_sub(intr);
+        println!(
+            "| {:<18} | {:<52} | {:>10} | {:>10} | {:>10} |",
+            hps_name, fn_name, intr, exec, rcpt.gas_used
+        );
+    }
+}
