@@ -2841,6 +2841,19 @@ async fn product_ledger_and_accounting_ledger_e2e_on_localtestnet() {
     assert_eq!(matched_vol, 1_000);
     assert_eq!(ingested_cnt, 5);
 
+    // Verify AVL tree pruned the exhausted $12 Bid level and $10 Ask level, leaving only 1 Bid level ($10)
+    let lvl_depth_raw = client
+        .read_call(None, dex_hps, &encode_values("priceLevelDepth()", &[]))
+        .await
+        .unwrap();
+    let active_bid_lvls = u64::from_be_bytes(lvl_depth_raw[24..32].try_into().unwrap());
+    let active_ask_lvls = u64::from_be_bytes(lvl_depth_raw[56..64].try_into().unwrap());
+    assert_eq!((active_bid_lvls, active_ask_lvls), (1, 0));
+    println!(
+        "[DEX CLOB AVL E2E] dexPlaceBid gas_used = {}, dexMatchBlock (5 orders ingested, 5 filled) gas_used = {}",
+        blk1_rcpt.gas_used, match_rcpt.gas_used
+    );
+
     // Verify futures balances after price-first, earliest-block-second, same-block pro-rata matching:
     // - `buyer2_id` (Bid @ 12, blk N2, qty 200) -> 200 units (100% fill via higher price priority)
     // - `mano_id` (Bid @ 10, blk N1, qty 400) -> 400 units (100% fill via earliest block at price 10)
