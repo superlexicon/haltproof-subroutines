@@ -12,8 +12,8 @@ use crate::keccak::keccak256;
 use crate::selector;
 
 pub const POLICY_WIRE_VERSION: u8 = 1;
-pub const MAX_STAGES: usize = 8;
-pub const MAX_MEMBERS_PER_STAGE: usize = 16;
+pub const MAX_STAGES: usize = 4;
+pub const MAX_MEMBERS_PER_STAGE: usize = 64;
 pub const MAX_ENCODED_POLICY_BYTES: usize = 4096;
 
 /// Canonical 32-byte action keys used in `AssetLedger` permissions and `Constitution` policies.
@@ -22,9 +22,13 @@ pub const ACTION_CANCEL: [u8; 32] = keccak256(b"CANCEL");
 pub const ACTION_TRANSFER: [u8; 32] = keccak256(b"TRANSFER");
 pub const ACTION_APPROVE: [u8; 32] = keccak256(b"APPROVE");
 pub const ACTION_SUPER: [u8; 32] = keccak256(b"SUPER");
+pub const ACTION_ADD_DIRECTOR: [u8; 32] = keccak256(b"ADD_DIRECTOR");
+pub const ACTION_REMOVE_DIRECTOR: [u8; 32] = keccak256(b"REMOVE_DIRECTOR");
 
 /// Canonical policy IDs for `Constitution`, `AssetLedger`, and `IdentityRegistry` governance.
 pub const POLICY_SUPER_GOVERNANCE: [u8; 32] = keccak256(b"SUPER_GOVERNANCE");
+pub const POLICY_SHAREHOLDER_SUPERMAJORITY: [u8; 32] = keccak256(b"SHAREHOLDER_SUPERMAJORITY");
+pub const POLICY_BOARD_RESOLUTION: [u8; 32] = keccak256(b"BOARD_RESOLUTION");
 pub const POLICY_ADMIN_ORACLE: [u8; 32] = keccak256(b"ADMIN_ORACLE");
 /// Dynamic policy sentinel for `ACTION_TRANSFER` / `ACTION_APPROVE` requiring a one-time
 /// `Authorization` object approved & finalized by the debited holder Identity itself.
@@ -52,6 +56,7 @@ pub const ERR_INVALID_IDENTITY: i32 = -70;
 pub const ERR_AUTH_CONSUME_FAILED: i32 = -71;
 pub const ERR_POLICY_INVALID: i32 = -72;
 pub const ERR_UNAPPROVED_CODE_HASH: i32 = -73;
+pub const ERR_CONSTITUTION_MISMATCH: i32 = -19;
 
 /// Single authorizer entry within a sequential authorization stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -39,6 +39,8 @@ hps_entry! {
     "cancelAsset(address,address,uint64,address)"                                     => handle_cancel_asset,
     "transferAsset(address,address,address,uint64,address)"                           => handle_transfer_asset,
     "approveAsset(address,address,uint64,address)"                                    => handle_approve_asset,
+    "addDirector(address,address,address)"                                            => handle_add_director,
+    "removeDirector(address,address,address)"                                         => handle_remove_director,
     "owner()"                                                                         => handle_owner,
     "isAuthorized(address)"                                                           => handle_is_authorized,
     "hasApprovedAuth(address)"                                                        => handle_has_approved_auth,
@@ -306,6 +308,34 @@ fn handle_transfer_asset(args: &CalldataReader) -> Result<(), i32> {
         return Err(-24);
     }
     ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_add_director(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let constitution = args.address(0).ok_or(-3)?;
+    let new_director = args.address(1).ok_or(-3)?;
+    let auth_obj = args.address(2).ok_or(-3)?;
+
+    let sub_cd = CallEncoder::<96>::new(selector("addDirector(address,address)"))
+        .push_address(&new_director)
+        .push_address(&auth_obj);
+    let new_count = call::call_u64(&constitution, sub_cd.as_slice())?;
+    ret::write_u64_word(new_count);
+    Ok(())
+}
+
+fn handle_remove_director(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let constitution = args.address(0).ok_or(-3)?;
+    let director = args.address(1).ok_or(-3)?;
+    let auth_obj = args.address(2).ok_or(-3)?;
+
+    let sub_cd = CallEncoder::<96>::new(selector("removeDirector(address,address)"))
+        .push_address(&director)
+        .push_address(&auth_obj);
+    let new_count = call::call_u64(&constitution, sub_cd.as_slice())?;
+    ret::write_u64_word(new_count);
     Ok(())
 }
 

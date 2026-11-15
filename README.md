@@ -22,6 +22,7 @@ Zero C++/RocksDB dependencies are required to build Haltproof Subroutines or run
 | `examples/asset-pair-otc/` | `AssetPair_OTC` HPS (`13.8 KB` WASM) pairing a Base `AssetLedger` and Quote `AssetLedger` with `IdentityRegistry` verification: lets the verified seller `Identity` list ask orders (`placeAskOrder`) and lets verified buyer `Identity` accounts execute atomic Delivery-vs-Payment trades (`buyOrder`) via dual-ledger `transferFrom`. |
 | `ts-client/` | JavaScript / TypeScript client helper (`hps.mjs` + `hps.d.ts`) implementing Lexicon's 10-field RLP transaction signing (`extraTargets` supported) and 2-step WASM HPS deployment for web & SuperLexicon frontends. |
 | [`docs/END_TO_END_GUIDE.md`](docs/END_TO_END_GUIDE.md) | Step-by-step **End-to-End Haltproof Subroutine (HPS) & Institutional Governance Guide**, including architecture diagrams and full workflows. |
+| [`docs/SUPERLEXICON_PE_AND_FSM_VERIFICATION.md`](docs/SUPERLEXICON_PE_AND_FSM_VERIFICATION.md) | **Superlexicon Pte. Ltd. (Singapore Private Equity Asset Ledger)** specification: 49-shareholder cap table (`100,000` shares), single-Constitution pinning, Shareholder Super-Majority ($\ge 75\%$) vs. Board of Directors (`2-of-2`) bylaws, event log schemas, positive/negative test catalogue (`P1`–`P4`, `N1`–`N11`), and **Formal Verification Template** (TLA+ & Kani Rust proofs). |
 
 ---
 
@@ -93,10 +94,14 @@ With `lexicon-node` installed, run the automated live chain test (spawns an isol
 
 ```bash
 cargo test -p hps-client --test live_governance_e2e -- --ignored --nocapture
+
+# Run the Superlexicon Pte. Ltd. (49-Shareholder Singapore Private Equity) live Wasmtime E2E suite:
+cargo test -p hps-client --test superlexicon_pe_e2e -- --ignored --nocapture
 ```
 
 ---
 
-## Full End-to-End Developer Guide
+## Full End-to-End Developer Guide & Formal Verification Template
 
-See **[`docs/END_TO_END_GUIDE.md`](docs/END_TO_END_GUIDE.md)** for the complete architectural reference, `PolicySpec` wire format, action-hash formulas, and Rust/CLI/TypeScript integration guide.
+- **[`docs/END_TO_END_GUIDE.md`](docs/END_TO_END_GUIDE.md)** — Complete architectural reference, `PolicySpec` wire format, action-hash formulas, and Rust/CLI/TypeScript integration guide.
+- **[`docs/SUPERLEXICON_PE_AND_FSM_VERIFICATION.md`](docs/SUPERLEXICON_PE_AND_FSM_VERIFICATION.md)** — Superlexicon Pte. Ltd. 49-shareholder Private Equity Asset Ledger, single-Constitution pinning, event log schemas, positive/negative test suite (`P1`–`P4`, `N1`–`N11`), and Formal Verification Template (LTL/CTL invariants, TLA+ specification, and Kani Rust bounded model checking proofs).

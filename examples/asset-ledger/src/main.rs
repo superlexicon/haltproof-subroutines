@@ -24,12 +24,13 @@ use hps_sdk::abi::CalldataReader;
 use hps_sdk::governance::{
     oracle_policy_id, require_valid_identity, verify_and_consume_auth, ActionHasher,
     ACTION_APPROVE, ACTION_CANCEL, ACTION_ISSUE, ACTION_SUPER, ACTION_TRANSFER,
-    POLICY_HOLDER_SELF,
+    ERR_CONSTITUTION_MISMATCH, POLICY_HOLDER_SELF,
 };
 use hps_sdk::storage::KeyBuilder;
 use hps_sdk::{context, event_topic, events, hps_entry, ret, storage};
 
 const LEDGER_INITIALIZED: [u8; 32] = event_topic("LedgerInitialized(address,uint64,uint64)");
+const CONSTITUTION_PINNED: [u8; 32] = event_topic("ConstitutionPinned(address)");
 const CREDIT_TOPIC: [u8; 32] = event_topic("Credited(address,uint64,uint64)");
 const DEBIT_TOPIC: [u8; 32] = event_topic("Debited(address,uint64,uint64)");
 const ISSUED_TOPIC: [u8; 32] = event_topic("AssetIssued(address,uint64,uint64,address)");
@@ -41,6 +42,7 @@ const PERMISSION_SET_TOPIC: [u8; 32] =
 
 const KEY_INIT: &[u8] = b"meta:init";
 const KEY_REGISTRY: &[u8] = b"meta:registry";
+const KEY_CONSTITUTION: &[u8] = b"meta:constitution";
 const KEY_SYMBOL: &[u8] = b"meta:symbol";
 const KEY_DECIMALS: &[u8] = b"meta:decimals";
 const KEY_SUPPLY: &[u8] = b"meta:supply";
@@ -62,6 +64,7 @@ hps_entry! {
     "decimals()"                                            => handle_decimals,
     "symbol()"                                              => handle_symbol,
     "identityRegistry()"                                    => handle_identity_registry,
+    "associatedConstitution()"                              => handle_associated_constitution,
     "getPermission(bytes32)"                                => handle_get_permission,
     "hashIssue(address,uint64)"                             => handle_hash_issue,
     "hashCancel(address,uint64)"                            => handle_hash_cancel,
@@ -311,8 +314,9 @@ fn handle_initialize(args: &CalldataReader) -> Result<(), i32> {
     let caller = context::msg_sender();
     require_valid_identity(&registry, &caller)?;
 
-    // 1. Validate & populate initial permissions map (must configure ACTION_SUPER).
+    // 1. Validate & populate initial permissions map (must configure ACTION_SUPER and bind at most ONE Constitution HPS).
     let mut has_super = false;
+    let mut pinned_constitution = [0u8; 20];
     let mut p_off = 0usize;
     while p_off < initial_perms.len() {
         let mut act = [0u8; 32];
@@ -326,16 +330,23 @@ fn handle_initialize(args: &CalldataReader) -> Result<(), i32> {
         if act == [0u8; 32] || pol == [0u8; 32] {
             return Err(-12);
         }
+        if con != [0u8; 20] {
+            if pinned_constitution == [0u8; 20] {
+                pinned_constitution = con;
+            } else if pinned_constitution != con {
+                return Err(ERR_CONSTITUTION_MISMATCH); // AssetLedger can ONLY be associated with a single Constitution HPS
+            }
+        }
         if act == ACTION_SUPER {
-            if pol == POLICY_HOLDER_SELF {
+            if pol == POLICY_HOLDER_SELF || con == [0u8; 20] {
                 return Err(-12); // SUPER cannot use dynamic holder-self sentinel
             }
             has_super = true;
         }
         store_permission(&act, &con, &pol);
     }
-    if !has_super {
-        return Err(-18); // ACTION_SUPER permission must be defined at initialization
+    if !has_super || pinned_constitution == [0u8; 20] {
+        return Err(-18); // ACTION_SUPER permission and single Constitution must be defined at initialization
     }
 
     // 2. Validate & credit initial Identity allocations via `internal_credit`.
@@ -357,15 +368,25 @@ fn handle_initialize(args: &CalldataReader) -> Result<(), i32> {
     }
 
     storage::set_address(KEY_REGISTRY, &registry);
+    storage::set_address(KEY_CONSTITUTION, &pinned_constitution);
     storage::set(KEY_SYMBOL, symbol);
     storage::set_u64(KEY_DECIMALS, decimals);
     storage::set_u64(KEY_SUPPLY, total_supply);
     storage::set_u64(KEY_INIT, 1);
 
-    let mut ev = [0u8; 16];
+    events::emit(&[CONSTITUTION_PINNED, addr_topic(&pinned_constitution)], &[]);
+    let mut ev = [0u8; 24];
     ev[0..8].copy_from_slice(&total_supply.to_be_bytes());
     ev[8..16].copy_from_slice(&((initial_perms.len() / 84) as u64).to_be_bytes());
-    events::emit(&[LEDGER_INITIALIZED, addr_topic(&registry)], &ev);
+    ev[16..24].copy_from_slice(&storage::get_u64(KEY_HOLDER_COUNT).to_be_bytes());
+    events::emit(
+        &[
+            LEDGER_INITIALIZED,
+            addr_topic(&registry),
+            addr_topic(&pinned_constitution),
+        ],
+        &ev,
+    );
     Ok(())
 }
 
@@ -390,9 +411,10 @@ fn handle_issue(args: &CalldataReader) -> Result<(), i32> {
     let new_bal = internal_credit(&to_identity, amount)?;
     storage::set_u64(KEY_SUPPLY, new_supply);
 
-    let mut ev = [0u8; 16];
+    let mut ev = [0u8; 24];
     ev[0..8].copy_from_slice(&amount.to_be_bytes());
     ev[8..16].copy_from_slice(&new_supply.to_be_bytes());
+    ev[16..24].copy_from_slice(&new_bal.to_be_bytes());
     events::emit(
         &[ISSUED_TOPIC, addr_topic(&to_identity), addr_topic(&auth_obj)],
         &ev,
@@ -435,9 +457,10 @@ fn handle_cancel(args: &CalldataReader) -> Result<(), i32> {
     let new_supply = cur_supply - amount;
     storage::set_u64(KEY_SUPPLY, new_supply);
 
-    let mut ev = [0u8; 16];
+    let mut ev = [0u8; 24];
     ev[0..8].copy_from_slice(&amount.to_be_bytes());
     ev[8..16].copy_from_slice(&new_supply.to_be_bytes());
+    ev[16..24].copy_from_slice(&new_bal.to_be_bytes());
     events::emit(
         &[
             CANCELLED_TOPIC,
@@ -568,7 +591,9 @@ fn handle_transfer_from(args: &CalldataReader) -> Result<(), i32> {
 }
 
 /// Update or add a permission rule for `actionKey`.
-/// Requires a finalized, one-time-use **`SUPER`** `Authorization` HPS object fulfilling `ACTION_SUPER`.
+/// Enforces the Single-Constitution Restriction (`constitution` MUST match `associatedConstitution()`
+/// or be `([0u8; 20], POLICY_HOLDER_SELF)`) and requires a finalized, one-time-use **`SUPER`**
+/// `Authorization` HPS object fulfilling `ACTION_SUPER`.
 fn handle_set_permission(args: &CalldataReader) -> Result<(), i32> {
     let (registry, caller) = ensure_initialized_and_valid_caller()?;
     let action_key = args.bytes32(0).ok_or(-3)?;
@@ -578,9 +603,18 @@ fn handle_set_permission(args: &CalldataReader) -> Result<(), i32> {
 
     if action_key == [0u8; 32]
         || policy_id == [0u8; 32]
-        || (action_key == ACTION_SUPER && policy_id == POLICY_HOLDER_SELF)
+        || (action_key == ACTION_SUPER && (policy_id == POLICY_HOLDER_SELF || constitution == [0u8; 20]))
     {
         return Err(-12);
+    }
+
+    let pinned_con = storage::get_address(KEY_CONSTITUTION).unwrap_or([0u8; 20]);
+    if constitution == [0u8; 20] {
+        if policy_id != POLICY_HOLDER_SELF {
+            return Err(ERR_CONSTITUTION_MISMATCH);
+        }
+    } else if pinned_con != [0u8; 20] && constitution != pinned_con {
+        return Err(ERR_CONSTITUTION_MISMATCH); // AssetLedger is locked to its single Constitution HPS
     }
 
     let action_hash = compute_set_perm_hash(&action_key, &constitution, &policy_id);
@@ -645,6 +679,11 @@ fn handle_symbol(_args: &CalldataReader) -> Result<(), i32> {
 
 fn handle_identity_registry(_args: &CalldataReader) -> Result<(), i32> {
     ret::write_address(&storage::get_address(KEY_REGISTRY).unwrap_or([0u8; 20]));
+    Ok(())
+}
+
+fn handle_associated_constitution(_args: &CalldataReader) -> Result<(), i32> {
+    ret::write_address(&storage::get_address(KEY_CONSTITUTION).unwrap_or([0u8; 20]));
     Ok(())
 }
 
@@ -996,14 +1035,30 @@ mod tests {
         assert_eq!(bal_of(treasury_id), 800);
         assert_eq!(supply(), 1_550);
 
-        // 4. Rotate ACTION_ISSUE permission to `con_v2` using a SUPER authorization object!
+        // 4. Single-Constitution Restriction: attempting to associate a second Constitution (`con_v2 != con`)
+        // in `setPermission` MUST be rejected with ERR_CONSTITUTION_MISMATCH (-19)!
         let new_pol = [0x99; 32];
+        assert_eq!(
+            mock::transact_as(
+                treasury_id,
+                ledger,
+                CallEncoder::<160>::new(selector("setPermission(bytes32,address,bytes32,address)"))
+                    .push_bytes32(&ACTION_ISSUE)
+                    .push_address(&con_v2)
+                    .push_bytes32(&new_pol)
+                    .push_address(&auth_super)
+                    .as_slice(),
+            ),
+            Err(ERR_CONSTITUTION_MISMATCH)
+        );
+
+        // Rotate ACTION_ISSUE permission to `new_pol` within the single pinned `con` using a SUPER authorization object!
         let h_perm: [u8; 32] = mock::transact_as(
             treasury_id,
             ledger,
             CallEncoder::<128>::new(selector("hashSetPermission(bytes32,address,bytes32)"))
                 .push_bytes32(&ACTION_ISSUE)
-                .push_address(&con_v2)
+                .push_address(&con)
                 .push_bytes32(&new_pol)
                 .as_slice(),
         )
@@ -1026,14 +1081,14 @@ mod tests {
             ledger,
             CallEncoder::<160>::new(selector("setPermission(bytes32,address,bytes32,address)"))
                 .push_bytes32(&ACTION_ISSUE)
-                .push_address(&con_v2)
+                .push_address(&con)
                 .push_bytes32(&new_pol)
                 .push_address(&auth_super)
                 .as_slice(),
         )
         .unwrap();
 
-        // Old `con` policy for issue is now rejected; `con_v2` + `new_pol` succeeds!
+        // Old `ACTION_ISSUE` policy ID is now rejected; `(con, new_pol)` succeeds!
         let h_iss2: [u8; 32] = mock::transact_as(
             treasury_id,
             ledger,
@@ -1050,7 +1105,7 @@ mod tests {
             auth_issue_v2,
             CallEncoder::<160>::new(selector("arm(address,address,bytes32,bytes32)"))
                 .push_address(&ledger)
-                .push_address(&con_v2)
+                .push_address(&con)
                 .push_bytes32(&new_pol)
                 .push_bytes32(&h_iss2)
                 .as_slice(),
@@ -1068,5 +1123,673 @@ mod tests {
         .unwrap();
         assert_eq!(bal_of(alice_id), 200);
         assert_eq!(supply(), 1_600);
+    }
+
+    #[test]
+    fn superlexicon_singapore_pte_ltd_private_equity_cap_table_and_governance() {
+        use hps_sdk::governance::{
+            PolicySpec, StageSpec, POLICY_BOARD_RESOLUTION, POLICY_SHAREHOLDER_SUPERMAJORITY,
+            POLICY_SUPER_GOVERNANCE,
+        };
+
+        // Full in-memory Constitution + Authorization FSM dispatchers so the 49-shareholder
+        // Superlexicon Pte. Ltd. lifecycle, positive & negative tests, and event logs run in <50ms.
+        mod pe_sim {
+            use super::*;
+            use hps_sdk::abi::CalldataReader;
+            use hps_sdk::governance::{
+                oracle_policy_id, PolicySpec, StageSpec, ERR_INVALID_IDENTITY,
+                MAX_ENCODED_POLICY_BYTES,
+            };
+            use hps_sdk::storage::KeyBuilder;
+            use hps_sdk::{call, context, events, ret, selector, storage};
+
+            const STATE_UNINITIALIZED: u64 = 0;
+            const STATE_IN_PROGRESS: u64 = 1;
+            const STATE_FINALIZED: u64 = 2;
+            const STATE_CONSUMED: u64 = 3;
+            const STATE_EXPIRED: u64 = 4;
+
+            const ERR_AUTH_NOT_FINALIZED: i32 = -62;
+            const ERR_AUTH_EXPIRED: i32 = -63;
+            const ERR_AUTH_TARGET_MISMATCH: i32 = -65;
+            const ERR_AUTH_POLICY_MISMATCH: i32 = -66;
+            const ERR_AUTH_ACTION_MISMATCH: i32 = -67;
+            const ERR_AUTH_ALREADY_CONSUMED: i32 = -68;
+            const ERR_NOT_STAGE_MEMBER: i32 = -70;
+
+            pub fn con_dispatch(raw: &[u8]) -> i32 {
+                let Some((sel, args)) = CalldataReader::parse(raw) else { return -1; };
+                if sel == selector("setPolicyRaw(address,bytes32,bytes)") {
+                    let target = args.address(0).unwrap();
+                    let pol = args.bytes32(1).unwrap();
+                    let spec_bytes = args.dynamic_bytes(2).unwrap();
+                    let pk = KeyBuilder::<64>::new().push(b"pol:").push(&target).push(&pol);
+                    storage::set(pk.as_slice(), spec_bytes);
+                    return 0;
+                }
+                if sel == selector("getPolicyRaw(address,bytes32)") {
+                    let target = args.address(0).unwrap();
+                    let pol = args.bytes32(1).unwrap();
+                    let pk = KeyBuilder::<64>::new().push(b"pol:").push(&target).push(&pol);
+                    let mut buf = [0u8; MAX_ENCODED_POLICY_BYTES];
+                    if let Some(n) = storage::get_into(pk.as_slice(), &mut buf) {
+                        ret::write_abi_bytes(&buf[..n]);
+                        return 0;
+                    }
+                    let gpk = KeyBuilder::<64>::new().push(b"pol:").push(&[0u8; 20]).push(&pol);
+                    if let Some(n) = storage::get_into(gpk.as_slice(), &mut buf) {
+                        ret::write_abi_bytes(&buf[..n]);
+                        return 0;
+                    }
+                    return -62;
+                }
+                -2
+            }
+
+            pub fn fsm_auth_dispatch(raw: &[u8]) -> i32 {
+                let Some((sel, args)) = CalldataReader::parse(raw) else { return -1; };
+                if sel == selector("initialize(address,address,address,bytes32,bytes32)") {
+                    if storage::get_u64(b"state") != STATE_UNINITIALIZED {
+                        return -60; // cannot overwrite an initialized Authorization HPS
+                    }
+                    let reg = args.address(0).unwrap();
+                    let con = args.address(1).unwrap();
+                    let target = args.address(2).unwrap();
+                    let pol = args.bytes32(3).unwrap();
+                    let act_hash = args.bytes32(4).unwrap();
+                    let caller = context::msg_sender();
+                    let valid = call::call_bool(
+                        &reg,
+                        CallEncoder::<64>::new(selector("isValidIdentity(address)"))
+                            .push_address(&caller)
+                            .as_slice(),
+                    )
+                    .unwrap_or(false);
+                    if !valid {
+                        return ERR_INVALID_IDENTITY;
+                    }
+
+                    let mut spec_buf = [0u8; MAX_ENCODED_POLICY_BYTES];
+                    let spec = if con == [0u8; 20] {
+                        if pol != oracle_policy_id(&caller) {
+                            return ERR_AUTH_POLICY_MISMATCH;
+                        }
+                        PolicySpec::new(100)
+                            .add_stage(StageSpec::new(1, 100).add_member(caller, 1).unwrap())
+                            .unwrap()
+                    } else {
+                        let get_cd = CallEncoder::<96>::new(selector("getPolicyRaw(address,bytes32)"))
+                            .push_address(&target)
+                            .push_bytes32(&pol);
+                        let ret_slice = call::call_raw(&con, get_cd.as_slice()).unwrap();
+                        let len = u64::from_be_bytes(ret_slice[56..64].try_into().unwrap()) as usize;
+                        assert!(64 + len <= ret_slice.len());
+                        PolicySpec::decode(&ret_slice[64..64 + len]).unwrap()
+                    };
+                    let slen = spec.encode(&mut spec_buf).unwrap();
+                    storage::set(b"spec", &spec_buf[..slen]);
+                    storage::set_address(b"reg", &reg);
+                    storage::set_address(b"con", &con);
+                    storage::set_address(b"target", &target);
+                    storage::set(b"pol", &pol);
+                    storage::set(b"hash", &act_hash);
+                    storage::set_u64(b"state", STATE_IN_PROGRESS);
+                    storage::set_u64(b"cur_stage", 0);
+                    let now = context::block_number();
+                    storage::set_u64(b"stage_start", now);
+                    storage::set_u64(b"overall_dl", now + spec.overall_expiry_blocks);
+                    return 0;
+                }
+                if sel == selector("approve(uint64)") {
+                    let expected_stage = args.u64(0).unwrap();
+                    let reg = storage::get_address(b"reg").unwrap();
+                    let caller = context::msg_sender();
+                    let valid = call::call_bool(
+                        &reg,
+                        CallEncoder::<64>::new(selector("isValidIdentity(address)"))
+                            .push_address(&caller)
+                            .as_slice(),
+                    )
+                    .unwrap_or(false);
+                    if !valid {
+                        return ERR_INVALID_IDENTITY;
+                    }
+                    if storage::get_u64(b"state") != STATE_IN_PROGRESS {
+                        return -61;
+                    }
+                    let mut sbuf = [0u8; MAX_ENCODED_POLICY_BYTES];
+                    let slen = storage::get_into(b"spec", &mut sbuf).unwrap();
+                    let spec = PolicySpec::decode(&sbuf[..slen]).unwrap();
+                    let cur = storage::get_u64(b"cur_stage") as usize;
+                    if cur >= spec.stage_count || (cur as u64) != expected_stage {
+                        return -61;
+                    }
+                    let now = context::block_number();
+                    let st_dl = storage::get_u64(b"stage_start") + spec.stages[cur].expiry_blocks;
+                    if now > storage::get_u64(b"overall_dl") || now > st_dl {
+                        storage::set_u64(b"state", STATE_EXPIRED);
+                        return ERR_AUTH_EXPIRED;
+                    }
+                    let Some(weight) = spec.stages[cur].member_weight(&caller) else {
+                        return ERR_NOT_STAGE_MEMBER;
+                    };
+                    let sig_k = KeyBuilder::<48>::new()
+                        .push(b"sig:")
+                        .push_u64_be(cur as u64)
+                        .push(&caller);
+                    if storage::get_u64(sig_k.as_slice()) != 0 {
+                        return -69; // ERR_ALREADY_SIGNED
+                    }
+                    storage::set_u64(sig_k.as_slice(), 1);
+                    let wk = KeyBuilder::<24>::new().push(b"wt:").push_u64_be(cur as u64);
+                    let accum = storage::get_u64(wk.as_slice()) + weight;
+                    storage::set_u64(wk.as_slice(), accum);
+                    if accum >= spec.stages[cur].required_weight {
+                        storage::set_u64(b"cur_stage", (cur + 1) as u64);
+                        storage::set_u64(b"stage_start", now);
+                    }
+                    ret::write_u64_word(accum);
+                    return 0;
+                }
+                if sel == selector("finalize()") {
+                    let st = storage::get_u64(b"state");
+                    if st == STATE_FINALIZED {
+                        ret::write_bool(true);
+                        return 0;
+                    }
+                    if st != STATE_IN_PROGRESS {
+                        return ERR_AUTH_NOT_FINALIZED;
+                    }
+                    let mut sbuf = [0u8; MAX_ENCODED_POLICY_BYTES];
+                    let slen = storage::get_into(b"spec", &mut sbuf).unwrap();
+                    let spec = PolicySpec::decode(&sbuf[..slen]).unwrap();
+                    if (storage::get_u64(b"cur_stage") as usize) < spec.stage_count {
+                        return ERR_AUTH_NOT_FINALIZED;
+                    }
+                    if context::block_number() > storage::get_u64(b"overall_dl") {
+                        storage::set_u64(b"state", STATE_EXPIRED);
+                        return ERR_AUTH_EXPIRED;
+                    }
+                    storage::set_u64(b"state", STATE_FINALIZED);
+                    ret::write_bool(true);
+                    return 0;
+                }
+                if sel == selector("consume(address,bytes32,bytes32,address)") {
+                    let st = storage::get_u64(b"state");
+                    if st == STATE_CONSUMED {
+                        return ERR_AUTH_ALREADY_CONSUMED;
+                    }
+                    if st == STATE_EXPIRED || context::block_number() > storage::get_u64(b"overall_dl") {
+                        storage::set_u64(b"state", STATE_EXPIRED);
+                        return ERR_AUTH_EXPIRED;
+                    }
+                    if st != STATE_FINALIZED {
+                        return ERR_AUTH_NOT_FINALIZED;
+                    }
+                    if context::msg_sender() != storage::get_address(b"target").unwrap() {
+                        return ERR_AUTH_TARGET_MISMATCH;
+                    }
+                    if args.address(0).unwrap() != storage::get_address(b"con").unwrap()
+                        || args.bytes32(1).unwrap() != storage::get_bytes32(b"pol").unwrap()
+                    {
+                        return ERR_AUTH_POLICY_MISMATCH;
+                    }
+                    if args.bytes32(2).unwrap() != storage::get_bytes32(b"hash").unwrap() {
+                        return ERR_AUTH_ACTION_MISMATCH;
+                    }
+                    storage::set_u64(b"state", STATE_CONSUMED);
+                    events::emit(&[event_topic("AuthorizationConsumed(address,address,bytes32)")], &[]);
+                    ret::write_bool(true);
+                    return 0;
+                }
+                if sel == selector("state()") {
+                    ret::write_u64_word(storage::get_u64(b"state"));
+                    return 0;
+                }
+                -2
+            }
+
+            pub fn pe_reg_dispatch(raw: &[u8]) -> i32 {
+                let Some((sel, args)) = CalldataReader::parse(raw) else { return -1; };
+                if sel == selector("isValidIdentity(address)") {
+                    let id = args.address(0).unwrap();
+                    ret::write_bool(id != [0u8; 20] && id[0] != 0xEE);
+                    return 0;
+                }
+                if sel == selector("isValidAuthorizationHps(address)") {
+                    let au = args.address(0).unwrap();
+                    let expected = hps_sdk::mock::dispatch_code_hash(fsm_auth_dispatch);
+                    ret::write_bool(context::code_hash_of(&au) == Some(expected));
+                    return 0;
+                }
+                -2
+            }
+
+            pub fn cloned_auth_dispatch(raw: &[u8]) -> i32 {
+                let _ = raw;
+                ret::write_bool(true);
+                0
+            }
+        }
+
+        mock::reset();
+        mock::set_block_number(1_000);
+
+        let reg = [0x10; 20];
+        let slx_con = [0x20; 20];
+        let rogue_con = [0x21; 20];
+        let slx_ledger = [0x30; 20];
+        let ext_treasury_ledger = [0x31; 20];
+
+        // 2 Directors of Superlexicon Pte. Ltd.:
+        // Director 1 & Founding Shareholder #1: Manogaran Thanabalan (50,000 shares)
+        let manogaran_id = [0xA1; 20];
+        // Director 2: Evelyn Tan Wei Ling (non-shareholder independent director)
+        let evelyn_director_id = [0xA2; 20];
+        // Corporate Identity of Superlexicon Pte. Ltd. (owner of assets in `ext_treasury_ledger`)
+        let superlexicon_company_id = [0xA0; 20];
+
+        // 49 Shareholders in total:
+        // Shareholder #1 = Manogaran Thanabalan (50,000 shares)
+        // Shareholders #2..#49 = 48 minority shareholders holding the remaining 50,000 shares:
+        //   - 16 shareholders (#2..#17) hold 1,250 shares each = 20,000 shares
+        //   - 16 shareholders (#18..#33) hold 1,000 shares each = 16,000 shares
+        //   - 16 shareholders (#34..#49) hold 875 shares each   = 14,000 shares
+        //   Total across 48 other shareholders = 20,000 + 16,000 + 14,000 = 50,000 shares!
+        //   Grand total across all 49 shareholders = 100,000 shares (1:1 voting rights).
+        let mut cap_table: Vec<([u8; 20], u64)> = Vec::with_capacity(49);
+        cap_table.push((manogaran_id, 50_000));
+        for idx in 0..48usize {
+            let mut sh_id = [0xB0; 20];
+            sh_id[19] = (idx + 2) as u8;
+            let shares = if idx < 16 {
+                1_250u64
+            } else if idx < 32 {
+                1_000u64
+            } else {
+                875u64
+            };
+            cap_table.push((sh_id, shares));
+        }
+        assert_eq!(cap_table.len(), 49);
+        let total_genesis_shares: u64 = cap_table.iter().map(|(_, s)| *s).sum();
+        assert_eq!(total_genesis_shares, 100_000);
+
+        mock::register_hps(reg, pe_sim::pe_reg_dispatch);
+        mock::register_hps(slx_con, pe_sim::con_dispatch);
+        mock::register_hps(rogue_con, pe_sim::con_dispatch);
+        mock::register_hps(slx_ledger, dispatch_calldata);
+        mock::register_hps(ext_treasury_ledger, dispatch_calldata);
+
+        // Build the Singapore Pte. Ltd. Constitution policies:
+        // 1. Shareholder Super-Majority Policy (>= 75% of 100,000 = 75,000 votes, 1:1 voting weight)
+        let mut sh_stage = StageSpec::new(75_000, 50);
+        for (sh_id, shares) in &cap_table {
+            sh_stage = sh_stage.add_member(*sh_id, *shares).unwrap();
+        }
+        let sh_supermajority_spec = PolicySpec::new(100).add_stage(sh_stage).unwrap();
+        let mut sh_spec_bytes = [0u8; 2048];
+        let sh_spec_len = sh_supermajority_spec.encode(&mut sh_spec_bytes).unwrap();
+
+        // 2. Board of Directors Resolution Policy (both Directors: Manogaran + Evelyn Tan, weight 1 each, required = 2)
+        let board_stage = StageSpec::new(2, 50)
+            .add_member(manogaran_id, 1)
+            .unwrap()
+            .add_member(evelyn_director_id, 1)
+            .unwrap();
+        let board_spec = PolicySpec::new(100).add_stage(board_stage).unwrap();
+        let mut board_spec_bytes = [0u8; 512];
+        let board_spec_len = board_spec.encode(&mut board_spec_bytes).unwrap();
+
+        let store_con_policy = |target: [u8; 20], pol: [u8; 32], raw_spec: &[u8]| {
+            let mut cd = Vec::new();
+            cd.extend_from_slice(&selector("setPolicyRaw(address,bytes32,bytes)"));
+            let mut tw = [0u8; 32];
+            tw[12..32].copy_from_slice(&target);
+            cd.extend_from_slice(&tw);
+            cd.extend_from_slice(&pol);
+            let mut off = [0u8; 32];
+            off[31] = 0x60;
+            cd.extend_from_slice(&off);
+            let mut lw = [0u8; 32];
+            lw[24..32].copy_from_slice(&(raw_spec.len() as u64).to_be_bytes());
+            cd.extend_from_slice(&lw);
+            cd.extend_from_slice(raw_spec);
+            cd.resize(cd.len() + (32 - raw_spec.len() % 32) % 32, 0);
+            mock::transact_as(manogaran_id, slx_con, &cd).unwrap();
+        };
+        store_con_policy([0u8; 20], POLICY_SUPER_GOVERNANCE, &sh_spec_bytes[..sh_spec_len]);
+        store_con_policy(slx_ledger, POLICY_SHAREHOLDER_SUPERMAJORITY, &sh_spec_bytes[..sh_spec_len]);
+        store_con_policy([0u8; 20], POLICY_BOARD_RESOLUTION, &board_spec_bytes[..board_spec_len]);
+
+        // Negative Test N1: Attempting to initialize `slx_ledger` with two different Constitutions MUST revert (-19)!
+        let bad_init_cd = encode_ledger_init(
+            reg,
+            b"SLX-COMMON",
+            0,
+            &cap_table,
+            &[
+                (ACTION_SUPER, slx_con, POLICY_SUPER_GOVERNANCE),
+                (ACTION_ISSUE, rogue_con, POLICY_SHAREHOLDER_SUPERMAJORITY),
+            ],
+        );
+        assert_eq!(
+            mock::transact_as(manogaran_id, slx_ledger, &bad_init_cd),
+            Err(ERR_CONSTITUTION_MISMATCH)
+        );
+
+        // Positive Test P1: Initialize `slx_ledger` with the 49-shareholder cap table (100,000 shares)
+        // pinned exclusively to `slx_con`.
+        let init_cd = encode_ledger_init(
+            reg,
+            b"SLX-COMMON",
+            0,
+            &cap_table,
+            &[
+                (ACTION_SUPER, slx_con, POLICY_SUPER_GOVERNANCE),
+                (ACTION_ISSUE, slx_con, POLICY_SHAREHOLDER_SUPERMAJORITY),
+                (ACTION_CANCEL, slx_con, POLICY_SHAREHOLDER_SUPERMAJORITY),
+                (ACTION_TRANSFER, [0u8; 20], POLICY_HOLDER_SELF),
+                (ACTION_APPROVE, [0u8; 20], POLICY_HOLDER_SELF),
+            ],
+        );
+        mock::transact_as(manogaran_id, slx_ledger, &init_cd).unwrap();
+
+        // Verify `ConstitutionPinned` and `LedgerInitialized` events were emitted!
+        let evs = mock::events();
+        assert!(evs.iter().any(|e| e.address == slx_ledger && e.topics[0] == CONSTITUTION_PINNED));
+        assert!(evs.iter().any(|e| e.address == slx_ledger && e.topics[0] == LEDGER_INITIALIZED));
+
+        // Verify associatedConstitution() == slx_con, holderCount() == 49, totalOutstanding() == 100,000,
+        // and Manogaran's balance == 50,000 (50.00%).
+        let assoc_con_out = mock::transact_as(
+            manogaran_id,
+            slx_ledger,
+            CallEncoder::<16>::new(selector("associatedConstitution()")).as_slice(),
+        )
+        .unwrap();
+        assert_eq!(&assoc_con_out[12..32], &slx_con);
+
+        let hc_out = mock::transact_as(
+            manogaran_id,
+            slx_ledger,
+            CallEncoder::<16>::new(selector("holderCount()")).as_slice(),
+        )
+        .unwrap();
+        assert_eq!(u64::from_be_bytes(hc_out[24..32].try_into().unwrap()), 49);
+
+        let bal_of = |ledger: [u8; 20], who: [u8; 20]| -> u64 {
+            let out = mock::transact_as(
+                manogaran_id,
+                ledger,
+                CallEncoder::<64>::new(selector("balanceOf(address)"))
+                    .push_address(&who)
+                    .as_slice(),
+            )
+            .unwrap();
+            u64::from_be_bytes(out[24..32].try_into().unwrap())
+        };
+        let supply_of = |ledger: [u8; 20]| -> u64 {
+            let out = mock::transact_as(
+                manogaran_id,
+                ledger,
+                CallEncoder::<16>::new(selector("totalOutstanding()")).as_slice(),
+            )
+            .unwrap();
+            u64::from_be_bytes(out[24..32].try_into().unwrap())
+        };
+        assert_eq!(bal_of(slx_ledger, manogaran_id), 50_000);
+        assert_eq!(supply_of(slx_ledger), 100_000);
+
+        // Compute actionHash for issuing 100,000 new shares to Manogaran Thanabalan
+        // (increasing his balance from 50,000 -> 150,000 out of 200,000 total = 75.00% super-majority!)
+        let issue_amount = 100_000u64;
+        let h_issue_mano: [u8; 32] = mock::transact_as(
+            manogaran_id,
+            slx_ledger,
+            CallEncoder::<96>::new(selector("hashIssue(address,uint64)"))
+                .push_address(&manogaran_id)
+                .push_u64(issue_amount)
+                .as_slice(),
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+
+        // Deploy `auth_issue_mano` Authorization HPS and initialize it from `slx_con`
+        let auth_issue_mano = [0xD1; 20];
+        mock::register_hps(auth_issue_mano, pe_sim::fsm_auth_dispatch);
+        let init_auth_cd =
+            CallEncoder::<192>::new(selector("initialize(address,address,address,bytes32,bytes32)"))
+                .push_address(&reg)
+                .push_address(&slx_con)
+                .push_address(&slx_ledger)
+                .push_bytes32(&POLICY_SHAREHOLDER_SUPERMAJORITY)
+                .push_bytes32(&h_issue_mano);
+        mock::transact_as(manogaran_id, auth_issue_mano, init_auth_cd.as_slice()).unwrap();
+
+        // Negative Test N2: Attempting to overwrite/re-initialize `auth_issue_mano` MUST revert (-60)!
+        assert_eq!(
+            mock::transact_as(manogaran_id, auth_issue_mano, init_auth_cd.as_slice()),
+            Err(-60)
+        );
+
+        // Manogaran votes first with his 50,000 shares (50.00% < 75.00% super-majority threshold of 75,000)
+        let approve_st0 = CallEncoder::<64>::new(selector("approve(uint64)")).push_u64(0);
+        let w1 = mock::transact_as(manogaran_id, auth_issue_mano, approve_st0.as_slice()).unwrap();
+        assert_eq!(u64::from_be_bytes(w1[24..32].try_into().unwrap()), 50_000);
+
+        // Negative Test N3: Duplicate vote by Manogaran to inflate weight MUST revert (-69)!
+        assert_eq!(
+            mock::transact_as(manogaran_id, auth_issue_mano, approve_st0.as_slice()),
+            Err(-69)
+        );
+
+        // Negative Test N4: Attempting `finalize()` with only 50,000 / 75,000 votes MUST revert (-62)!
+        assert_eq!(
+            mock::transact_as(
+                manogaran_id,
+                auth_issue_mano,
+                CallEncoder::<16>::new(selector("finalize()")).as_slice(),
+            ),
+            Err(-62)
+        );
+
+        // Negative Test N5: Passing an unfinalized `auth_issue_mano` to `slx_ledger.issue` MUST revert (-62)!
+        let issue_cd = CallEncoder::<128>::new(selector("issue(address,uint64,address)"))
+            .push_address(&manogaran_id)
+            .push_u64(issue_amount)
+            .push_address(&auth_issue_mano);
+        assert_eq!(
+            mock::transact_as(manogaran_id, slx_ledger, issue_cd.as_slice()),
+            Err(-62)
+        );
+
+        // Negative Test N6: Passing an arbitrary finalized Authorization (e.g. a 2-of-2 Board Resolution
+        // instead of Shareholder Super-Majority, or wrong action hash, or unapproved clone) MUST revert!
+        let auth_board_wrong_pol = [0xD2; 20];
+        mock::register_hps(auth_board_wrong_pol, pe_sim::fsm_auth_dispatch);
+        mock::transact_as(
+            manogaran_id,
+            auth_board_wrong_pol,
+            CallEncoder::<192>::new(selector("initialize(address,address,address,bytes32,bytes32)"))
+                .push_address(&reg)
+                .push_address(&slx_con)
+                .push_address(&slx_ledger)
+                .push_bytes32(&POLICY_BOARD_RESOLUTION)
+                .push_bytes32(&h_issue_mano)
+                .as_slice(),
+        )
+        .unwrap();
+        mock::transact_as(manogaran_id, auth_board_wrong_pol, approve_st0.as_slice()).unwrap();
+        mock::transact_as(evelyn_director_id, auth_board_wrong_pol, approve_st0.as_slice()).unwrap();
+        mock::transact_as(
+            manogaran_id,
+            auth_board_wrong_pol,
+            CallEncoder::<16>::new(selector("finalize()")).as_slice(),
+        )
+        .unwrap();
+        assert_eq!(
+            mock::transact_as(
+                manogaran_id,
+                slx_ledger,
+                CallEncoder::<128>::new(selector("issue(address,uint64,address)"))
+                    .push_address(&manogaran_id)
+                    .push_u64(issue_amount)
+                    .push_address(&auth_board_wrong_pol)
+                    .as_slice(),
+            ),
+            Err(-66) // ERR_AUTH_POLICY_MISMATCH: Board resolution cannot authorize Share Issuance!
+        );
+
+        // Negative Test N7: Passing a maliciously cloned Authorization HPS with unapproved bytecode hash MUST revert (-73)!
+        let auth_malicious_clone = [0xD3; 20];
+        mock::register_hps(auth_malicious_clone, pe_sim::cloned_auth_dispatch);
+        assert_eq!(
+            mock::transact_as(
+                manogaran_id,
+                slx_ledger,
+                CallEncoder::<128>::new(selector("issue(address,uint64,address)"))
+                    .push_address(&manogaran_id)
+                    .push_u64(issue_amount)
+                    .push_address(&auth_malicious_clone)
+                    .as_slice(),
+            ),
+            Err(hps_sdk::governance::ERR_UNAPPROVED_CODE_HASH)
+        );
+
+        // Now accumulate >= 25,000 more shareholder votes from Shareholders #2..#22
+        // (16 * 1,250 + 5 * 1,000 = 20,000 + 5,000 = 25,000 votes)
+        // so cumulative weight reaches exactly 75,000 (75.00% Super-Majority)!
+        let mut running_weight = 50_000u64;
+        for (sh_id, sh_votes) in cap_table.iter().skip(1).take(21) {
+            let out = mock::transact_as(*sh_id, auth_issue_mano, approve_st0.as_slice()).unwrap();
+            running_weight += *sh_votes;
+            assert_eq!(u64::from_be_bytes(out[24..32].try_into().unwrap()), running_weight);
+        }
+        assert_eq!(running_weight, 75_000);
+
+        // Negative Test N8: Even after 75,000 votes are accumulated, passing `auth_issue_mano` BEFORE
+        // calling `finalize()` MUST still revert (-62)!
+        assert_eq!(
+            mock::transact_as(manogaran_id, slx_ledger, issue_cd.as_slice()),
+            Err(-62)
+        );
+
+        // Positive Test P2: Finalize `auth_issue_mano` and invoke `slx_ledger.issue(manogaran_id, 100_000, auth_issue_mano)`
+        mock::transact_as(
+            manogaran_id,
+            auth_issue_mano,
+            CallEncoder::<16>::new(selector("finalize()")).as_slice(),
+        )
+        .unwrap();
+        mock::transact_as(manogaran_id, slx_ledger, issue_cd.as_slice()).unwrap();
+
+        // Verify Manogaran Thanabalan now owns 150,000 / 200,000 shares = 75.00% Super-Majority!
+        assert_eq!(bal_of(slx_ledger, manogaran_id), 150_000);
+        assert_eq!(supply_of(slx_ledger), 200_000);
+        assert_eq!(bal_of(slx_ledger, manogaran_id) * 100 / supply_of(slx_ledger), 75);
+
+        // Verify `Issued` event was emitted with `to = manogaran_id`, `auth = auth_issue_mano`,
+        // `amount = 100,000`, `new_balance = 150,000`, `new_supply = 200,000`.
+        let issued_ev = mock::events()
+            .into_iter()
+            .find(|e| e.address == slx_ledger && e.topics[0] == ISSUED_TOPIC)
+            .expect("Issued event must be emitted");
+        assert_eq!(&issued_ev.topics[1][12..32], &manogaran_id);
+        assert_eq!(&issued_ev.topics[2][12..32], &auth_issue_mano);
+        assert_eq!(u64::from_be_bytes(issued_ev.data[0..8].try_into().unwrap()), 100_000);
+        assert_eq!(u64::from_be_bytes(issued_ev.data[8..16].try_into().unwrap()), 200_000);
+        assert_eq!(u64::from_be_bytes(issued_ev.data[16..24].try_into().unwrap()), 150_000);
+
+        // Negative Test N9: Re-passing the already-consumed `auth_issue_mano` for a duplicate `issue` call MUST revert (-68)!
+        assert_eq!(
+            mock::transact_as(manogaran_id, slx_ledger, issue_cd.as_slice()),
+            Err(-68)
+        );
+        assert_eq!(bal_of(slx_ledger, manogaran_id), 150_000);
+        assert_eq!(supply_of(slx_ledger), 200_000);
+
+        // Positive Test P3: Board of Directors Resolution (Manogaran + Evelyn Tan, 2-of-2 Directors)
+        // authorizing a `transfer` in another AssetLedger (`ext_treasury_ledger`) where Superlexicon's
+        // corporate identity (`superlexicon_company_id`) is the owner of the assets!
+        let ext_init_cd = encode_ledger_init(
+            reg,
+            b"USD-TREASURY",
+            2,
+            &[(superlexicon_company_id, 250_000)],
+            &[
+                (ACTION_SUPER, slx_con, POLICY_SUPER_GOVERNANCE),
+                (ACTION_ISSUE, slx_con, POLICY_SHAREHOLDER_SUPERMAJORITY),
+                (ACTION_CANCEL, slx_con, POLICY_SHAREHOLDER_SUPERMAJORITY),
+                (ACTION_TRANSFER, slx_con, POLICY_BOARD_RESOLUTION),
+                (ACTION_APPROVE, slx_con, POLICY_BOARD_RESOLUTION),
+            ],
+        );
+        mock::transact_as(superlexicon_company_id, ext_treasury_ledger, &ext_init_cd).unwrap();
+        assert_eq!(bal_of(ext_treasury_ledger, superlexicon_company_id), 250_000);
+
+        let recipient_sh = cap_table[1].0;
+        let h_board_tf: [u8; 32] = mock::transact_as(
+            superlexicon_company_id,
+            ext_treasury_ledger,
+            CallEncoder::<128>::new(selector("hashTransfer(address,address,uint64)"))
+                .push_address(&superlexicon_company_id)
+                .push_address(&recipient_sh)
+                .push_u64(50_000)
+                .as_slice(),
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+
+        let auth_board_tf = [0xD4; 20];
+        mock::register_hps(auth_board_tf, pe_sim::fsm_auth_dispatch);
+        mock::transact_as(
+            manogaran_id,
+            auth_board_tf,
+            CallEncoder::<192>::new(selector("initialize(address,address,address,bytes32,bytes32)"))
+                .push_address(&reg)
+                .push_address(&slx_con)
+                .push_address(&ext_treasury_ledger)
+                .push_bytes32(&POLICY_BOARD_RESOLUTION)
+                .push_bytes32(&h_board_tf)
+                .as_slice(),
+        )
+        .unwrap();
+
+        // Director 1 (Manogaran) approves -> 1 of 2 directors
+        mock::transact_as(manogaran_id, auth_board_tf, approve_st0.as_slice()).unwrap();
+        // Negative Test N10: 1-of-2 director alone cannot finalize a 2-of-2 Board Resolution!
+        assert_eq!(
+            mock::transact_as(
+                manogaran_id,
+                auth_board_tf,
+                CallEncoder::<16>::new(selector("finalize()")).as_slice(),
+            ),
+            Err(-62)
+        );
+        // Director 2 (Evelyn Tan) approves -> 2 of 2 directors -> finalize -> company identity executes transfer!
+        mock::transact_as(evelyn_director_id, auth_board_tf, approve_st0.as_slice()).unwrap();
+        mock::transact_as(
+            manogaran_id,
+            auth_board_tf,
+            CallEncoder::<16>::new(selector("finalize()")).as_slice(),
+        )
+        .unwrap();
+        mock::transact_as(
+            superlexicon_company_id,
+            ext_treasury_ledger,
+            CallEncoder::<160>::new(selector("transfer(address,address,uint64,address)"))
+                .push_address(&superlexicon_company_id)
+                .push_address(&recipient_sh)
+                .push_u64(50_000)
+                .push_address(&auth_board_tf)
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(bal_of(ext_treasury_ledger, superlexicon_company_id), 200_000);
+        assert_eq!(bal_of(ext_treasury_ledger, recipient_sh), 50_000);
     }
 }

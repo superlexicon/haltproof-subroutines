@@ -488,6 +488,35 @@ impl HpsClient {
         self.wait_for_receipt(&tx_hash).await
     }
 
+    /// Pipeline multiple stateful HPS invocations from `signer` (using sequential nonces)
+    /// and await all receipts in order.
+    pub async fn send_call_batch(
+        &self,
+        signer: &HpsSigner,
+        calls: &[(H160, Vec<u8>, Vec<H160>)],
+    ) -> Result<Vec<TxOutcome>> {
+        if calls.is_empty() {
+            return Ok(Vec::new());
+        }
+        let base_nonce = self.get_nonce(signer.address()).await?;
+        let mut tx_hashes = Vec::with_capacity(calls.len());
+        for (idx, (hps, calldata, extra_targets)) in calls.iter().enumerate() {
+            let raw_tx = signer.build_call_tx_with_targets(
+                base_nonce + idx as u64,
+                *hps,
+                calldata,
+                extra_targets,
+            )?;
+            let tx_hash = self.send_raw_transaction(&raw_tx).await?;
+            tx_hashes.push(tx_hash);
+        }
+        let mut outcomes = Vec::with_capacity(calls.len());
+        for tx_hash in tx_hashes {
+            outcomes.push(self.wait_for_receipt(&tx_hash).await?);
+        }
+        Ok(outcomes)
+    }
+
     /// Execute a read-only `eth_call` against committed HPS state (consumes 0 blocks / 0 txns).
     pub async fn read_call(
         &self,

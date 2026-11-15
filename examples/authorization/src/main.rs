@@ -42,6 +42,8 @@ const AUTH_INITIALIZED: [u8; 32] =
     event_topic("AuthorizationInitialized(address,address,bytes32,bytes32)");
 const STAGE_APPROVED: [u8; 32] =
     event_topic("StageApproved(address,uint64,uint64,uint64)");
+const STAGE_THRESHOLD_REACHED: [u8; 32] =
+    event_topic("StageThresholdReached(uint64,uint64,uint64)");
 const STAGE_ADVANCED: [u8; 32] = event_topic("StageAdvanced(uint64,uint64)");
 const AUTH_FINALIZED: [u8; 32] = event_topic("AuthorizationFinalized(address,uint64)");
 const AUTH_CONSUMED: [u8; 32] = event_topic("AuthorizationConsumed(address,address,bytes32)");
@@ -133,6 +135,10 @@ fn setup_instance(
     storage::set_u64(KEY_OVERALL_DEADLINE, overall_dl);
     storage::set_u64(KEY_STATE, STATE_PENDING);
 
+    let mut init_ev = [0u8; 36];
+    init_ev[0..20].copy_from_slice(constitution);
+    init_ev[20..28].copy_from_slice(&spec.stages[0].required_weight.to_be_bytes());
+    init_ev[28..36].copy_from_slice(&(spec.stage_count as u64).to_be_bytes());
     events::emit(
         &[
             AUTH_INITIALIZED,
@@ -140,7 +146,7 @@ fn setup_instance(
             *policy_id,
             *action_hash,
         ],
-        constitution,
+        &init_ev,
     );
     Ok(())
 }
@@ -293,6 +299,12 @@ fn execute_approve_step() -> Result<[u8; 20], i32> {
     events::emit(&[STAGE_APPROVED, addr_topic(&caller)], &ev);
 
     if accum >= stage.required_weight {
+        let mut thr = [0u8; 24];
+        thr[0..8].copy_from_slice(&(cur_stage as u64).to_be_bytes());
+        thr[8..16].copy_from_slice(&accum.to_be_bytes());
+        thr[16..24].copy_from_slice(&stage.required_weight.to_be_bytes());
+        events::emit(&[STAGE_THRESHOLD_REACHED], &thr);
+
         if cur_stage + 1 < spec.stage_count {
             let next_stage = cur_stage + 1;
             let next_dl = now.saturating_add(spec.stages[next_stage].expiry_blocks);
