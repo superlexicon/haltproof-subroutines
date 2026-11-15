@@ -10,59 +10,58 @@ Zero C++/RocksDB dependencies are required to build Haltproof Subroutines or run
 
 | Path | Description |
 | :--- | :--- |
-| `crates/hps-sdk/` | `#![no_std]` guest Rust SDK for `wasm32-unknown-unknown` Haltproof Subroutines. Wraps persistent state (`storage`), execution context (`context::msg_sender`, `context::self_address`, `context::block_number`), synchronous cross-HPS calls (`call`), ABI calldata decoding/encoding (`abi`, `call::CallEncoder`), structured return payloads (`ret`), event logs (`events`), compile-time `selector()` / `event_topic()`, `hps_entry!`, and a multi-HPS native `mock` host so `cargo test` runs in milliseconds. |
-| `crates/hps-client/` | Pure-Rust client library implementing Lexicon's 10-field EIP-155 RLP transaction signing (including multi-HPS `target_addresses`), 1-call 2-step WASM deployment (`deploy_hps`), human-readable ABI call encoding, `read_call` (`eth_call`) queries, and cross-subnet `subnet_sendTransaction`. |
+| `crates/hps-sdk/` | `#![no_std]` guest Rust SDK for `wasm32-unknown-unknown` Haltproof Subroutines. Wraps persistent state (`storage`), execution context (`context::msg_sender`, `context::self_address`, `context::block_number`), synchronous cross-HPS calls (`call`), institutional governance & sequential/weighted policy codecs (`governance`), ABI calldata decoding/encoding (`abi`, `call::CallEncoder`), structured return payloads (`ret`), event logs (`events`), compile-time `selector()` / `event_topic()`, `hps_entry!`, and a multi-HPS native `mock` host so `cargo test` runs in milliseconds. |
+| `crates/hps-client/` | Pure-Rust client library implementing Lexicon's 10-field EIP-155 RLP transaction signing (including multi-HPS `target_addresses`), 1-call 2-step WASM deployment (`deploy_hps`), content-addressed `store_bytecode` + pipelined `instantiate_batch`, human-readable ABI call encoding, `read_call` (`eth_call`) queries, and cross-subnet `subnet_sendTransaction`. |
 | `crates/cargo-hps/` | Developer CLI (`cargo hps` / `cargo-hps`): scaffolds new Haltproof Subroutines (`new`), compiles & strips WASM zero-data segments (`build`), deploys in 1 command (`deploy`), submits stateful single- or multi-HPS invocations (`send` / `--touch`), executes instant read queries (`call`), and manages keys (`keygen`). |
 | `examples/counter-registry/` | Starter reference HPS (`4.7 KB` WASM) demonstrating counters, dynamic string storage, indexed events, read calls, and native unit tests. |
-| `examples/messaging/` | High-TPS channel messaging HPS (`4.4 KB` WASM) 100% ABI-, storage-key-, event-, and wire-compatible with Lexicon's maximum-TPS benchmark (`postMessage(bytes32,bytes)`, `getMessages(bytes32,uint64)`, `MessagePosted` event). |
-| `examples/asset-ledger/` | Fungible Asset Ledger HPS (`6.9 KB` WASM) tracking balances (`balanceOf`, `mint`, `transfer`) and debit allowances (`approve`, `allowance`, `transferFrom`) across EOA and Identity HPS holders. |
-| `examples/identity/` | On-chain Identity HPS (`9.3 KB` WASM) whose 20-byte HPS address holds asset balances in `asset-ledger` instances and executes owner-/delegate-authorized actions (`approveAsset`, `transferAsset`, `execute`). |
-| `examples/asset-pair-otc/` | `AssetPair_OTC` HPS (`14.0 KB` WASM) pairing a Base Asset Ledger and a Quote Asset Ledger: lets the contract owner place item ask/sell orders (`placeAskOrder`) and lets buyers fill orders at the prevailing price (`buyOrderWithIdentity` / `buyOrder`) via atomic dual-ledger `transferFrom` settlement after authorizing debit of their Quote Asset balance. |
+| `examples/messaging/` | High-TPS channel messaging HPS (`4.5 KB` WASM) 100% ABI-, storage-key-, event-, and wire-compatible with Lexicon's maximum-TPS benchmark (`postMessage(bytes32,bytes)`, `getMessages(bytes32,uint64)`). |
+| `examples/identity/` | On-chain Identity HPS (`16.3 KB` WASM) controlled by an EOA owner + optional delegates. All state-changing interactions with `IdentityRegistry`, `Constitution`, `Authorization`, `AssetLedger`, and `AssetPair_OTC` flow through verified `Identity` HPS instances (`execute`, `initConstitutionAuth`, `initOracleAuth`, `approveAuth`, `approveAndFinalizeAuth`, `issueAsset`, `cancelAsset`, `transferAsset`, `approveAsset`). |
+| `examples/identity-registry/` | Verified Identity Register HPS (`14.7 KB` WASM) tracking active/suspended/revoked `Identity` HPS addresses (`isValidIdentity`, `registerIdentity`, `suspendIdentity`, `reinstateIdentity`, `revokeIdentity`, `rotateAdmin`, `setGovernancePolicy`), gated by one-time `Authorization` objects (starting with a single-account admin/oracle policy and upgradable to a `Constitution` policy). |
+| `examples/constitution/` | Institutional Bylaws & Policy Registry HPS (`14.2 KB` WASM) storing sequential + weighted + block-expiry `PolicySpec` definitions (`getPolicyRaw`, `setPolicy`, `deactivatePolicy`), gated by `POLICY_SUPER_GOVERNANCE` one-time `Authorization` objects. |
+| `examples/authorization/` | Per-Invocation Process & One-Time Authorization HPS (`18.9 KB` WASM) initialized per protected action (`initializeFromConstitution`, `initializeOracle`, `initializeCustom`), enforcing strict sequential stage ordering (`Stage 0 -> Stage 1 -> ...`), per-authorizer integer weights (`>= 1`), per-stage & overall block-height expiry (`context::block_number()`), explicit finalization, and target-only single-use consumption (`consume`). |
+| `examples/asset-ledger/` | Institutional Fungible Asset Ledger HPS (`23.2 KB` WASM) enforcing verified `Identity` ownership (`IdentityRegistry`), process-driven permissions (`ACTION_ISSUE`, `ACTION_CANCEL`, `ACTION_TRANSFER`, `ACTION_APPROVE`, `ACTION_SUPER`), unexported private `internal_debit`/`internal_credit` primitives, one-time `Authorization` consumption on every public state mutation (`issue`, `cancel`, `transfer`, `approve`, `setPermission`), genesis allocations + permissions setup, and `SUPER`-gated permission rotation. |
+| `examples/asset-pair-otc/` | `AssetPair_OTC` HPS (`13.8 KB` WASM) pairing a Base `AssetLedger` and Quote `AssetLedger` with `IdentityRegistry` verification: lets the verified seller `Identity` list ask orders (`placeAskOrder`) and lets verified buyer `Identity` accounts execute atomic Delivery-vs-Payment trades (`buyOrder`) via dual-ledger `transferFrom`. |
 | `ts-client/` | JavaScript / TypeScript client helper (`hps.mjs` + `hps.d.ts`) implementing Lexicon's 10-field RLP transaction signing (`extraTargets` supported) and 2-step WASM HPS deployment for web & SuperLexicon frontends. |
-| [`docs/END_TO_END_GUIDE.md`](docs/END_TO_END_GUIDE.md) | Step-by-step **End-to-End Haltproof Subroutine (HPS) & App Developer Guide**, including full CLI walkthroughs for single- and multi-HPS (`Identity` + `AssetLedger` + `AssetPair_OTC`) workflows. |
+| [`docs/END_TO_END_GUIDE.md`](docs/END_TO_END_GUIDE.md) | Step-by-step **End-to-End Haltproof Subroutine (HPS) & Institutional Governance Guide**, including architecture diagrams and full workflows. |
 
 ---
 
-## Sample Haltproof Subroutines Overview
+## Institutional Governance & Asset Ledger Architecture
 
-### 1. High-TPS Messaging (`examples/messaging`)
-The exact channel-indexed, per-block-grouped messaging subroutine used to benchmark Lexicon's maximum transaction throughput:
-- `postMessage(bytes32 channelHash, bytes message)` (`0x482f63b0`) — appends `[sender(20) || message]` to `(channelHash, blockNumber)` and emits `MessagePosted(bytes32,uint64,address,bytes)`.
-- `getMessages(bytes32 channelHash, uint64 blockNumber)` (`0xa8c9582d`) — returns `[u64 LE count][sender(20) || u64 LE len || bytes]*`.
+Conventional smart contracts rely on flat RBAC (`users / groups / permissions`), which cannot express **joint weighted approvals** alongside **strict sequential multi-party authorization processes** (for example: *an officer from Group A must authorize Stage 0 within 20 blocks first; then and only then can Group B signers with cumulative weight >= 3 authorize Stage 1 within 20 blocks*).
 
-### 2. Asset Ledger (`examples/asset-ledger`)
-Tracks balances and delegated debit allowances for any fungible asset (e.g., `GOLD`, `USD`, points, or inventory units):
-- `initialize(address issuer, string symbol, uint64 decimals)`
-- `mint(address to, uint64 amount)` (issuer-only)
-- `transfer(address to, uint64 amount)`
-- `approve(address spender, uint64 amount)` & `transferFrom(address from, address to, uint64 amount)`
-- `balanceOf(address holder)`, `allowance(address owner, address spender)`, `totalSupply()`, `symbol()`, `decimals()`, `issuer()`
+`haltproof-subroutines` solves this cleanly across five composable Haltproof Subroutines:
 
-### 3. Identity (`examples/identity`)
-Programmable on-chain identity / vault whose own 20-byte HPS address holds balances inside `AssetLedger` subroutines:
-- `initialize(address owner, string label)`
-- `setDelegate(address delegate, bool enabled)` & `transferOwnership(address newOwner)`
-- `approveAsset(address ledger, address spender, uint64 amount)` — cross-HPS calls `ledger.approve(spender, amount)` with `msg.sender = Identity`
-- `transferAsset(address ledger, address to, uint64 amount)` — cross-HPS calls `ledger.transfer(to, amount)` with `msg.sender = Identity`
-- `execute(address target, bytes data)` — general owner/delegate call forwarding
-- `isAuthorized(address account)`, `owner()`, `label()`, `nonce()`
+1. **Identity-First Execution (`Identity` + `IdentityRegistry`)**:
+   - Every participant operates through an `Identity` HPS (`examples/identity`) registered in `IdentityRegistry` (`examples/identity-registry`).
+   - State-changing functions across `AssetLedger`, `Authorization`, `Constitution`, `AssetPair_OTC`, and `IdentityRegistry` verify `IdentityRegistry.isValidIdentity(caller)` (and any subject/recipient `Identity`) live on-chain.
+   - `IdentityRegistry` lifecycle transitions (`registerIdentity`, `suspendIdentity`, `reinstateIdentity`, `revokeIdentity`, `rotateAdmin`, `setGovernancePolicy`) themselves consume a valid one-time `Authorization` object (initialized out of the box with a 1-of-1 admin/oracle policy).
 
-### 4. AssetPair OTC (`examples/asset-pair-otc`)
-Atomic Over-The-Counter ask-book & settlement subroutine pairing a **Base Asset Ledger** and a **Quote Asset Ledger**:
-1. **Pair Ledgers**: `initialize(address owner, address sellerIdentity, address baseLedger, address quoteLedger)`
-2. **Place Ask Orders**: `placeAskOrder(bytes32 itemId, uint64 baseQuantity, uint64 unitPriceQuote)` (owner or `sellerIdentity` controller) — lists `baseQuantity` units of Base Asset for `itemId` at `unitPriceQuote` Quote units per Base unit (verifying `sellerIdentity` balance & allowance on `baseLedger`). Also supports `updateAskPrice` and `cancelAskOrder`.
-3. **Authorize & Buy at Prevailing Price**:
-   - Buyer first authorizes debit of `quoteCost = baseQuantity * unitPriceQuote` on `quoteLedger` via `BuyerIdentity.approveAsset(quoteLedger, otcAddress, quoteCost)`.
-   - Buyer calls `buyOrderWithIdentity(bytes32 itemId, address buyerIdentity, uint64 baseQuantity)` (or `buyOrder(bytes32,uint64)` when invoked via `BuyerIdentity.execute` or direct EOA).
-   - `AssetPair_OTC` verifies caller authorization on `BuyerIdentity`, then **atomically** debits `quoteCost` from `BuyerIdentity` -> credits `sellerIdentity` in `quoteLedger` **and** debits `baseQuantity` from `sellerIdentity` -> credits `BuyerIdentity` in `baseLedger`. Any insufficient allowance or balance reverts the entire transaction cleanly.
+2. **Bylaws & Sequential-Weighted Policies (`Constitution`)**:
+   - `Constitution` (`examples/constitution`) maps `(targetHps, policyId)` (with global fallback `targetHps = 0x00..00`) to a binary `PolicySpec`:
+     - `overall_expiry_blocks`: hard block window from initialization to finalization + consumption.
+     - `stages[0..N]`: ordered `StageSpec` entries, each specifying `required_weight`, `expiry_blocks`, and `members: [(identity, weight)]`.
+   - Initialized with genesis policies including `POLICY_SUPER_GOVERNANCE`; subsequent bylaw changes (`setPolicy`, `deactivatePolicy`) require a finalized `SUPER_GOVERNANCE` one-time `Authorization` object.
+
+3. **Stateful Per-Call Process & One-Time Token (`Authorization`)**:
+   - Instantiated and initialized per protected operation (`initializeFromConstitution` or `initializeOracle`), binding `(targetHps, policyId, actionHash, constitutionHps)`.
+   - `approve()` / `approveAndFinalize()` verify the caller `Identity` is active in `IdentityRegistry`, belongs to the **currently active stage**, has not approved that stage yet, and is within both the current stage's `stage_deadline` and `overall_deadline`. Out-of-turn approvals from later stages revert deterministically.
+   - Once all stages meet their `required_weight` and `finalize()` is reached, only `targetHps` can call `consume(expectedTarget, expectedConstitution, expectedPolicyId, expectedActionHash)` — atomically transitioning status from `FINALIZED (2)` to `CONSUMED (4)` so the object can **never** be replayed.
+
+4. **Institutional `AssetLedger` (`examples/asset-ledger`)**:
+   - **Verified Ownership Map**: Maps active `Identity` HPS addresses to `u64` balances (`totalOutstanding` invariant preserved).
+   - **Private `internal_credit` / `internal_debit`**: Unexported Rust functions invoked exclusively by public entrypoints:
+     - `issue(toIdentity, amount, authHps)` -> `internal_credit` (`+totalOutstanding`)
+     - `cancel(fromIdentity, amount, authHps)` -> `internal_debit` (`-totalOutstanding`)
+     - `transfer(toIdentity, amount, authHps)` -> `internal_debit(caller)` + `internal_credit(to)`
+     - `transferFrom(fromIdentity, toIdentity, amount)` -> allowance check + `internal_debit(from)` + `internal_credit(to)` (where `approve(spender, amount, authHps)` consumed a one-time `Authorization`)
+   - **Genesis State & `SUPER` Rotation**: `initialize(...)` loads initial verified balances + complete action permissions (`ACTION_SUPER`, `ACTION_ISSUE`, `ACTION_CANCEL`, `ACTION_TRANSFER`, `ACTION_APPROVE`, including dynamic `POLICY_HOLDER_SELF` for holder-authorized transfers/allowances). Updating any permission via `setPermission(...)` requires a `SUPER` one-time `Authorization` object.
 
 ---
 
-## 60-Second Quickstart
+## Quickstart
 
 ### 1. Prerequisites
-
-Install the prebuilt [`lexicon-node`](https://github.com/superlexicon/lexicon-bin) binary and the `cargo hps` CLI:
 
 ```bash
 # Install lexicon-node -> ~/.local/bin/lexicon-node
@@ -74,47 +73,30 @@ rustup target add wasm32-unknown-unknown
 cargo install --path crates/cargo-hps
 ```
 
-### 2. Run All Native Unit Tests (Single & Multi-HPS Simulator)
+### 2. Run All Native Unit Tests (Milliseconds, Zero External Dependencies)
 
 ```bash
 cargo test --workspace
 ```
 
-### 3. Build All 5 Reference Haltproof Subroutines
+### 3. Build All 8 Reference Haltproof Subroutines
 
 ```bash
-cargo hps build -p counter-registry
-cargo hps build -p messaging
-cargo hps build -p asset-ledger
-cargo hps build -p identity
-cargo hps build -p asset-pair-otc
+for pkg in counter-registry messaging identity-registry identity constitution authorization asset-ledger asset-pair-otc; do
+  cargo hps build -p "$pkg"
+done
 ```
 
-### 4. Start a 1-Node Local Testnet & Deploy
+### 4. Run Full Live Wasmtime End-to-End Governance + Ledger + OTC Suite
 
-In Terminal 1:
-
-```bash
-lexicon-node --localtestnet
-```
-
-In Terminal 2:
+With `lexicon-node` installed, run the automated live chain test (spawns an isolated `lexicon-node --localtestnet` on port `18555` and exercises all 8 subroutines, out-of-order rejection, block expiry, replay rejection, `SUPER` governance rotation, and atomic OTC settlement):
 
 ```bash
-cargo hps deploy dist/messaging.wasm --save msg.json
-MSG=$(jq -r .hps_address msg.json)
-
-# Post a message to channel keccak256("alpha") and read it back
-cargo hps send "$MSG" "postMessage(bytes32,bytes)" "keccak:alpha" "0x48656c6c6f"
+cargo test -p hps-client --test live_governance_e2e -- --ignored --nocapture
 ```
 
 ---
 
 ## Full End-to-End Developer Guide
 
-See **[`docs/END_TO_END_GUIDE.md`](docs/END_TO_END_GUIDE.md)** for the complete walkthrough covering:
-1. Authoring single- and multi-contract Haltproof Subroutines with `hps-sdk` (`storage`, `context`, `call`, `events`, `ret`)
-2. Step-by-step live deployment & settlement walkthrough for **`Identity` + Dual `AssetLedger` + `AssetPair_OTC`**
-3. How `cargo hps build` optimizes WASM bytecode (`4–14 KB`) for low-bandwidth radio subnets
-4. Connecting a Rust backend (`hps-client`) or Web/TypeScript frontend (`ts-client/hps.mjs` + WebSocket `logs`)
-5. Moving from `--localtestnet` to a multi-node Semtech LR2021 FLRC radio subnet
+See **[`docs/END_TO_END_GUIDE.md`](docs/END_TO_END_GUIDE.md)** for the complete architectural reference, `PolicySpec` wire format, action-hash formulas, and Rust/CLI/TypeScript integration guide.

@@ -1,21 +1,12 @@
 //! On-Chain Identity **Haltproof Subroutine (HPS)** built with `hps-sdk`.
 //!
-//! Each deployed `identity` instance represents a persistent on-chain participant whose own
-//! 20-byte HPS address (`context::self_address()`) holds balances in `asset-ledger` contracts
-//! and executes authorized cross-HPS calls (such as approving quote-asset debits and settling
-//! OTC trades in `asset-pair-otc`).
+//! All state-changing interactions with `IdentityRegistry`, `Constitution`, `Authorization`,
+//! `AssetLedger`, and `AssetPair_OTC` occur through a verified `Identity` HPS instance so
+//! `context::msg_sender()` inside those target subroutines is always the calling Identity's
+//! 20-byte HPS address (`context::self_address()`).
 //!
-//! Supported ABI methods:
-//! - `initialize(address owner, string handle)`
-//! - `setDelegate(address delegate, bool allowed)`
-//! - `transferOwnership(address newOwner)`
-//! - `approveAsset(address ledger, address spender, uint64 amount)`
-//! - `transferAsset(address ledger, address toIdentity, uint64 amount)`
-//! - `execute(address targetHps, bytes callData)`
-//! - `owner()` -> `address`
-//! - `isAuthorized(address actor)` -> `bool`
-//! - `handle()` -> `string`
-//! - `balanceIn(address ledger)` -> `uint256`
+//! Provides both general-purpose `execute(address targetHps, bytes callData)` forwarding and
+//! ergonomic typed entrypoints for authorization workflows and asset ledger operations.
 
 #![cfg_attr(target_arch = "wasm32", no_std)]
 #![cfg_attr(target_arch = "wasm32", no_main)]
@@ -28,22 +19,31 @@ use hps_sdk::{context, event_topic, events, hps_entry, ret, selector, storage};
 const IDENTITY_INITIALIZED: [u8; 32] = event_topic("IdentityInitialized(address,string)");
 const DELEGATE_UPDATED: [u8; 32] = event_topic("DelegateUpdated(address,bool)");
 const EXECUTED_CALL: [u8; 32] = event_topic("Executed(address,bytes4)");
+const AUTH_SIGNED: [u8; 32] = event_topic("AuthorizationSigned(address,uint64)");
 
 const KEY_INIT: &[u8] = b"id:init";
 const KEY_OWNER: &[u8] = b"id:owner";
 const KEY_HANDLE: &[u8] = b"id:handle";
 
 hps_entry! {
-    "initialize(address,string)"               => handle_initialize,
-    "setDelegate(address,bool)"                => handle_set_delegate,
-    "transferOwnership(address)"               => handle_transfer_ownership,
-    "approveAsset(address,address,uint64)"     => handle_approve_asset,
-    "transferAsset(address,address,uint64)"    => handle_transfer_asset,
-    "execute(address,bytes)"                   => handle_execute,
-    "owner()"                                  => handle_owner,
-    "isAuthorized(address)"                    => handle_is_authorized,
-    "handle()"                                 => handle_handle,
-    "balanceIn(address)"                       => handle_balance_in,
+    "initialize(address,string)"                                                      => handle_initialize,
+    "setDelegate(address,bool)"                                                       => handle_set_delegate,
+    "transferOwnership(address)"                                                      => handle_transfer_ownership,
+    "execute(address,bytes)"                                                          => handle_execute,
+    "initConstitutionAuth(address,address,address,address,bytes32,bytes32)"           => handle_init_constitution_auth,
+    "initOracleAuth(address,address,address,address,bytes32,uint64)"                  => handle_init_oracle_auth,
+    "approveAuth(address)"                                                            => handle_approve_auth,
+    "approveAndFinalizeAuth(address)"                                                 => handle_approve_and_finalize_auth,
+    "finalizeAuth(address)"                                                           => handle_finalize_auth,
+    "issueAsset(address,address,uint64,address)"                                      => handle_issue_asset,
+    "cancelAsset(address,address,uint64,address)"                                     => handle_cancel_asset,
+    "transferAsset(address,address,address,uint64,address)"                           => handle_transfer_asset,
+    "approveAsset(address,address,uint64,address)"                                    => handle_approve_asset,
+    "owner()"                                                                         => handle_owner,
+    "isAuthorized(address)"                                                           => handle_is_authorized,
+    "hasApprovedAuth(address)"                                                        => handle_has_approved_auth,
+    "handle()"                                                                        => handle_handle,
+    "balanceIn(address)"                                                              => handle_balance_in,
 }
 
 fn addr_topic(addr: &[u8; 20]) -> [u8; 32] {
@@ -54,6 +54,10 @@ fn addr_topic(addr: &[u8; 20]) -> [u8; 32] {
 
 fn delegate_key(actor: &[u8; 20]) -> KeyBuilder<32> {
     KeyBuilder::<32>::new().push(b"del:").push(actor)
+}
+
+fn auth_stamp_key(auth_obj: &[u8; 20]) -> KeyBuilder<32> {
+    KeyBuilder::<32>::new().push(b"ast:").push(auth_obj)
 }
 
 fn check_owner(actor: &[u8; 20]) -> Result<(), i32> {
@@ -88,6 +92,13 @@ fn require_authorized() -> Result<(), i32> {
     } else {
         Err(-21)
     }
+}
+
+fn stamp_auth_approval(auth_obj: &[u8; 20]) {
+    let now = context::block_number();
+    let sk = auth_stamp_key(auth_obj);
+    storage::set_u64(sk.as_slice(), now.saturating_add(1));
+    events::emit(&[AUTH_SIGNED, addr_topic(auth_obj)], &now.to_be_bytes());
 }
 
 fn handle_initialize(args: &CalldataReader) -> Result<(), i32> {
@@ -141,44 +152,7 @@ fn handle_transfer_ownership(args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
-/// Authorize `spender` (e.g., `AssetPair_OTC`) on `ledger` (`AssetLedger`) to debit up to `amount`
-/// from this Identity's balance (`msg.sender` inside `ledger` will be `self_address()`).
-fn handle_approve_asset(args: &CalldataReader) -> Result<(), i32> {
-    require_authorized()?;
-    let ledger = args.address(0).ok_or(-3)?;
-    let spender = args.address(1).ok_or(-3)?;
-    let amount = args.u64(2).ok_or(-3)?;
-
-    let sub_cd = CallEncoder::<128>::new(selector("approve(address,uint64)"))
-        .push_address(&spender)
-        .push_u64(amount);
-    let ok = call::call_bool(&ledger, sub_cd.as_slice())?;
-    if !ok {
-        return Err(-24);
-    }
-    ret::write_bool(true);
-    Ok(())
-}
-
-/// Transfer `amount` of `ledger` asset from this Identity to `to_identity`.
-fn handle_transfer_asset(args: &CalldataReader) -> Result<(), i32> {
-    require_authorized()?;
-    let ledger = args.address(0).ok_or(-3)?;
-    let to_identity = args.address(1).ok_or(-3)?;
-    let amount = args.u64(2).ok_or(-3)?;
-
-    let sub_cd = CallEncoder::<128>::new(selector("transfer(address,uint64)"))
-        .push_address(&to_identity)
-        .push_u64(amount);
-    let ok = call::call_bool(&ledger, sub_cd.as_slice())?;
-    if !ok {
-        return Err(-24);
-    }
-    ret::write_bool(true);
-    Ok(())
-}
-
-/// Execute an arbitrary cross-HPS call as this Identity (`msg.sender = self_address()`).
+/// Universal Identity call gateway (`msg.sender` inside `target` becomes `self_address()`).
 fn handle_execute(args: &CalldataReader) -> Result<(), i32> {
     require_authorized()?;
     let target = args.address(0).ok_or(-3)?;
@@ -187,9 +161,170 @@ fn handle_execute(args: &CalldataReader) -> Result<(), i32> {
         return Err(-25);
     }
 
+    let sel = [sub_cd[0], sub_cd[1], sub_cd[2], sub_cd[3]];
+    if sel == selector("approve()") || sel == selector("approveAndFinalize()") {
+        stamp_auth_approval(&target);
+    }
+
     let out = call::call_raw(&target, sub_cd)?;
-    events::emit(&[EXECUTED_CALL, addr_topic(&target)], &sub_cd[0..4]);
+    events::emit(&[EXECUTED_CALL, addr_topic(&target)], &sel);
     ret::write(out);
+    Ok(())
+}
+
+fn handle_init_constitution_auth(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let auth_obj = args.address(0).ok_or(-3)?;
+    let registry = args.address(1).ok_or(-3)?;
+    let constitution = args.address(2).ok_or(-3)?;
+    let target_hps = args.address(3).ok_or(-3)?;
+    let policy_id = args.bytes32(4).ok_or(-3)?;
+    let action_hash = args.bytes32(5).ok_or(-3)?;
+
+    let sub_cd = CallEncoder::<192>::new(selector(
+        "initializeFromConstitution(address,address,address,bytes32,bytes32)",
+    ))
+    .push_address(&registry)
+    .push_address(&constitution)
+    .push_address(&target_hps)
+    .push_bytes32(&policy_id)
+    .push_bytes32(&action_hash);
+
+    let ok = call::call_bool(&auth_obj, sub_cd.as_slice())?;
+    if !ok {
+        return Err(-24);
+    }
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_init_oracle_auth(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let auth_obj = args.address(0).ok_or(-3)?;
+    let registry = args.address(1).ok_or(-3)?;
+    let oracle_id = args.address(2).ok_or(-3)?;
+    let target_hps = args.address(3).ok_or(-3)?;
+    let action_hash = args.bytes32(4).ok_or(-3)?;
+    let expiry_blocks = args.u64(5).ok_or(-3)?;
+
+    let sub_cd = CallEncoder::<192>::new(selector(
+        "initializeOracle(address,address,address,bytes32,uint64)",
+    ))
+    .push_address(&registry)
+    .push_address(&oracle_id)
+    .push_address(&target_hps)
+    .push_bytes32(&action_hash)
+    .push_u64(expiry_blocks);
+
+    let ok = call::call_bool(&auth_obj, sub_cd.as_slice())?;
+    if !ok {
+        return Err(-24);
+    }
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_approve_auth(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let auth_obj = args.address(0).ok_or(-3)?;
+    stamp_auth_approval(&auth_obj);
+    let sub_cd = CallEncoder::<16>::new(selector("approve()"));
+    let stages_done = call::call_bool(&auth_obj, sub_cd.as_slice())?;
+    ret::write_bool(stages_done);
+    Ok(())
+}
+
+fn handle_approve_and_finalize_auth(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let auth_obj = args.address(0).ok_or(-3)?;
+    stamp_auth_approval(&auth_obj);
+    let sub_cd = CallEncoder::<16>::new(selector("approveAndFinalize()"));
+    let finalized = call::call_bool(&auth_obj, sub_cd.as_slice())?;
+    ret::write_bool(finalized);
+    Ok(())
+}
+
+fn handle_finalize_auth(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let auth_obj = args.address(0).ok_or(-3)?;
+    let sub_cd = CallEncoder::<16>::new(selector("finalize()"));
+    let ok = call::call_bool(&auth_obj, sub_cd.as_slice())?;
+    if !ok {
+        return Err(-24);
+    }
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_issue_asset(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let ledger = args.address(0).ok_or(-3)?;
+    let to_identity = args.address(1).ok_or(-3)?;
+    let amount = args.u64(2).ok_or(-3)?;
+    let auth_obj = args.address(3).ok_or(-3)?;
+
+    let sub_cd = CallEncoder::<128>::new(selector("issue(address,uint64,address)"))
+        .push_address(&to_identity)
+        .push_u64(amount)
+        .push_address(&auth_obj);
+    let new_bal = call::call_u64(&ledger, sub_cd.as_slice())?;
+    ret::write_u64_word(new_bal);
+    Ok(())
+}
+
+fn handle_cancel_asset(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let ledger = args.address(0).ok_or(-3)?;
+    let from_identity = args.address(1).ok_or(-3)?;
+    let amount = args.u64(2).ok_or(-3)?;
+    let auth_obj = args.address(3).ok_or(-3)?;
+
+    let sub_cd = CallEncoder::<128>::new(selector("cancel(address,uint64,address)"))
+        .push_address(&from_identity)
+        .push_u64(amount)
+        .push_address(&auth_obj);
+    let new_bal = call::call_u64(&ledger, sub_cd.as_slice())?;
+    ret::write_u64_word(new_bal);
+    Ok(())
+}
+
+fn handle_transfer_asset(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let ledger = args.address(0).ok_or(-3)?;
+    let from_identity = args.address(1).ok_or(-3)?;
+    let to_identity = args.address(2).ok_or(-3)?;
+    let amount = args.u64(3).ok_or(-3)?;
+    let auth_obj = args.address(4).ok_or(-3)?;
+
+    let sub_cd = CallEncoder::<160>::new(selector("transfer(address,address,uint64,address)"))
+        .push_address(&from_identity)
+        .push_address(&to_identity)
+        .push_u64(amount)
+        .push_address(&auth_obj);
+    let ok = call::call_bool(&ledger, sub_cd.as_slice())?;
+    if !ok {
+        return Err(-24);
+    }
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_approve_asset(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let ledger = args.address(0).ok_or(-3)?;
+    let spender = args.address(1).ok_or(-3)?;
+    let amount = args.u64(2).ok_or(-3)?;
+    let auth_obj = args.address(3).ok_or(-3)?;
+
+    let sub_cd = CallEncoder::<128>::new(selector("approve(address,uint64,address)"))
+        .push_address(&spender)
+        .push_u64(amount)
+        .push_address(&auth_obj);
+    let ok = call::call_bool(&ledger, sub_cd.as_slice())?;
+    if !ok {
+        return Err(-24);
+    }
+    ret::write_bool(true);
     Ok(())
 }
 
@@ -202,6 +337,13 @@ fn handle_owner(_args: &CalldataReader) -> Result<(), i32> {
 fn handle_is_authorized(args: &CalldataReader) -> Result<(), i32> {
     let actor = args.address(0).ok_or(-3)?;
     ret::write_bool(is_actor_authorized(&actor));
+    Ok(())
+}
+
+fn handle_has_approved_auth(args: &CalldataReader) -> Result<(), i32> {
+    let auth_obj = args.address(0).ok_or(-3)?;
+    let sk = auth_stamp_key(&auth_obj);
+    ret::write_bool(storage::get_u64(sk.as_slice()) > 0);
     Ok(())
 }
 
@@ -255,23 +397,24 @@ mod tests {
 
         mock::transact_as(owner_eoa, id_hps, &init_identity_cd(owner_eoa, b"alice.id")).unwrap();
 
-        let q_stranger = CallEncoder::<64>::new(selector("isAuthorized(address)"))
-            .push_address(&stranger);
+        let q_stranger =
+            CallEncoder::<64>::new(selector("isAuthorized(address)")).push_address(&stranger);
         assert_eq!(
             mock::transact_as(owner_eoa, id_hps, q_stranger.as_slice()).unwrap()[31],
             0
         );
 
-        // Stranger cannot add delegate
         let set_del = CallEncoder::<96>::new(selector("setDelegate(address,bool)"))
             .push_address(&delegate_eoa)
             .push_bool(true);
-        assert_eq!(mock::transact_as(stranger, id_hps, set_del.as_slice()), Err(-21));
+        assert_eq!(
+            mock::transact_as(stranger, id_hps, set_del.as_slice()),
+            Err(-21)
+        );
 
-        // Owner grants delegate
         mock::transact_as(owner_eoa, id_hps, set_del.as_slice()).unwrap();
-        let q_del = CallEncoder::<64>::new(selector("isAuthorized(address)"))
-            .push_address(&delegate_eoa);
+        let q_del =
+            CallEncoder::<64>::new(selector("isAuthorized(address)")).push_address(&delegate_eoa);
         assert_eq!(
             mock::transact_as(owner_eoa, id_hps, q_del.as_slice()).unwrap()[31],
             1

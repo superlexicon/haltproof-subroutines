@@ -6,8 +6,11 @@ members = [
     "crates/cargo-hps",
     "examples/counter-registry",
     "examples/messaging",
-    "examples/asset-ledger",
+    "examples/identity-registry",
     "examples/identity",
+    "examples/constitution",
+    "examples/authorization",
+    "examples/asset-ledger",
     "examples/asset-pair-otc",
 ]
 

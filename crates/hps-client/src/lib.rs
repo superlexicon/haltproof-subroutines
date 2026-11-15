@@ -387,6 +387,83 @@ impl HpsClient {
         })
     }
 
+    /// Store WASM bytecode once in Lexicon's content-addressed bytecode store (`0x000...0100`),
+    /// returning its 32-byte `code_hash` so multiple HPS instances (e.g. `Identity` or one-time
+    /// `Authorization` objects) can be instantiated cheaply via [`Self::instantiate_hps`] or
+    /// [`Self::instantiate_batch`].
+    pub async fn store_bytecode(
+        &self,
+        signer: &HpsSigner,
+        wasm_bytes: &[u8],
+    ) -> Result<H256> {
+        let nonce = self.get_nonce(signer.address()).await?;
+        let (code_hash, store_raw) = signer.build_store_bytecode_tx(nonce, wasm_bytes)?;
+        let tx_hash = self.send_raw_transaction(&store_raw).await?;
+        let rcpt = self.wait_for_receipt(&tx_hash).await?;
+        if !rcpt.status {
+            bail!("store_bytecode transaction {tx_hash} failed: {}", rcpt.raw);
+        }
+        Ok(code_hash)
+    }
+
+    /// Instantiate a new HPS instance from an already-stored `code_hash` in a single transaction.
+    pub async fn instantiate_hps(
+        &self,
+        signer: &HpsSigner,
+        code_hash: H256,
+        init_args: &[u8],
+    ) -> Result<H160> {
+        let nonce = self.get_nonce(signer.address()).await?;
+        let (expected_addr, deploy_raw) =
+            signer.build_instantiate_tx(nonce, code_hash, init_args)?;
+        let tx_hash = self.send_raw_transaction(&deploy_raw).await?;
+        let rcpt = self.wait_for_receipt(&tx_hash).await?;
+        if !rcpt.status {
+            bail!("instantiate transaction {tx_hash} failed: {}", rcpt.raw);
+        }
+        if let Some(addr_str) = rcpt.hps_address {
+            parse_address(&addr_str)
+        } else {
+            Ok(expected_addr)
+        }
+    }
+
+    /// Pipeline multiple HPS instantiations from stored `(code_hash, init_args)` pairs in a single block!
+    pub async fn instantiate_batch(
+        &self,
+        signer: &HpsSigner,
+        specs: &[(H256, Vec<u8>)],
+    ) -> Result<Vec<H160>> {
+        if specs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let base_nonce = self.get_nonce(signer.address()).await?;
+        let mut tx_hashes = Vec::with_capacity(specs.len());
+        let mut expected_addrs = Vec::with_capacity(specs.len());
+
+        for (idx, (code_hash, init_args)) in specs.iter().enumerate() {
+            let (addr, raw) =
+                signer.build_instantiate_tx(base_nonce + idx as u64, *code_hash, init_args)?;
+            let hash = self.send_raw_transaction(&raw).await?;
+            expected_addrs.push(addr);
+            tx_hashes.push(hash);
+        }
+
+        let mut out = Vec::with_capacity(specs.len());
+        for (hash, fallback) in tx_hashes.into_iter().zip(expected_addrs.into_iter()) {
+            let rcpt = self.wait_for_receipt(&hash).await?;
+            if !rcpt.status {
+                bail!("batch instantiate transaction {hash} failed: {}", rcpt.raw);
+            }
+            if let Some(addr_str) = rcpt.hps_address {
+                out.push(parse_address(&addr_str)?);
+            } else {
+                out.push(fallback);
+            }
+        }
+        Ok(out)
+    }
+
     /// Sign, submit, and await confirmation of a stateful HPS invocation.
     pub async fn send_call(
         &self,

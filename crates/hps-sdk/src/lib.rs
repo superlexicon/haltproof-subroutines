@@ -14,6 +14,7 @@
 
 #![cfg_attr(target_arch = "wasm32", no_std)]
 
+pub mod governance;
 pub mod keccak;
 
 /// Fixed linear-memory layout expected by Lexicon's `WasmtimeAdapter`.
@@ -515,6 +516,44 @@ pub mod call {
                 Ok(Box::leak(out.into_boxed_slice()) as &'static [u8])
             }
         }
+    }
+
+    /// Invoke another HPS and copy up to `out.len()` bytes of raw return data into `out`.
+    pub fn call_into(target: &[u8; 20], calldata: &[u8], out: &mut [u8]) -> Result<usize, i32> {
+        let raw = call_raw(target, calldata)?;
+        if raw.len() > out.len() {
+            return Err(-105);
+        }
+        out[..raw.len()].copy_from_slice(raw);
+        Ok(raw.len())
+    }
+
+    /// Invoke another HPS returning ABI-encoded `bytes`, decoding the inner byte slice into `out`.
+    pub fn call_abi_bytes_into(
+        target: &[u8; 20],
+        calldata: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, i32> {
+        let raw = call_raw(target, calldata)?;
+        if raw.len() < 64 {
+            return Err(-104);
+        }
+        // Parse `[offset=0x20 (32B)][len (32B)][payload...]` safely on wasm32
+        if raw[0..31] != [0u8; 31] || raw[31] != 0x20 || raw[32..56] != [0u8; 24] {
+            return Err(-104);
+        }
+        let mut lb = [0u8; 8];
+        lb.copy_from_slice(&raw[56..64]);
+        let len_u64 = u64::from_be_bytes(lb);
+        if len_u64 > (out.len() as u64) {
+            return Err(-105);
+        }
+        let len = len_u64 as usize;
+        if 64usize.saturating_add(len) > raw.len() {
+            return Err(-104);
+        }
+        out[..len].copy_from_slice(&raw[64..64 + len]);
+        Ok(len)
     }
 
     /// Invoke another HPS and decode an ABI 32-byte `uint64` return word.
