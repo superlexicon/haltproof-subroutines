@@ -107,6 +107,7 @@ hps_entry! {
     "isReadyToConsume()"                                                  => handle_is_ready_to_consume,
     "targetHps()"                                                         => handle_target_hps,
     "constitution()"                                                      => handle_constitution,
+    "policyId()"                                                          => handle_policy_id,
     "actionHash()"                                                        => handle_action_hash,
 }
 
@@ -1078,6 +1079,11 @@ fn handle_target_hps(_args: &CalldataReader) -> Result<(), i32> {
 
 fn handle_constitution(_args: &CalldataReader) -> Result<(), i32> {
     ret::write_address(&storage::get_address(KEY_CONSTITUTION).unwrap_or([0u8; 20]));
+    Ok(())
+}
+
+fn handle_policy_id(_args: &CalldataReader) -> Result<(), i32> {
+    ret::write_word(&storage::get_bytes32(KEY_POLICY_ID).unwrap_or([0u8; 32]));
     Ok(())
 }
 

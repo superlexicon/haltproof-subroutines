@@ -59,6 +59,8 @@ hps_entry! {
     "approveAsset(address,address,uint64,address)"                                    => handle_approve_asset,
     "addDirector(address,address,address)"                                            => handle_add_director,
     "removeDirector(address,address,address)"                                         => handle_remove_director,
+    "grantRole(address,bytes32,address,address)"                                      => handle_grant_role,
+    "revokeRole(address,bytes32,address,address)"                                     => handle_revoke_role,
     "owner()"                                                                         => handle_owner,
     "isAuthorized(address)"                                                           => handle_is_authorized,
     "hasApprovedAuth(address)"                                                        => handle_has_approved_auth,
@@ -675,6 +677,38 @@ fn handle_remove_director(args: &CalldataReader) -> Result<(), i32> {
     let sub_cd = CallEncoder::<96>::new(const { selector("removeDirector(address,address)") })
         .push_address(&director)
         .push_address(&auth_obj);
+    let new_count = call::call_u64(&constitution, sub_cd.as_slice())?;
+    ret::write_u64_word(new_count);
+    Ok(())
+}
+
+fn handle_grant_role(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let constitution = args.address(0).ok_or(-3)?;
+    let role_id = args.bytes32(1).ok_or(-3)?;
+    let account = args.address(2).ok_or(-3)?;
+    let board_auth = args.address(3).ok_or(-3)?;
+
+    let sub_cd = CallEncoder::<128>::new(const { selector("grantRole(bytes32,address,address)") })
+        .push_bytes32(&role_id)
+        .push_address(&account)
+        .push_address(&board_auth);
+    let new_count = call::call_u64(&constitution, sub_cd.as_slice())?;
+    ret::write_u64_word(new_count);
+    Ok(())
+}
+
+fn handle_revoke_role(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let constitution = args.address(0).ok_or(-3)?;
+    let role_id = args.bytes32(1).ok_or(-3)?;
+    let account = args.address(2).ok_or(-3)?;
+    let board_auth = args.address(3).ok_or(-3)?;
+
+    let sub_cd = CallEncoder::<128>::new(const { selector("revokeRole(bytes32,address,address)") })
+        .push_bytes32(&role_id)
+        .push_address(&account)
+        .push_address(&board_auth);
     let new_count = call::call_u64(&constitution, sub_cd.as_slice())?;
     ret::write_u64_word(new_count);
     Ok(())

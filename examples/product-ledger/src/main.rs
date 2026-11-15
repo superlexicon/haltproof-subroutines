@@ -24,8 +24,8 @@ use hps_sdk::call::{self, CallEncoder};
 use hps_sdk::governance::{
     require_valid_identity, verify_and_consume_auth, ActionHasher, ACTION_RESTOCK_PRODUCT,
     ACTION_SET_PRODUCT_PRICE, ACTION_UPSERT_PRODUCT, ERR_CONSTITUTION_MISMATCH,
-    ERR_INSUFFICIENT_PRODUCT_UNITS, ERR_INVALID_PRODUCT_PARAMS, ERR_PRODUCT_NOT_FOUND,
-    POLICY_PRODUCT_ORACLE,
+    ERR_INSUFFICIENT_PRODUCT_UNITS, ERR_INVALID_PRODUCT_PARAMS, ERR_MISSING_ROLE,
+    ERR_PRODUCT_NOT_FOUND, POLICY_PRODUCT_ORACLE, ROLE_PRODUCT_MANAGER,
 };
 use hps_sdk::storage::KeyBuilder;
 use hps_sdk::{context, event_topic, events, hps_entry, ret, selector, storage};
@@ -199,16 +199,21 @@ fn ensure_initialized_and_valid_caller() -> Result<([u8; 20], [u8; 20], [u8; 20]
     let registry = storage::get_address(KEY_REGISTRY).ok_or(-10)?;
     let constitution = storage::get_address(KEY_CONSTITUTION).ok_or(-10)?;
     let caller = context::msg_sender();
-    require_valid_identity(&registry, &caller)?;
+    if caller != constitution {
+        require_valid_identity(&registry, &caller)?;
+    }
     Ok((registry, constitution, caller))
 }
 
-/// Verify that a catalog/inventory mutation is authorized by the Board-appointed Product Oracle
-/// (`POLICY_PRODUCT_ORACLE` on the pinned `Constitution` HPS):
+/// Verify that a catalog/inventory mutation is authorized by an `Identity` holding
+/// `ROLE_PRODUCT_MANAGER` on the pinned `Constitution` HPS (or the per-ledger Product Oracle):
+/// - If `caller == constitution` (invoked via `Constitution.upsertProduct` / `restockProduct` /
+///   `setProductPrice`), `Constitution` has already verified `ROLE_PRODUCT_MANAGER`.
 /// - If `auth_obj != 0x0`, atomically verifies and consumes the one-time `Authorization` HPS object
-///   under `(constitution, POLICY_PRODUCT_ORACLE, action_hash)`.
-/// - If `auth_obj == 0x0`, queries `constitution.productOracleOf(self_address)` and permits direct
-///   execution when `caller` is the active appointed Product Oracle `Identity`.
+///   under `ROLE_PRODUCT_MANAGER` (or `POLICY_PRODUCT_ORACLE`).
+/// - If `auth_obj == 0x0`, checks `constitution.hasRole(ROLE_PRODUCT_MANAGER, caller)` first,
+///   falling back to `constitution.productOracleOf(self_address) == caller`, and returning
+///   `Err(ERR_MISSING_ROLE)` (`-85`) otherwise.
 fn require_product_oracle_auth(
     registry: &[u8; 20],
     constitution: &[u8; 20],
@@ -216,30 +221,51 @@ fn require_product_oracle_auth(
     auth_obj: &[u8; 20],
     caller: &[u8; 20],
 ) -> Result<(), i32> {
+    if *caller == *constitution {
+        return Ok(());
+    }
+
     if *auth_obj != [0u8; 20] {
+        let pid_cd = CallEncoder::<16>::new(const { selector("policyId()") });
+        let policy_id = if let Ok(raw_pid) = call::call_raw(auth_obj, pid_cd.as_slice()) {
+            if raw_pid.len() >= 32 && raw_pid[..32] == ROLE_PRODUCT_MANAGER {
+                ROLE_PRODUCT_MANAGER
+            } else {
+                POLICY_PRODUCT_ORACLE
+            }
+        } else {
+            POLICY_PRODUCT_ORACLE
+        };
         return verify_and_consume_auth(
             registry,
             auth_obj,
             constitution,
-            &POLICY_PRODUCT_ORACLE,
+            &policy_id,
             action_hash,
             caller,
         );
+    }
+
+    let role_cd = CallEncoder::<96>::new(const { selector("hasRole(bytes32,address)") })
+        .push_bytes32(&ROLE_PRODUCT_MANAGER)
+        .push_address(caller);
+    if let Ok(true) = call::call_bool(constitution, role_cd.as_slice()) {
+        return Ok(());
     }
 
     let me = context::self_address();
     let ora_cd =
         CallEncoder::<64>::new(const { selector("productOracleOf(address)") }).push_address(&me);
     let Ok(raw_ora) = call::call_raw(constitution, ora_cd.as_slice()) else {
-        return Err(-65);
+        return Err(ERR_MISSING_ROLE);
     };
     if raw_ora.len() < 32 {
-        return Err(-65);
+        return Err(ERR_MISSING_ROLE);
     }
     let mut appointed_oracle = [0u8; 20];
     appointed_oracle.copy_from_slice(&raw_ora[12..32]);
     if appointed_oracle == [0u8; 20] || *caller != appointed_oracle {
-        return Err(-65);
+        return Err(ERR_MISSING_ROLE);
     }
     Ok(())
 }

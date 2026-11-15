@@ -1903,15 +1903,40 @@ async fn product_ledger_and_accounting_ledger_e2e_on_localtestnet() {
         .await
         .unwrap();
 
-    // Step 3: Appoint `catalog_oracle_id` via Board Resolution (`setProductOracle`)
-    let hash_prod_ora = read_b32(
+    // Step 3: Negative check before role assignment — `catalog_oracle_id` does not yet hold
+    // `ROLE_PRODUCT_MANAGER`, so attempting to restock a product MUST revert!
+    let pre_role_rcpt = client
+        .send_call_with_targets(
+            &deployer,
+            catalog_oracle_id,
+            &encode_values(
+                "restockProduct(address,bytes32,uint64,uint64,address)",
+                &[
+                    AbiValue::Address(product_ledger),
+                    AbiValue::Bytes32(sku_radio),
+                    AbiValue::Uint(U256::from(4u64)),
+                    AbiValue::Uint(U256::from(3_000u64)),
+                    AbiValue::Address(H160::zero()),
+                ],
+            ),
+            &[product_ledger, registry, constitution, catalog_oracle_id],
+        )
+        .await
+        .unwrap();
+    assert!(
+        !pre_role_rcpt.status,
+        "product listing management without ROLE_PRODUCT_MANAGER must revert"
+    );
+
+    // Step 3b: Directors (`mano_id` + `evelyn_id`) assign `ROLE_PRODUCT_MANAGER` to
+    // `catalog_oracle_id` via a Board Resolution (`grantRole`)
+    let hash_grant_pm = read_b32(
         &client,
         constitution,
-        "hashSetProductOracle(address,address,uint64)",
+        "hashGrantRole(bytes32,address)",
         &[
-            AbiValue::Address(product_ledger),
+            AbiValue::Bytes32(hps_sdk::governance::ROLE_PRODUCT_MANAGER),
             AbiValue::Address(catalog_oracle_id),
-            AbiValue::Uint(U256::from(50u64)),
         ],
     )
     .await;
@@ -1930,7 +1955,7 @@ async fn product_ledger_and_accounting_ledger_e2e_on_localtestnet() {
                             AbiValue::Address(constitution),
                             AbiValue::Address(constitution),
                             AbiValue::Bytes32(hps_sdk::governance::POLICY_BOARD_RESOLUTION),
-                            AbiValue::Bytes32(hash_prod_ora),
+                            AbiValue::Bytes32(hash_grant_pm),
                         ],
                     ),
                     vec![board_auth, registry, constitution, mano_id, evelyn_id],
@@ -1951,21 +1976,45 @@ async fn product_ledger_and_accounting_ledger_e2e_on_localtestnet() {
                 (
                     mano_id,
                     encode_values(
-                        "setProductOracle(address,address,address,uint64,address)",
+                        "grantRole(address,bytes32,address,address)",
                         &[
                             AbiValue::Address(constitution),
-                            AbiValue::Address(product_ledger),
+                            AbiValue::Bytes32(hps_sdk::governance::ROLE_PRODUCT_MANAGER),
                             AbiValue::Address(catalog_oracle_id),
-                            AbiValue::Uint(U256::from(50u64)),
                             AbiValue::Address(board_auth),
                         ],
                     ),
-                    vec![constitution, registry, product_ledger, catalog_oracle_id, board_auth],
+                    vec![constitution, registry, catalog_oracle_id, board_auth],
                 ),
             ],
         )
         .await
         .unwrap();
+
+    assert_eq!(
+        read_u64(
+            &client,
+            constitution,
+            "hasRole(bytes32,address)",
+            &[
+                AbiValue::Bytes32(hps_sdk::governance::ROLE_PRODUCT_MANAGER),
+                AbiValue::Address(catalog_oracle_id),
+            ]
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        read_u64(
+            &client,
+            constitution,
+            "roleMemberCount(bytes32)",
+            &[AbiValue::Bytes32(hps_sdk::governance::ROLE_PRODUCT_MANAGER)]
+        )
+        .await,
+        1
+    );
+    println!("[ProductLedger E2E] Directors assigned ROLE_PRODUCT_MANAGER to catalog_oracle_id via Board Resolution");
 
     // Step 4: Buyer 1 places immediate-fulfilment buy order for 4 units of SLX-LR2021-RADIO @ 2,500 = 10,000 SGD
     let buy1_rcpt = client
@@ -2090,8 +2139,9 @@ async fn product_ledger_and_accounting_ledger_e2e_on_localtestnet() {
         "buying with insufficient bank balance must revert"
     );
 
-    // Step 7: Catalog Oracle restocks +4 units of SLX-LR2021-RADIO (6 -> 10) and updates price to 3,000 SGD
-    // using a one-time `POLICY_PRODUCT_ORACLE` Authorization HPS object (`restock_auth`)
+    // Step 7: Product Manager (`catalog_oracle_id`, holding `ROLE_PRODUCT_MANAGER`) restocks +4
+    // units of SLX-LR2021-RADIO (6 -> 10) and updates price to 3,000 SGD using a one-time
+    // `ROLE_PRODUCT_MANAGER` Authorization HPS object (`restock_auth`)
     let hash_restock = read_b32(
         &client,
         product_ledger,
@@ -2117,7 +2167,7 @@ async fn product_ledger_and_accounting_ledger_e2e_on_localtestnet() {
                             AbiValue::Address(registry),
                             AbiValue::Address(constitution),
                             AbiValue::Address(product_ledger),
-                            AbiValue::Bytes32(hps_sdk::governance::POLICY_PRODUCT_ORACLE),
+                            AbiValue::Bytes32(hps_sdk::governance::ROLE_PRODUCT_MANAGER),
                             AbiValue::Bytes32(hash_restock),
                         ],
                     ),

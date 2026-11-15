@@ -17,11 +17,12 @@ use hps_sdk::abi::CalldataReader;
 use hps_sdk::call::{self, CallEncoder};
 use hps_sdk::governance::{
     oracle_policy_id, require_valid_identity, verify_and_consume_auth, ActionHasher, PolicySpec,
-    ShareClassSpec, StageSpec, ACTION_ADD_DIRECTOR, ACTION_REGISTER_SHARE_CLASS,
-    ACTION_REMOVE_DIRECTOR, ACTION_SET_BANK_ORACLE, ACTION_SET_CLEARING_ACCOUNT,
-    ACTION_SET_PRODUCT_ORACLE, ERR_POLICY_INVALID, MAX_ENCODED_POLICY_BYTES, MAX_MEMBERS_PER_STAGE,
-    MAX_SHARE_CLASSES, POLICY_BANK_ORACLE, POLICY_BOARD_RESOLUTION, POLICY_PRODUCT_ORACLE,
-    POLICY_SUPER_GOVERNANCE,
+    ShareClassSpec, StageSpec, ACTION_ADD_DIRECTOR, ACTION_GRANT_ROLE, ACTION_REGISTER_SHARE_CLASS,
+    ACTION_REMOVE_DIRECTOR, ACTION_RESTOCK_PRODUCT, ACTION_REVOKE_ROLE, ACTION_SET_BANK_ORACLE,
+    ACTION_SET_CLEARING_ACCOUNT, ACTION_SET_PRODUCT_ORACLE, ACTION_SET_PRODUCT_PRICE,
+    ACTION_UPSERT_PRODUCT, ERR_MISSING_ROLE, ERR_POLICY_INVALID, MAX_ENCODED_POLICY_BYTES,
+    MAX_MEMBERS_PER_STAGE, MAX_SHARE_CLASSES, POLICY_BANK_ORACLE, POLICY_BOARD_RESOLUTION,
+    POLICY_PRODUCT_ORACLE, POLICY_SUPER_GOVERNANCE, ROLE_PRODUCT_MANAGER,
 };
 use hps_sdk::keccak::keccak256;
 use hps_sdk::storage::KeyBuilder;
@@ -32,6 +33,8 @@ const POLICY_SET: [u8; 32] = event_topic("PolicySet(address,bytes32,uint64,uint6
 const POLICY_DEACTIVATED: [u8; 32] = event_topic("PolicyDeactivated(address,bytes32)");
 const DIRECTOR_ADDED: [u8; 32] = event_topic("DirectorAdded(address,uint64,address)");
 const DIRECTOR_REMOVED: [u8; 32] = event_topic("DirectorRemoved(address,uint64,address)");
+const ROLE_GRANTED: [u8; 32] = event_topic("RoleGranted(bytes32,address,address,uint64)");
+const ROLE_REVOKED: [u8; 32] = event_topic("RoleRevoked(bytes32,address,address,uint64)");
 const BANK_ORACLE_SET: [u8; 32] = event_topic("BankOracleSet(address,address,address)");
 const PRODUCT_ORACLE_SET: [u8; 32] = event_topic("ProductOracleSet(address,address,address)");
 const CLEARING_ACCOUNT_SET: [u8; 32] = event_topic("ClearingAccountSet(address,address)");
@@ -65,6 +68,14 @@ hps_entry! {
     "removeDirector(address,address)"                                     => handle_remove_director,
     "isDirector(address)"                                                 => handle_is_director,
     "directorCount()"                                                     => handle_director_count,
+    "grantRole(bytes32,address,address)"                                  => handle_grant_role,
+    "revokeRole(bytes32,address,address)"                                 => handle_revoke_role,
+    "hasRole(bytes32,address)"                                            => handle_has_role,
+    "roleMemberCount(bytes32)"                                            => handle_role_member_count,
+    "roleMemberAt(bytes32,uint64)"                                        => handle_role_member_at,
+    "upsertProduct(address,bytes32,uint64,uint64,bytes,address)"          => handle_con_upsert_product,
+    "restockProduct(address,bytes32,uint64,uint64,address)"               => handle_con_restock_product,
+    "setProductPrice(address,bytes32,uint64,address)"                     => handle_con_set_product_price,
     "setBankOracle(address,address,uint64,address)"                       => handle_set_bank_oracle,
     "setProductOracle(address,address,uint64,address)"                    => handle_set_product_oracle,
     "setClearingAccount(address,address,address)"                         => handle_set_clearing_account,
@@ -91,6 +102,8 @@ hps_entry! {
     "hashDeactivatePolicy(address,bytes32)"                               => handle_hash_deactivate_policy,
     "hashAddDirector(address)"                                            => handle_hash_add_director,
     "hashRemoveDirector(address)"                                         => handle_hash_remove_director,
+    "hashGrantRole(bytes32,address)"                                      => handle_hash_grant_role,
+    "hashRevokeRole(bytes32,address)"                                     => handle_hash_revoke_role,
     "hashSetBankOracle(address,address,uint64)"                           => handle_hash_set_bank_oracle,
     "hashSetProductOracle(address,address,uint64)"                        => handle_hash_set_product_oracle,
     "hashSetClearingAccount(address,address)"                             => handle_hash_set_clearing_account,
@@ -241,6 +254,125 @@ fn compute_register_share_class_hash(
         .push_u64(conversion_numer)
         .push_u64(conversion_denom)
         .finish()
+}
+
+fn compute_grant_role_hash(role_id: &[u8; 32], account: &[u8; 20]) -> [u8; 32] {
+    ActionHasher::<160>::new(&context::self_address(), &ACTION_GRANT_ROLE)
+        .push_bytes32(role_id)
+        .push_address(account)
+        .finish()
+}
+
+fn compute_revoke_role_hash(role_id: &[u8; 32], account: &[u8; 20]) -> [u8; 32] {
+    ActionHasher::<160>::new(&context::self_address(), &ACTION_REVOKE_ROLE)
+        .push_bytes32(role_id)
+        .push_address(account)
+        .finish()
+}
+
+fn role_members_key(role_id: &[u8; 32]) -> KeyBuilder<48> {
+    KeyBuilder::<48>::new().push(b"rmem:").push(role_id)
+}
+
+fn role_has_key(role_id: &[u8; 32], account: &[u8; 20]) -> KeyBuilder<64> {
+    KeyBuilder::<64>::new()
+        .push(b"rhas:")
+        .push(role_id)
+        .push(account)
+}
+
+fn load_role_members(role_id: &[u8; 32], out: &mut [[u8; 20]; MAX_MEMBERS_PER_STAGE]) -> usize {
+    let rk = role_members_key(role_id);
+    let mut raw = [0u8; MAX_MEMBERS_PER_STAGE * 20];
+    let Some(n) = storage::get_into(rk.as_slice(), &mut raw) else {
+        return 0;
+    };
+    let count = (n / 20).min(MAX_MEMBERS_PER_STAGE);
+    let mut i = 0;
+    while i < count {
+        out[i].copy_from_slice(&raw[i * 20..(i + 1) * 20]);
+        i += 1;
+    }
+    count
+}
+
+fn save_role_members_and_sync_policy(
+    role_id: &[u8; 32],
+    members: &[[u8; 20]; MAX_MEMBERS_PER_STAGE],
+    count: usize,
+) -> Result<(), i32> {
+    let rk = role_members_key(role_id);
+    if count == 0 {
+        storage::set(rk.as_slice(), &[]);
+        storage::set(policy_key(&[0u8; 20], role_id).as_slice(), &[]);
+        if *role_id == ROLE_PRODUCT_MANAGER {
+            storage::set(policy_key(&[0u8; 20], &POLICY_PRODUCT_ORACLE).as_slice(), &[]);
+        }
+        return Ok(());
+    }
+
+    let mut raw = [0u8; MAX_MEMBERS_PER_STAGE * 20];
+    let mut i = 0;
+    while i < count {
+        raw[i * 20..(i + 1) * 20].copy_from_slice(&members[i]);
+        i += 1;
+    }
+    storage::set(rk.as_slice(), &raw[..count * 20]);
+
+    let exp = {
+        let bexp = storage::get_u64(KEY_BOARD_EXPIRY);
+        if bexp == 0 { 50 } else { bexp }
+    };
+    // 1-of-N role policy: any single active holder of `role_id` has weight=1 and satisfies required_weight=1
+    let mut stage = StageSpec::new(1, exp);
+    let mut j = 0;
+    while j < count {
+        stage = stage
+            .add_member(members[j], 1)
+            .ok_or(ERR_POLICY_INVALID)?;
+        j += 1;
+    }
+    let spec = PolicySpec::new(exp.saturating_mul(2))
+        .add_stage(stage)
+        .ok_or(ERR_POLICY_INVALID)?;
+    let mut enc = [0u8; MAX_ENCODED_POLICY_BYTES];
+    let enc_len = spec.encode(&mut enc).ok_or(ERR_POLICY_INVALID)?;
+    store_policy(&[0u8; 20], role_id, &enc[..enc_len], &spec);
+    if *role_id == ROLE_PRODUCT_MANAGER {
+        store_policy(&[0u8; 20], &POLICY_PRODUCT_ORACLE, &enc[..enc_len], &spec);
+    }
+    Ok(())
+}
+
+fn grant_role_internal(role_id: &[u8; 32], account: &[u8; 20]) -> Result<usize, i32> {
+    let mut members = [[0u8; 20]; MAX_MEMBERS_PER_STAGE];
+    let count = load_role_members(role_id, &mut members);
+    let mut i = 0;
+    while i < count {
+        if &members[i] == account {
+            storage::set_u64(role_has_key(role_id, account).as_slice(), 1);
+            return Ok(count);
+        }
+        i += 1;
+    }
+    if count >= MAX_MEMBERS_PER_STAGE {
+        return Err(-61);
+    }
+    members[count] = *account;
+    let new_count = count + 1;
+    storage::set_u64(role_has_key(role_id, account).as_slice(), 1);
+    save_role_members_and_sync_policy(role_id, &members, new_count)?;
+    Ok(new_count)
+}
+
+fn has_active_role(registry: &[u8; 20], role_id: &[u8; 32], account: &[u8; 20]) -> bool {
+    if *account == [0u8; 20] {
+        return false;
+    }
+    if storage::get_u64(role_has_key(role_id, account).as_slice()) != 1 {
+        return false;
+    }
+    require_valid_identity(registry, account).is_ok()
 }
 
 fn bank_oracle_key(bank_ledger: &[u8; 20]) -> KeyBuilder<32> {
@@ -629,6 +761,270 @@ fn handle_director_count(_args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
+/// Assign an administrative role (`roleId`, e.g., `ROLE_PRODUCT_MANAGER`) to a verified `Identity`
+/// HPS (`accountIdentity`).
+/// Requires a finalized, one-time-use **Board Resolution** (`POLICY_BOARD_RESOLUTION`)
+/// `Authorization` HPS object authorized by the company's directors.
+/// Also synchronizes a 1-of-N `PolicySpec` under `([0u8; 20], roleId)` (and `POLICY_PRODUCT_ORACLE`
+/// when `roleId == ROLE_PRODUCT_MANAGER`) so role holders can also initialize and finalize
+/// `Authorization` HPS objects under `roleId`.
+fn handle_grant_role(args: &CalldataReader) -> Result<(), i32> {
+    let (registry, caller) = ensure_initialized_and_valid_caller()?;
+    let role_id = args.bytes32(0).ok_or(-3)?;
+    let account = args.address(1).ok_or(-3)?;
+    let board_auth = args.address(2).ok_or(-3)?;
+    if role_id == [0u8; 32] || account == [0u8; 20] {
+        return Err(-59);
+    }
+
+    require_valid_identity(&registry, &account)?;
+
+    let action_hash = compute_grant_role_hash(&role_id, &account);
+    let me = context::self_address();
+    verify_and_consume_auth(
+        &registry,
+        &board_auth,
+        &me,
+        &POLICY_BOARD_RESOLUTION,
+        &action_hash,
+        &caller,
+    )?;
+
+    let new_count = grant_role_internal(&role_id, &account)?;
+
+    events::emit(
+        &[
+            ROLE_GRANTED,
+            role_id,
+            addr_topic(&account),
+            addr_topic(&board_auth),
+        ],
+        &(new_count as u64).to_be_bytes(),
+    );
+    ret::write_u64_word(new_count as u64);
+    Ok(())
+}
+
+/// Revoke an administrative role (`roleId`) from `accountIdentity`.
+/// Requires a finalized, one-time-use **Board Resolution** (`POLICY_BOARD_RESOLUTION`)
+/// `Authorization` HPS object authorized by the company's directors.
+fn handle_revoke_role(args: &CalldataReader) -> Result<(), i32> {
+    let (registry, caller) = ensure_initialized_and_valid_caller()?;
+    let role_id = args.bytes32(0).ok_or(-3)?;
+    let account = args.address(1).ok_or(-3)?;
+    let board_auth = args.address(2).ok_or(-3)?;
+    if role_id == [0u8; 32] || account == [0u8; 20] {
+        return Err(-59);
+    }
+
+    let action_hash = compute_revoke_role_hash(&role_id, &account);
+    let me = context::self_address();
+    verify_and_consume_auth(
+        &registry,
+        &board_auth,
+        &me,
+        &POLICY_BOARD_RESOLUTION,
+        &action_hash,
+        &caller,
+    )?;
+
+    let mut members = [[0u8; 20]; MAX_MEMBERS_PER_STAGE];
+    let count = load_role_members(&role_id, &mut members);
+    let mut found_idx: Option<usize> = None;
+    let mut i = 0;
+    while i < count {
+        if members[i] == account {
+            found_idx = Some(i);
+            break;
+        }
+        i += 1;
+    }
+    let idx = found_idx.ok_or(-62)?;
+    let mut j = idx;
+    while j + 1 < count {
+        members[j] = members[j + 1];
+        j += 1;
+    }
+    let new_count = count - 1;
+    members[new_count] = [0u8; 20];
+    storage::set_u64(role_has_key(&role_id, &account).as_slice(), 0);
+    save_role_members_and_sync_policy(&role_id, &members, new_count)?;
+
+    events::emit(
+        &[
+            ROLE_REVOKED,
+            role_id,
+            addr_topic(&account),
+            addr_topic(&board_auth),
+        ],
+        &(new_count as u64).to_be_bytes(),
+    );
+    ret::write_u64_word(new_count as u64);
+    Ok(())
+}
+
+/// Returns `true` iff `accountIdentity` holds `roleId` in this `Constitution` AND is currently
+/// an active, bytecode-hash-verified `Identity` in `IdentityRegistry`.
+fn handle_has_role(args: &CalldataReader) -> Result<(), i32> {
+    if storage::get_u64(KEY_INIT) != 1 {
+        ret::write_bool(false);
+        return Ok(());
+    }
+    let Some(registry) = storage::get_address(KEY_REGISTRY) else {
+        ret::write_bool(false);
+        return Ok(());
+    };
+    let role_id = args.bytes32(0).ok_or(-3)?;
+    let account = args.address(1).ok_or(-3)?;
+    ret::write_bool(has_active_role(&registry, &role_id, &account));
+    Ok(())
+}
+
+fn handle_role_member_count(args: &CalldataReader) -> Result<(), i32> {
+    let role_id = args.bytes32(0).ok_or(-3)?;
+    let mut members = [[0u8; 20]; MAX_MEMBERS_PER_STAGE];
+    let count = load_role_members(&role_id, &mut members);
+    ret::write_u64_word(count as u64);
+    Ok(())
+}
+
+fn handle_role_member_at(args: &CalldataReader) -> Result<(), i32> {
+    let role_id = args.bytes32(0).ok_or(-3)?;
+    let idx = args.u64(1).ok_or(-3)? as usize;
+    let mut members = [[0u8; 20]; MAX_MEMBERS_PER_STAGE];
+    let count = load_role_members(&role_id, &mut members);
+    if idx >= count {
+        return Err(-62);
+    }
+    ret::write_address(&members[idx]);
+    Ok(())
+}
+
+fn require_role_or_auth(
+    registry: &[u8; 20],
+    role_id: &[u8; 32],
+    target_hps: &[u8; 20],
+    action_hash: &[u8; 32],
+    auth_obj: &[u8; 20],
+    caller: &[u8; 20],
+) -> Result<(), i32> {
+    if *auth_obj == [0u8; 20] {
+        if has_active_role(registry, role_id, caller) {
+            return Ok(());
+        }
+        return Err(ERR_MISSING_ROLE);
+    }
+    verify_and_consume_auth(registry, auth_obj, target_hps, role_id, action_hash, caller)
+}
+
+/// Administer product listing creation/update on `productLedger` via the `Constitution`.
+/// Requires the calling `Identity` to hold `ROLE_PRODUCT_MANAGER` (when `authObj == 0x0`) or a
+/// finalized `Authorization` HPS under `ROLE_PRODUCT_MANAGER`.
+fn handle_con_upsert_product(args: &CalldataReader) -> Result<(), i32> {
+    let (registry, caller) = ensure_initialized_and_valid_caller()?;
+    let product_ledger = args.address(0).ok_or(-3)?;
+    let product_id = args.bytes32(1).ok_or(-3)?;
+    let units = args.u64(2).ok_or(-3)?;
+    let price = args.u64(3).ok_or(-3)?;
+    let name = args.dynamic_bytes(4).ok_or(-3)?;
+    let auth_obj = args.address(5).ok_or(-3)?;
+
+    let action_hash = ActionHasher::<192>::new(&product_ledger, &ACTION_UPSERT_PRODUCT)
+        .push_bytes32(&product_id)
+        .push_u64(units)
+        .push_u64(price)
+        .push_bytes_digest(name)
+        .finish();
+    require_role_or_auth(
+        &registry,
+        &ROLE_PRODUCT_MANAGER,
+        &product_ledger,
+        &action_hash,
+        &auth_obj,
+        &caller,
+    )?;
+
+    let cd = CallEncoder::<512>::new(const {
+        selector("upsertProduct(bytes32,uint64,uint64,bytes,address)")
+    })
+    .push_bytes32(&product_id)
+    .push_u64(units)
+    .push_u64(price)
+    .push_u64(160)
+    .push_address(&[0u8; 20])
+    .push_dynamic_bytes_tail(name);
+    let out = call::call_raw(&product_ledger, cd.as_slice())?;
+    ret::write(out);
+    Ok(())
+}
+
+/// Administer product inventory restock/adjustment on `productLedger` via the `Constitution`.
+/// Requires `ROLE_PRODUCT_MANAGER`.
+fn handle_con_restock_product(args: &CalldataReader) -> Result<(), i32> {
+    let (registry, caller) = ensure_initialized_and_valid_caller()?;
+    let product_ledger = args.address(0).ok_or(-3)?;
+    let product_id = args.bytes32(1).ok_or(-3)?;
+    let units_to_add = args.u64(2).ok_or(-3)?;
+    let new_price = args.u64(3).ok_or(-3)?;
+    let auth_obj = args.address(4).ok_or(-3)?;
+
+    let action_hash = ActionHasher::<160>::new(&product_ledger, &ACTION_RESTOCK_PRODUCT)
+        .push_bytes32(&product_id)
+        .push_u64(units_to_add)
+        .push_u64(new_price)
+        .finish();
+    require_role_or_auth(
+        &registry,
+        &ROLE_PRODUCT_MANAGER,
+        &product_ledger,
+        &action_hash,
+        &auth_obj,
+        &caller,
+    )?;
+
+    let cd = CallEncoder::<160>::new(const {
+        selector("restockProduct(bytes32,uint64,uint64,address)")
+    })
+    .push_bytes32(&product_id)
+    .push_u64(units_to_add)
+    .push_u64(new_price)
+    .push_address(&[0u8; 20]);
+    let out = call::call_raw(&product_ledger, cd.as_slice())?;
+    ret::write(out);
+    Ok(())
+}
+
+/// Administer product unit price update on `productLedger` via the `Constitution`.
+/// Requires `ROLE_PRODUCT_MANAGER`.
+fn handle_con_set_product_price(args: &CalldataReader) -> Result<(), i32> {
+    let (registry, caller) = ensure_initialized_and_valid_caller()?;
+    let product_ledger = args.address(0).ok_or(-3)?;
+    let product_id = args.bytes32(1).ok_or(-3)?;
+    let new_price = args.u64(2).ok_or(-3)?;
+    let auth_obj = args.address(3).ok_or(-3)?;
+
+    let action_hash = ActionHasher::<160>::new(&product_ledger, &ACTION_SET_PRODUCT_PRICE)
+        .push_bytes32(&product_id)
+        .push_u64(new_price)
+        .finish();
+    require_role_or_auth(
+        &registry,
+        &ROLE_PRODUCT_MANAGER,
+        &product_ledger,
+        &action_hash,
+        &auth_obj,
+        &caller,
+    )?;
+
+    let cd = CallEncoder::<128>::new(const { selector("setProductPrice(bytes32,uint64,address)") })
+        .push_bytes32(&product_id)
+        .push_u64(new_price)
+        .push_address(&[0u8; 20]);
+    let out = call::call_raw(&product_ledger, cd.as_slice())?;
+    ret::write(out);
+    Ok(())
+}
+
 /// Set or rotate the Bank Oracle backend Identity (`oracleIdentity`) for a company bank-account
 /// `AssetLedger` (`bankLedger`).
 /// Requires a finalized, one-time-use **Board Resolution** (`POLICY_BOARD_RESOLUTION`)
@@ -802,6 +1198,7 @@ fn handle_set_product_oracle(args: &CalldataReader) -> Result<(), i32> {
 
     let pk = product_oracle_key(&product_ledger);
     storage::set_address(pk.as_slice(), &oracle_identity);
+    let _ = grant_role_internal(&ROLE_PRODUCT_MANAGER, &oracle_identity);
 
     events::emit(
         &[
@@ -837,11 +1234,17 @@ fn handle_settle_product_payment(args: &CalldataReader) -> Result<(), i32> {
         return Err(-59);
     }
 
-    // Verify caller is a registered ProductLedger controlled by this Constitution
+    // Verify caller is a ProductLedger controlled by this Constitution
     let product_ledger = context::msg_sender();
     let pk = product_oracle_key(&product_ledger);
     if storage::get_address(pk.as_slice()).is_none() {
-        return Err(-62);
+        let assoc_cd = CallEncoder::<16>::new(const { selector("associatedConstitution()") });
+        let Ok(raw_assoc) = call::call_raw(&product_ledger, assoc_cd.as_slice()) else {
+            return Err(-62);
+        };
+        if raw_assoc.len() < 32 || raw_assoc[12..32] != context::self_address() {
+            return Err(-62);
+        }
     }
 
     let bank_ledger = storage::get_address(KEY_DEFAULT_BANK_LEDGER).ok_or(-63)?;
@@ -1348,6 +1751,20 @@ fn handle_hash_add_director(args: &CalldataReader) -> Result<(), i32> {
 fn handle_hash_remove_director(args: &CalldataReader) -> Result<(), i32> {
     let director = args.address(0).ok_or(-3)?;
     ret::write_word(&compute_remove_director_hash(&director));
+    Ok(())
+}
+
+fn handle_hash_grant_role(args: &CalldataReader) -> Result<(), i32> {
+    let role_id = args.bytes32(0).ok_or(-3)?;
+    let account = args.address(1).ok_or(-3)?;
+    ret::write_word(&compute_grant_role_hash(&role_id, &account));
+    Ok(())
+}
+
+fn handle_hash_revoke_role(args: &CalldataReader) -> Result<(), i32> {
+    let role_id = args.bytes32(0).ok_or(-3)?;
+    let account = args.address(1).ok_or(-3)?;
+    ret::write_word(&compute_revoke_role_hash(&role_id, &account));
     Ok(())
 }
 
@@ -2123,5 +2540,277 @@ mod tests {
         .unwrap();
         assert_eq!(u64::from_be_bytes(buyer_vp[24..32].try_into().unwrap()), 0);
         assert_eq!(u64::from_be_bytes(buyer_vp[120..128].try_into().unwrap()), 50_000);
+    }
+
+    #[test]
+    fn director_assigned_roles_and_product_manager_administration() {
+        mock::reset();
+        let reg = [0x10; 20];
+        let con = [0x20; 20];
+        let manogaran = [0xA1; 20];
+        let evelyn = [0xA2; 20];
+        let prod_mgr = [0xB7; 20];
+        let outsider = [0xB8; 20];
+        let prod_ledger = [0xD1; 20];
+        let auth_grant = [0xC1; 20];
+        let auth_revoke = [0xC2; 20];
+
+        mod board_auth_stub {
+            use hps_sdk::abi::CalldataReader;
+            use hps_sdk::governance::POLICY_BOARD_RESOLUTION;
+            use hps_sdk::{ret, selector, storage};
+            pub fn dispatch(raw: &[u8]) -> i32 {
+                let Some((sel, args)) = CalldataReader::parse(raw) else { return -1; };
+                if sel == const { selector("arm(bytes32)") } {
+                    storage::set(b"hash", &args.bytes32(0).unwrap());
+                    storage::set_u64(b"used", 0);
+                    return 0;
+                }
+                if sel == const { selector("consume(address,bytes32,bytes32,address)") } {
+                    if storage::get_u64(b"used") == 1 {
+                        return -66;
+                    }
+                    let pol = args.bytes32(1).unwrap();
+                    let h = args.bytes32(2).unwrap();
+                    if pol != POLICY_BOARD_RESOLUTION
+                        || storage::get_bytes32(b"hash").as_ref() != Some(&h)
+                    {
+                        return -67;
+                    }
+                    storage::set_u64(b"used", 1);
+                    ret::write_bool(true);
+                    return 0;
+                }
+                -2
+            }
+        }
+
+        mod prod_ledger_stub {
+            use hps_sdk::abi::CalldataReader;
+            use hps_sdk::{ret, selector, storage};
+            pub fn dispatch(raw: &[u8]) -> i32 {
+                let Some((sel, args)) = CalldataReader::parse(raw) else { return -1; };
+                if sel == const { selector("upsertProduct(bytes32,uint64,uint64,bytes,address)") } {
+                    storage::set_u64(b"units", args.u64(1).unwrap());
+                    storage::set_u64(b"price", args.u64(2).unwrap());
+                    ret::write_u64_word(1);
+                    return 0;
+                }
+                if sel == const { selector("restockProduct(bytes32,uint64,uint64,address)") } {
+                    let u = storage::get_u64(b"units") + args.u64(1).unwrap();
+                    storage::set_u64(b"units", u);
+                    let np = args.u64(2).unwrap();
+                    if np > 0 {
+                        storage::set_u64(b"price", np);
+                    }
+                    ret::write_u64_word(u);
+                    return 0;
+                }
+                if sel == const { selector("setProductPrice(bytes32,uint64,address)") } {
+                    let np = args.u64(1).unwrap();
+                    storage::set_u64(b"price", np);
+                    ret::write_u64_word(np);
+                    return 0;
+                }
+                -2
+            }
+        }
+
+        mock::register_hps(reg, reg_stub::dispatch);
+        mock::register_hps(con, dispatch_calldata);
+        mock::register_hps(auth_grant, board_auth_stub::dispatch);
+        mock::register_hps(auth_revoke, board_auth_stub::dispatch);
+        mock::set_code_hash(auth_grant, [0x99; 32]);
+        mock::set_code_hash(auth_revoke, [0x99; 32]);
+        mock::register_hps(prod_ledger, prod_ledger_stub::dispatch);
+
+        let super_spec = PolicySpec::new(100)
+            .add_stage(StageSpec::new(75_000, 50).add_member(manogaran, 75_000).unwrap())
+            .unwrap();
+        let board_spec = PolicySpec::new(100)
+            .add_stage(
+                StageSpec::new(2, 50)
+                    .add_member(manogaran, 1)
+                    .unwrap()
+                    .add_member(evelyn, 1)
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut buf_s = [0u8; 512];
+        let len_s = super_spec.encode(&mut buf_s).unwrap();
+        let mut buf_b = [0u8; 512];
+        let len_b = board_spec.encode(&mut buf_b).unwrap();
+
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&2u16.to_be_bytes());
+        blob.extend_from_slice(&[0u8; 20]);
+        blob.extend_from_slice(&POLICY_SUPER_GOVERNANCE);
+        blob.extend_from_slice(&(len_s as u16).to_be_bytes());
+        blob.extend_from_slice(&buf_s[..len_s]);
+        blob.extend_from_slice(&[0u8; 20]);
+        blob.extend_from_slice(&POLICY_BOARD_RESOLUTION);
+        blob.extend_from_slice(&(len_b as u16).to_be_bytes());
+        blob.extend_from_slice(&buf_b[..len_b]);
+
+        let mut cd = Vec::new();
+        cd.extend_from_slice(&const { selector("initialize(address,bytes)") });
+        let mut rw = [0u8; 32];
+        rw[12..32].copy_from_slice(&reg);
+        cd.extend_from_slice(&rw);
+        let mut off = [0u8; 32];
+        off[31] = 0x40;
+        cd.extend_from_slice(&off);
+        let mut lw = [0u8; 32];
+        lw[24..32].copy_from_slice(&(blob.len() as u64).to_be_bytes());
+        cd.extend_from_slice(&lw);
+        cd.extend_from_slice(&blob);
+        cd.resize(cd.len() + (32 - blob.len() % 32) % 32, 0);
+        mock::transact_as(manogaran, con, &cd).unwrap();
+
+        let sku = keccak256(b"SKU_ENTERPRISE_NODE");
+
+        // Before role is granted, prod_mgr cannot administer product listings via Constitution
+        let upsert_cd = CallEncoder::<512>::new(const {
+            selector("upsertProduct(address,bytes32,uint64,uint64,bytes,address)")
+        })
+        .push_address(&prod_ledger)
+        .push_bytes32(&sku)
+        .push_u64(25)
+        .push_u64(1_200)
+        .push_u64(192)
+        .push_address(&[0u8; 20])
+        .push_dynamic_bytes_tail(b"Enterprise Node");
+        let err = mock::transact_as(prod_mgr, con, upsert_cd.as_slice()).unwrap_err();
+        assert_eq!(err, ERR_MISSING_ROLE);
+
+        // Directors grant ROLE_PRODUCT_MANAGER to prod_mgr via Board Resolution
+        let h_grant: [u8; 32] = mock::transact_as(
+            manogaran,
+            con,
+            CallEncoder::<96>::new(const { selector("hashGrantRole(bytes32,address)") })
+                .push_bytes32(&ROLE_PRODUCT_MANAGER)
+                .push_address(&prod_mgr)
+                .as_slice(),
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+        mock::transact_as(
+            manogaran,
+            auth_grant,
+            CallEncoder::<64>::new(const { selector("arm(bytes32)") })
+                .push_bytes32(&h_grant)
+                .as_slice(),
+        )
+        .unwrap();
+        let cnt_out = mock::transact_as(
+            manogaran,
+            con,
+            CallEncoder::<128>::new(const { selector("grantRole(bytes32,address,address)") })
+                .push_bytes32(&ROLE_PRODUCT_MANAGER)
+                .push_address(&prod_mgr)
+                .push_address(&auth_grant)
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(u64::from_be_bytes(cnt_out[24..32].try_into().unwrap()), 1);
+
+        // Verify hasRole(ROLE_PRODUCT_MANAGER, prod_mgr) == true and outsider == false
+        let has_pm = mock::transact_as(
+            manogaran,
+            con,
+            CallEncoder::<96>::new(const { selector("hasRole(bytes32,address)") })
+                .push_bytes32(&ROLE_PRODUCT_MANAGER)
+                .push_address(&prod_mgr)
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(has_pm[31], 1);
+
+        let has_out = mock::transact_as(
+            manogaran,
+            con,
+            CallEncoder::<96>::new(const { selector("hasRole(bytes32,address)") })
+                .push_bytes32(&ROLE_PRODUCT_MANAGER)
+                .push_address(&outsider)
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(has_out[31], 0);
+
+        // prod_mgr can now upsertProduct, restockProduct, and setProductPrice via Constitution
+        let up_res = mock::transact_as(prod_mgr, con, upsert_cd.as_slice()).unwrap();
+        assert_eq!(u64::from_be_bytes(up_res[24..32].try_into().unwrap()), 1);
+
+        let restock_res = mock::transact_as(
+            prod_mgr,
+            con,
+            CallEncoder::<192>::new(const {
+                selector("restockProduct(address,bytes32,uint64,uint64,address)")
+            })
+            .push_address(&prod_ledger)
+            .push_bytes32(&sku)
+            .push_u64(10)
+            .push_u64(1_300)
+            .push_address(&[0u8; 20])
+            .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(u64::from_be_bytes(restock_res[24..32].try_into().unwrap()), 35);
+
+        let price_res = mock::transact_as(
+            prod_mgr,
+            con,
+            CallEncoder::<160>::new(const {
+                selector("setProductPrice(address,bytes32,uint64,address)")
+            })
+            .push_address(&prod_ledger)
+            .push_bytes32(&sku)
+            .push_u64(1_400)
+            .push_address(&[0u8; 20])
+            .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(u64::from_be_bytes(price_res[24..32].try_into().unwrap()), 1_400);
+
+        // Outsider still rejected with ERR_MISSING_ROLE
+        let out_err = mock::transact_as(outsider, con, upsert_cd.as_slice()).unwrap_err();
+        assert_eq!(out_err, ERR_MISSING_ROLE);
+
+        // Directors revoke ROLE_PRODUCT_MANAGER from prod_mgr via Board Resolution
+        let h_revoke: [u8; 32] = mock::transact_as(
+            manogaran,
+            con,
+            CallEncoder::<96>::new(const { selector("hashRevokeRole(bytes32,address)") })
+                .push_bytes32(&ROLE_PRODUCT_MANAGER)
+                .push_address(&prod_mgr)
+                .as_slice(),
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+        mock::transact_as(
+            manogaran,
+            auth_revoke,
+            CallEncoder::<64>::new(const { selector("arm(bytes32)") })
+                .push_bytes32(&h_revoke)
+                .as_slice(),
+        )
+        .unwrap();
+        let rev_out = mock::transact_as(
+            manogaran,
+            con,
+            CallEncoder::<128>::new(const { selector("revokeRole(bytes32,address,address)") })
+                .push_bytes32(&ROLE_PRODUCT_MANAGER)
+                .push_address(&prod_mgr)
+                .push_address(&auth_revoke)
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(u64::from_be_bytes(rev_out[24..32].try_into().unwrap()), 0);
+
+        // After revocation, prod_mgr is rejected with ERR_MISSING_ROLE
+        let rev_err = mock::transact_as(prod_mgr, con, upsert_cd.as_slice()).unwrap_err();
+        assert_eq!(rev_err, ERR_MISSING_ROLE);
     }
 }

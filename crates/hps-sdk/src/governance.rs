@@ -31,6 +31,14 @@ pub const ACTION_SET_PRODUCT_ORACLE: [u8; 32] = keccak256(b"SET_PRODUCT_ORACLE")
 pub const ACTION_UPSERT_PRODUCT: [u8; 32] = keccak256(b"UPSERT_PRODUCT");
 pub const ACTION_RESTOCK_PRODUCT: [u8; 32] = keccak256(b"RESTOCK_PRODUCT");
 pub const ACTION_SET_PRODUCT_PRICE: [u8; 32] = keccak256(b"SET_PRODUCT_PRICE");
+pub const ACTION_GRANT_ROLE: [u8; 32] = keccak256(b"GRANT_ROLE");
+pub const ACTION_REVOKE_ROLE: [u8; 32] = keccak256(b"REVOKE_ROLE");
+pub const ACTION_REGISTER_PRODUCT_LEDGER: [u8; 32] = keccak256(b"REGISTER_PRODUCT_LEDGER");
+
+/// Canonical administrative Role IDs assigned by Directors (`POLICY_BOARD_RESOLUTION`) in `Constitution`.
+pub const ROLE_PRODUCT_MANAGER: [u8; 32] = keccak256(b"ROLE_PRODUCT_MANAGER");
+pub const ROLE_TREASURY_MANAGER: [u8; 32] = keccak256(b"ROLE_TREASURY_MANAGER");
+pub const ROLE_BANK_ORACLE: [u8; 32] = keccak256(b"ROLE_BANK_ORACLE");
 
 /// Canonical policy IDs for `Constitution`, `AssetLedger`, `ProductLedger`, and `IdentityRegistry` governance.
 pub const POLICY_SUPER_GOVERNANCE: [u8; 32] = keccak256(b"SUPER_GOVERNANCE");
@@ -77,6 +85,7 @@ pub const ERR_PRODUCT_NOT_FOUND: i32 = -81;
 pub const ERR_INSUFFICIENT_PRODUCT_UNITS: i32 = -82;
 pub const ERR_INVALID_PRODUCT_PARAMS: i32 = -83;
 pub const ERR_UNAUTHORIZED_SALES_RECORDER: i32 = -84;
+pub const ERR_MISSING_ROLE: i32 = -85;
 pub const ERR_CONSTITUTION_MISMATCH: i32 = -19;
 
 /// Order side/step tags for `POLICY_SHARE_TRANSFER_AUCTION` 3-step share transfer auctions.
