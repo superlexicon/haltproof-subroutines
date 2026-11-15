@@ -592,38 +592,15 @@ fn allocate_cohort_fills(
         } else {
             // Marginal `(price, block_number)` cohort: all orders in `[idx..end]` have the exact
             // same price and arrived at the exact same block -> equal priority -> pro-rata fill!
-            let mut allocated = 0u64;
-            let mut remainders = [0u128; MAX_DEX_ORDERS];
+            // Note: Exact integer floor `floor(rem_to_fill * rem_qty_k / cohort_qty)` is used without
+            // assigning leftover 1-unit rounding dust by intra-block transaction index, so intra-block
+            // transaction ordering has ZERO effect on any order's fill (strictly MEV-proof).
             k = idx;
             while k < end {
                 let num = (rem_to_fill as u128) * (orders[k].rem_qty as u128);
                 let fl = (num / (cohort_qty as u128)) as u64;
                 fills[k] = fl;
-                remainders[k] = num % (cohort_qty as u128);
-                allocated += fl;
                 k += 1;
-            }
-
-            let mut rem_units = rem_to_fill.saturating_sub(allocated);
-            while rem_units > 0 {
-                let mut best_k = usize::MAX;
-                let mut best_rem = 0u128;
-                k = idx;
-                while k < end {
-                    if fills[k] < orders[k].rem_qty
-                        && (best_k == usize::MAX || remainders[k] > best_rem)
-                    {
-                        best_k = k;
-                        best_rem = remainders[k];
-                    }
-                    k += 1;
-                }
-                if best_k == usize::MAX {
-                    break;
-                }
-                fills[best_k] += 1;
-                remainders[best_k] = 0;
-                rem_units -= 1;
             }
             rem_to_fill = 0;
         }
@@ -635,9 +612,10 @@ fn allocate_cohort_fills(
 }
 
 /// Per-block discrete-time FIFO CLOB matching engine entrypoint:
-/// 1. Iterates through all pending orders received until the last block (`order.block_number < current_block`,
-///    or `<= current_block` if all pending orders are from the current block) and inserts them into the
-///    ordered Bid list (`price DESC, block_number ASC`) and ordered Ask list (`price ASC, block_number ASC`).
+/// 1. Iterates through all pending orders received until the last block (`order.block_number < current_block`)
+///    and inserts them into the ordered Bid list (`price DESC, block_number ASC`) and ordered Ask list
+///    (`price ASC, block_number ASC`). Orders placed in `current_block` are NEVER ingested in `current_block`,
+///    preventing intra-block front-running, back-running, or sandwiching.
 /// 2. Checks for crossing Bid and Ask prices (`best_bid.price >= best_ask.price`).
 /// 3. Determines a single clearing price `P*` maximizing matched volume `V* = min(D(P*), S(P*))`.
 /// 4. Fills crossing Bids and Asks in order of price first and earliest block second, pro-rating fills
@@ -653,36 +631,17 @@ fn handle_match_block(_args: &CalldataReader) -> Result<(), i32> {
     let (mut bid_ids, mut bid_count) = load_id_list(KEY_BID_LIST);
     let (mut ask_ids, mut ask_count) = load_id_list(KEY_ASK_LIST);
 
-    // Check whether any pending orders arrived strictly before `current_block`.
-    // If so, ingest all orders with `order.block_number < current_block` ("until the last block");
-    // otherwise (e.g. single-block batch test or immediate block crank), ingest up to `current_block`.
-    let mut has_prior_block_pending = false;
-    let mut i = 0usize;
-    while i < pending_count {
-        if let Some(ord) = load_order(pending_ids[i]) {
-            if ord.status == STATUS_PENDING && ord.block_number < current_block {
-                has_prior_block_pending = true;
-                break;
-            }
-        }
-        i += 1;
-    }
-
     let mut rem_pending = [0u64; MAX_DEX_ORDERS];
     let mut rem_pending_count = 0usize;
     let mut ingested_count = 0u64;
 
-    i = 0;
+    let mut i = 0usize;
     while i < pending_count {
         let oid = pending_ids[i];
         if let Some(mut ord) = load_order(oid) {
             if ord.status == STATUS_PENDING && ord.rem_qty > 0 {
-                let eligible = if has_prior_block_pending {
-                    ord.block_number < current_block
-                } else {
-                    ord.block_number <= current_block
-                };
-                if eligible {
+                // Strictly ingest only orders received until the last block (`block_number < current_block`)
+                if ord.block_number < current_block {
                     ord.status = STATUS_ACTIVE;
                     store_order(&ord);
                     if ord.side == SIDE_BID {
@@ -911,9 +870,48 @@ fn handle_match_block(_args: &CalldataReader) -> Result<(), i32> {
         total_ask_cross
     };
 
-    // Compute fills in `(price, block_number)` priority order with same-block pro-rata allocation
-    let bid_fills = allocate_cohort_fills(&bids, crossing_bid_count, matched_volume);
-    let ask_fills = allocate_cohort_fills(&asks, crossing_ask_count, matched_volume);
+    // Compute fills in `(price, block_number)` priority order with same-block pro-rata allocation.
+    // Because we use exact integer floor `floor(target * rem_qty / cohort_qty)` without assigning
+    // rounding dust by intra-block transaction order, the sum of pro-rated fills on the rationed side
+    // may be up to `cohort_size - 1` units less than `matched_volume`; we therefore re-align both sides
+    // to the exact integer-feasible `actual_matched = min(sum(bid_fills), sum(ask_fills))` so total buyer
+    // fills and total seller fills are always 100% balanced AND strictly permutation-invariant.
+    let mut bid_fills = allocate_cohort_fills(&bids, crossing_bid_count, matched_volume);
+    let mut ask_fills = allocate_cohort_fills(&asks, crossing_ask_count, matched_volume);
+
+    let mut sum_bid_fills = 0u64;
+    i = 0;
+    while i < crossing_bid_count {
+        sum_bid_fills = sum_bid_fills.saturating_add(bid_fills[i]);
+        i += 1;
+    }
+    let mut sum_ask_fills = 0u64;
+    i = 0;
+    while i < crossing_ask_count {
+        sum_ask_fills = sum_ask_fills.saturating_add(ask_fills[i]);
+        i += 1;
+    }
+    let matched_volume = if sum_bid_fills < sum_ask_fills {
+        ask_fills = allocate_cohort_fills(&asks, crossing_ask_count, sum_bid_fills);
+        let mut s = 0u64;
+        i = 0;
+        while i < crossing_ask_count {
+            s = s.saturating_add(ask_fills[i]);
+            i += 1;
+        }
+        s
+    } else if sum_ask_fills < sum_bid_fills {
+        bid_fills = allocate_cohort_fills(&bids, crossing_bid_count, sum_ask_fills);
+        let mut s = 0u64;
+        i = 0;
+        while i < crossing_bid_count {
+            s = s.saturating_add(bid_fills[i]);
+            i += 1;
+        }
+        s
+    } else {
+        sum_bid_fills
+    };
 
     let asset_ledger = storage::get_address(KEY_ASSET_LEDGER).ok_or(-10)?;
     let quote_ledger = storage::get_address(KEY_QUOTE_LEDGER).unwrap_or([0u8; 20]);
@@ -1359,5 +1357,209 @@ mod tests {
         let bid_cnt = u64::from_be_bytes(depth_out[56..64].try_into().unwrap());
         let ask_cnt = u64::from_be_bytes(depth_out[88..96].try_into().unwrap());
         assert_eq!((pending_cnt, bid_cnt, ask_cnt), (0, 2, 0));
+    }
+
+    #[test]
+    fn mev_invariance_under_intra_block_tx_reordering_and_same_block_match_isolation() {
+        // Run the exact same block-level order flow under two reversed intra-block transaction
+        // orderings (A before B vs. B before A) AND with an attacker attempting to call `matchBlock()`
+        // in the same block as their front-run/sandwich order. Verify that every trader's fill and
+        // balance is 100% identical regardless of transaction ordering inside the block.
+        let run_with_order = |b_first: bool| -> (u64, u64, u64, u64, u64, u64) {
+            mock::reset();
+            let reg = [0x10; 20];
+            let asset_ledger = [0x20; 20];
+            let quote_ledger = [0x30; 20];
+            let dex = [0x40; 20];
+            let escrow_id = [0x90; 20];
+
+            let trader_a = [0xA1; 20];
+            let trader_b = [0xA2; 20];
+            let seller = [0xB1; 20];
+
+            mock::register_hps(reg, sim_ledgers::reg_dispatch);
+            mock::register_hps(asset_ledger, sim_ledgers::ledger_dispatch);
+            mock::register_hps(quote_ledger, sim_ledgers::ledger_dispatch);
+            mock::register_hps(dex, dispatch_calldata);
+
+            let init_cd = CallEncoder::<160>::new(const {
+                selector("initialize(address,address,address,address)")
+            })
+            .push_address(&reg)
+            .push_address(&asset_ledger)
+            .push_address(&quote_ledger)
+            .push_address(&escrow_id);
+            mock::transact_as(trader_a, dex, init_cd.as_slice()).unwrap();
+
+            seed_balance(quote_ledger, trader_a, 10_000);
+            seed_balance(quote_ledger, trader_b, 10_000);
+            seed_balance(asset_ledger, seller, 1_000);
+
+            // Block 50: Both `trader_a` and `trader_b` submit identical Bid @ $10 for 100 units,
+            // and `seller` submits Ask @ $10 for 101 units (creating an indivisible 1-unit remainder
+            // when pro-rating 101 across 100 + 100 = 200!).
+            mock::set_block_number(50);
+            let bid_cd = CallEncoder::<96>::new(const { selector("placeBid(uint64,uint64)") })
+                .push_u64(10)
+                .push_u64(100);
+            let ask_cd = CallEncoder::<96>::new(const { selector("placeAsk(uint64,uint64)") })
+                .push_u64(10)
+                .push_u64(101);
+
+            if !b_first {
+                mock::transact_as(trader_a, dex, bid_cd.as_slice()).unwrap();
+                // Attacker tries calling `matchBlock()` in the SAME block 50 right after `trader_a`:
+                // must ingest 0 orders and match 0 volume because Block 50 is not yet closed!
+                let match_cd = CallEncoder::<16>::new(const { selector("matchBlock()") });
+                let early_out = mock::transact_as(trader_a, dex, match_cd.as_slice()).unwrap();
+                assert_eq!(u64::from_be_bytes(early_out[56..64].try_into().unwrap()), 0);
+                assert_eq!(u64::from_be_bytes(early_out[88..96].try_into().unwrap()), 0);
+
+                mock::transact_as(trader_b, dex, bid_cd.as_slice()).unwrap();
+                mock::transact_as(seller, dex, ask_cd.as_slice()).unwrap();
+            } else {
+                mock::transact_as(seller, dex, ask_cd.as_slice()).unwrap();
+                mock::transact_as(trader_b, dex, bid_cd.as_slice()).unwrap();
+                mock::transact_as(trader_a, dex, bid_cd.as_slice()).unwrap();
+            }
+
+            // Block 51: Call `matchBlock()` to ingest Block 50 orders and clear
+            mock::set_block_number(51);
+            let match_cd = CallEncoder::<16>::new(const { selector("matchBlock()") });
+            mock::transact_as(trader_a, dex, match_cd.as_slice()).unwrap();
+
+            (
+                balance_of(asset_ledger, trader_a),
+                balance_of(asset_ledger, trader_b),
+                balance_of(quote_ledger, trader_a),
+                balance_of(quote_ledger, trader_b),
+                balance_of(asset_ledger, seller),
+                balance_of(quote_ledger, seller),
+            )
+        };
+
+        let out_a_first = run_with_order(false);
+        let out_b_first = run_with_order(true);
+        assert_eq!(
+            out_a_first, out_b_first,
+            "intra-block tx ordering must have zero effect on fills or balances"
+        );
+        // Each buyer receives exactly floor(101 * 100 / 200) = 50 units (total 100 units matched)
+        assert_eq!(out_a_first.0, 50);
+        assert_eq!(out_a_first.1, 50);
+        assert_eq!(out_a_first.5, 1_000); // seller received 100 * $10 = $1,000
+    }
+
+    #[test]
+    fn ask_side_cohort_prorata_multi_block_resting_carryover_and_order_cancellation() {
+        mock::reset();
+        let reg = [0x10; 20];
+        let asset_ledger = [0x20; 20];
+        let quote_ledger = [0x30; 20];
+        let dex = [0x40; 20];
+        let escrow_id = [0x90; 20];
+
+        let seller_early = [0xB1; 20];
+        let seller_same_1 = [0xB2; 20];
+        let seller_same_2 = [0xB3; 20];
+        let seller_low_px = [0xB4; 20];
+        let buyer_1 = [0xA1; 20];
+        let buyer_2 = [0xA2; 20];
+
+        mock::register_hps(reg, sim_ledgers::reg_dispatch);
+        mock::register_hps(asset_ledger, sim_ledgers::ledger_dispatch);
+        mock::register_hps(quote_ledger, sim_ledgers::ledger_dispatch);
+        mock::register_hps(dex, dispatch_calldata);
+
+        let init_cd = CallEncoder::<160>::new(const {
+            selector("initialize(address,address,address,address)")
+        })
+        .push_address(&reg)
+        .push_address(&asset_ledger)
+        .push_address(&quote_ledger)
+        .push_address(&escrow_id);
+        mock::transact_as(buyer_1, dex, init_cd.as_slice()).unwrap();
+
+        seed_balance(asset_ledger, seller_early, 1_000);
+        seed_balance(asset_ledger, seller_same_1, 1_000);
+        seed_balance(asset_ledger, seller_same_2, 1_000);
+        seed_balance(asset_ledger, seller_low_px, 1_000);
+        seed_balance(quote_ledger, buyer_1, 100_000);
+        seed_balance(quote_ledger, buyer_2, 100_000);
+
+        // Block 20: `seller_early` places Ask @ $20 for 100 units
+        mock::set_block_number(20);
+        let a1 = CallEncoder::<96>::new(const { selector("placeAsk(uint64,uint64)") })
+            .push_u64(20)
+            .push_u64(100);
+        mock::transact_as(seller_early, dex, a1.as_slice()).unwrap();
+
+        // Block 21:
+        //   - `seller_same_1` places Ask @ $20 for 100 units (blk 21)
+        //   - `seller_same_2` places Ask @ $20 for 300 units (blk 21)
+        //   - `seller_low_px` places Ask @ $18 for 50 units (blk 21, better/lower ask price!)
+        //   - `buyer_1` places Bid @ $20 for 350 units (blk 21)
+        mock::set_block_number(21);
+        let a2 = CallEncoder::<96>::new(const { selector("placeAsk(uint64,uint64)") })
+            .push_u64(20)
+            .push_u64(100);
+        mock::transact_as(seller_same_1, dex, a2.as_slice()).unwrap();
+
+        let a3 = CallEncoder::<96>::new(const { selector("placeAsk(uint64,uint64)") })
+            .push_u64(20)
+            .push_u64(300);
+        mock::transact_as(seller_same_2, dex, a3.as_slice()).unwrap();
+
+        let a4 = CallEncoder::<96>::new(const { selector("placeAsk(uint64,uint64)") })
+            .push_u64(18)
+            .push_u64(50);
+        mock::transact_as(seller_low_px, dex, a4.as_slice()).unwrap();
+
+        let b1 = CallEncoder::<96>::new(const { selector("placeBid(uint64,uint64)") })
+            .push_u64(20)
+            .push_u64(350);
+        mock::transact_as(buyer_1, dex, b1.as_slice()).unwrap();
+
+        // Block 22: `matchBlock()` clears 350 units @ P* = $20:
+        //   - `seller_low_px` (Ask @ $18, blk 21, qty 50) -> 100% fill (50 units @ $20 = $1,000!)
+        //   - `seller_early` (Ask @ $20, blk 20, qty 100) -> 100% fill (100 units @ $20 = $2,000!)
+        //   - Marginal Ask cohort `(price = $20, block = 21)` has `seller_same_1` (100) + `seller_same_2` (300) = 400
+        //     competing for remaining 200 units -> pro-rated 50% each:
+        //       * `seller_same_1`: 50 filled ($1,000), 50 remaining on book
+        //       * `seller_same_2`: 150 filled ($3,000), 150 remaining on book
+        mock::set_block_number(22);
+        let match_cd = CallEncoder::<16>::new(const { selector("matchBlock()") });
+        let out22 = mock::transact_as(buyer_1, dex, match_cd.as_slice()).unwrap();
+        assert_eq!(u64::from_be_bytes(out22[24..32].try_into().unwrap()), 20);
+        assert_eq!(u64::from_be_bytes(out22[56..64].try_into().unwrap()), 350);
+
+        assert_eq!(balance_of(quote_ledger, seller_low_px), 1_000);
+        assert_eq!(balance_of(quote_ledger, seller_early), 2_000);
+        assert_eq!(balance_of(quote_ledger, seller_same_1), 1_000);
+        assert_eq!(balance_of(quote_ledger, seller_same_2), 3_000);
+        assert_eq!(balance_of(asset_ledger, buyer_1), 350);
+
+        // Still in Block 22:
+        //   - `seller_same_1` cancels their partially filled order #2 (refunds remaining 50 units -> 950 total)
+        //   - `buyer_2` places a new Bid @ $20 for 150 units to buy `seller_same_2`'s resting 150 units
+        let cancel_cd =
+            CallEncoder::<64>::new(const { selector("cancelOrder(uint64)") }).push_u64(2);
+        let cancel_out = mock::transact_as(seller_same_1, dex, cancel_cd.as_slice()).unwrap();
+        assert_eq!(u64::from_be_bytes(cancel_out[24..32].try_into().unwrap()), 50);
+        assert_eq!(balance_of(asset_ledger, seller_same_1), 950);
+
+        let b2 = CallEncoder::<96>::new(const { selector("placeBid(uint64,uint64)") })
+            .push_u64(20)
+            .push_u64(150);
+        mock::transact_as(buyer_2, dex, b2.as_slice()).unwrap();
+
+        // Block 23: `matchBlock()` ingests `buyer_2`'s Bid from Block 22 and matches it against
+        // `seller_same_2`'s resting Ask from Block 21 (150 units @ $20)!
+        mock::set_block_number(23);
+        let out23 = mock::transact_as(buyer_2, dex, match_cd.as_slice()).unwrap();
+        assert_eq!(u64::from_be_bytes(out23[24..32].try_into().unwrap()), 20);
+        assert_eq!(u64::from_be_bytes(out23[56..64].try_into().unwrap()), 150);
+        assert_eq!(balance_of(asset_ledger, buyer_2), 150);
+        assert_eq!(balance_of(quote_ledger, seller_same_2), 6_000);
     }
 }
