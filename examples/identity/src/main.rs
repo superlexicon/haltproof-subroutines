@@ -177,10 +177,10 @@ fn handle_execute(args: &CalldataReader) -> Result<(), i32> {
     }
 
     let sel = [sub_cd[0], sub_cd[1], sub_cd[2], sub_cd[3]];
-    if sel == selector("approve()")
-        || sel == selector("approveAndFinalize()")
-        || sel == selector("placeBuyOrder(uint64,uint64)")
-        || sel == selector("placeSellOrder(uint64,uint64)")
+    if sel == const { selector("approve()") }
+        || sel == const { selector("approveAndFinalize()") }
+        || sel == const { selector("placeBuyOrder(uint64,uint64)") }
+        || sel == const { selector("placeSellOrder(uint64,uint64)") }
     {
         stamp_auth_approval(&target);
     }
@@ -247,7 +247,7 @@ fn handle_approve_auth(args: &CalldataReader) -> Result<(), i32> {
     require_authorized()?;
     let auth_obj = args.address(0).ok_or(-3)?;
     stamp_auth_approval(&auth_obj);
-    let sub_cd = CallEncoder::<16>::new(selector("approve()"));
+    let sub_cd = CallEncoder::<16>::new(const { selector("approve()") });
     let stages_done = call::call_bool(&auth_obj, sub_cd.as_slice())?;
     ret::write_bool(stages_done);
     Ok(())
@@ -257,7 +257,7 @@ fn handle_approve_and_finalize_auth(args: &CalldataReader) -> Result<(), i32> {
     require_authorized()?;
     let auth_obj = args.address(0).ok_or(-3)?;
     stamp_auth_approval(&auth_obj);
-    let sub_cd = CallEncoder::<16>::new(selector("approveAndFinalize()"));
+    let sub_cd = CallEncoder::<16>::new(const { selector("approveAndFinalize()") });
     let finalized = call::call_bool(&auth_obj, sub_cd.as_slice())?;
     ret::write_bool(finalized);
     Ok(())
@@ -266,7 +266,7 @@ fn handle_approve_and_finalize_auth(args: &CalldataReader) -> Result<(), i32> {
 fn handle_finalize_auth(args: &CalldataReader) -> Result<(), i32> {
     require_authorized()?;
     let auth_obj = args.address(0).ok_or(-3)?;
-    let sub_cd = CallEncoder::<16>::new(selector("finalize()"));
+    let sub_cd = CallEncoder::<16>::new(const { selector("finalize()") });
     let ok = call::call_bool(&auth_obj, sub_cd.as_slice())?;
     if !ok {
         return Err(-24);
@@ -304,7 +304,7 @@ fn handle_place_buy_order(args: &CalldataReader) -> Result<(), i32> {
     let quantity = args.u64(2).ok_or(-3)?;
 
     stamp_auth_approval(&auth_obj);
-    let sub_cd = CallEncoder::<96>::new(selector("placeBuyOrder(uint64,uint64)"))
+    let sub_cd = CallEncoder::<96>::new(const { selector("placeBuyOrder(uint64,uint64)") })
         .push_u64(price)
         .push_u64(quantity);
     let order_idx = call::call_u64(&auth_obj, sub_cd.as_slice())?;
@@ -319,7 +319,7 @@ fn handle_place_sell_order(args: &CalldataReader) -> Result<(), i32> {
     let quantity = args.u64(2).ok_or(-3)?;
 
     stamp_auth_approval(&auth_obj);
-    let sub_cd = CallEncoder::<96>::new(selector("placeSellOrder(uint64,uint64)"))
+    let sub_cd = CallEncoder::<96>::new(const { selector("placeSellOrder(uint64,uint64)") })
         .push_u64(price)
         .push_u64(quantity);
     let order_idx = call::call_u64(&auth_obj, sub_cd.as_slice())?;
@@ -332,7 +332,7 @@ fn handle_settle_transfer_auction(args: &CalldataReader) -> Result<(), i32> {
     let ledger = args.address(0).ok_or(-3)?;
     let auth_obj = args.address(1).ok_or(-3)?;
 
-    let sub_cd = CallEncoder::<64>::new(selector("settleTransferAuction(address)"))
+    let sub_cd = CallEncoder::<64>::new(const { selector("settleTransferAuction(address)") })
         .push_address(&auth_obj);
     let out = call::call_raw(&ledger, sub_cd.as_slice())?;
     ret::write(out);
@@ -345,7 +345,7 @@ fn handle_cancel_buy_order(args: &CalldataReader) -> Result<(), i32> {
     let order_index = args.u64(1).ok_or(-3)?;
 
     let sub_cd =
-        CallEncoder::<64>::new(selector("cancelBuyOrder(uint64)")).push_u64(order_index);
+        CallEncoder::<64>::new(const { selector("cancelBuyOrder(uint64)") }).push_u64(order_index);
     let out = call::call_raw(&auth_obj, sub_cd.as_slice())?;
     ret::write(out);
     Ok(())
@@ -359,7 +359,7 @@ fn handle_place_buy_order_via_con(args: &CalldataReader) -> Result<(), i32> {
     let quantity = args.u64(3).ok_or(-3)?;
 
     stamp_auth_approval(&auth_obj);
-    let sub_cd = CallEncoder::<128>::new(selector("placeBuyOrder(address,uint64,uint64)"))
+    let sub_cd = CallEncoder::<128>::new(const { selector("placeBuyOrder(address,uint64,uint64)") })
         .push_address(&auth_obj)
         .push_u64(price)
         .push_u64(quantity);
@@ -374,7 +374,7 @@ fn handle_cancel_buy_order_via_con(args: &CalldataReader) -> Result<(), i32> {
     let auth_obj = args.address(1).ok_or(-3)?;
     let order_index = args.u64(2).ok_or(-3)?;
 
-    let sub_cd = CallEncoder::<96>::new(selector("cancelBuyOrder(address,uint64)"))
+    let sub_cd = CallEncoder::<96>::new(const { selector("cancelBuyOrder(address,uint64)") })
         .push_address(&auth_obj)
         .push_u64(order_index);
     let refunded = call::call_u64(&constitution, sub_cd.as_slice())?;
@@ -390,7 +390,7 @@ fn handle_place_sell_order_via_con(args: &CalldataReader) -> Result<(), i32> {
     let quantity = args.u64(3).ok_or(-3)?;
 
     stamp_auth_approval(&auth_obj);
-    let sub_cd = CallEncoder::<128>::new(selector("placeSellOrder(address,uint64,uint64)"))
+    let sub_cd = CallEncoder::<128>::new(const { selector("placeSellOrder(address,uint64,uint64)") })
         .push_address(&auth_obj)
         .push_u64(price)
         .push_u64(quantity);
@@ -421,7 +421,7 @@ fn handle_transfer_bank_balance(args: &CalldataReader) -> Result<(), i32> {
     let to_payee = args.address(1).ok_or(-3)?;
     let amount = args.u64(2).ok_or(-3)?;
 
-    let sub_cd = CallEncoder::<96>::new(selector("transferDirect(address,uint64)"))
+    let sub_cd = CallEncoder::<96>::new(const { selector("transferDirect(address,uint64)") })
         .push_address(&to_payee)
         .push_u64(amount);
     let ok = call::call_bool(&bank_ledger, sub_cd.as_slice())?;
@@ -505,7 +505,7 @@ fn handle_issue_asset(args: &CalldataReader) -> Result<(), i32> {
     let amount = args.u64(2).ok_or(-3)?;
     let auth_obj = args.address(3).ok_or(-3)?;
 
-    let sub_cd = CallEncoder::<128>::new(selector("issue(address,uint64,address)"))
+    let sub_cd = CallEncoder::<128>::new(const { selector("issue(address,uint64,address)") })
         .push_address(&to_identity)
         .push_u64(amount)
         .push_address(&auth_obj);
@@ -521,7 +521,7 @@ fn handle_cancel_asset(args: &CalldataReader) -> Result<(), i32> {
     let amount = args.u64(2).ok_or(-3)?;
     let auth_obj = args.address(3).ok_or(-3)?;
 
-    let sub_cd = CallEncoder::<128>::new(selector("cancel(address,uint64,address)"))
+    let sub_cd = CallEncoder::<128>::new(const { selector("cancel(address,uint64,address)") })
         .push_address(&from_identity)
         .push_u64(amount)
         .push_address(&auth_obj);
@@ -538,7 +538,7 @@ fn handle_transfer_asset(args: &CalldataReader) -> Result<(), i32> {
     let amount = args.u64(3).ok_or(-3)?;
     let auth_obj = args.address(4).ok_or(-3)?;
 
-    let sub_cd = CallEncoder::<160>::new(selector("transfer(address,address,uint64,address)"))
+    let sub_cd = CallEncoder::<160>::new(const { selector("transfer(address,address,uint64,address)") })
         .push_address(&from_identity)
         .push_address(&to_identity)
         .push_u64(amount)
@@ -557,7 +557,7 @@ fn handle_add_director(args: &CalldataReader) -> Result<(), i32> {
     let new_director = args.address(1).ok_or(-3)?;
     let auth_obj = args.address(2).ok_or(-3)?;
 
-    let sub_cd = CallEncoder::<96>::new(selector("addDirector(address,address)"))
+    let sub_cd = CallEncoder::<96>::new(const { selector("addDirector(address,address)") })
         .push_address(&new_director)
         .push_address(&auth_obj);
     let new_count = call::call_u64(&constitution, sub_cd.as_slice())?;
@@ -571,7 +571,7 @@ fn handle_remove_director(args: &CalldataReader) -> Result<(), i32> {
     let director = args.address(1).ok_or(-3)?;
     let auth_obj = args.address(2).ok_or(-3)?;
 
-    let sub_cd = CallEncoder::<96>::new(selector("removeDirector(address,address)"))
+    let sub_cd = CallEncoder::<96>::new(const { selector("removeDirector(address,address)") })
         .push_address(&director)
         .push_address(&auth_obj);
     let new_count = call::call_u64(&constitution, sub_cd.as_slice())?;
@@ -586,7 +586,7 @@ fn handle_approve_asset(args: &CalldataReader) -> Result<(), i32> {
     let amount = args.u64(2).ok_or(-3)?;
     let auth_obj = args.address(3).ok_or(-3)?;
 
-    let sub_cd = CallEncoder::<128>::new(selector("approve(address,uint64,address)"))
+    let sub_cd = CallEncoder::<128>::new(const { selector("approve(address,uint64,address)") })
         .push_address(&spender)
         .push_u64(amount)
         .push_address(&auth_obj);
@@ -628,7 +628,7 @@ fn handle_handle(_args: &CalldataReader) -> Result<(), i32> {
 fn handle_balance_in(args: &CalldataReader) -> Result<(), i32> {
     let ledger = args.address(0).ok_or(-3)?;
     let me = context::self_address();
-    let sub_cd = CallEncoder::<64>::new(selector("balanceOf(address)")).push_address(&me);
+    let sub_cd = CallEncoder::<64>::new(const { selector("balanceOf(address)") }).push_address(&me);
     let bal = call::call_u64(&ledger, sub_cd.as_slice())?;
     ret::write_u64_word(bal);
     Ok(())
@@ -641,7 +641,7 @@ mod tests {
 
     fn init_identity_cd(owner: [u8; 20], handle: &[u8]) -> Vec<u8> {
         let mut cd = Vec::new();
-        cd.extend_from_slice(&selector("initialize(address,string)"));
+        cd.extend_from_slice(&const { selector("initialize(address,string)") });
         let mut ow = [0u8; 32];
         ow[12..32].copy_from_slice(&owner);
         cd.extend_from_slice(&ow);
@@ -668,13 +668,13 @@ mod tests {
         mock::transact_as(owner_eoa, id_hps, &init_identity_cd(owner_eoa, b"alice.id")).unwrap();
 
         let q_stranger =
-            CallEncoder::<64>::new(selector("isAuthorized(address)")).push_address(&stranger);
+            CallEncoder::<64>::new(const { selector("isAuthorized(address)") }).push_address(&stranger);
         assert_eq!(
             mock::transact_as(owner_eoa, id_hps, q_stranger.as_slice()).unwrap()[31],
             0
         );
 
-        let set_del = CallEncoder::<96>::new(selector("setDelegate(address,bool)"))
+        let set_del = CallEncoder::<96>::new(const { selector("setDelegate(address,bool)") })
             .push_address(&delegate_eoa)
             .push_bool(true);
         assert_eq!(
@@ -684,7 +684,7 @@ mod tests {
 
         mock::transact_as(owner_eoa, id_hps, set_del.as_slice()).unwrap();
         let q_del =
-            CallEncoder::<64>::new(selector("isAuthorized(address)")).push_address(&delegate_eoa);
+            CallEncoder::<64>::new(const { selector("isAuthorized(address)") }).push_address(&delegate_eoa);
         assert_eq!(
             mock::transact_as(owner_eoa, id_hps, q_del.as_slice()).unwrap()[31],
             1

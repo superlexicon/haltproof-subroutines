@@ -571,14 +571,14 @@ mod tests {
             let Some((sel, args)) = CalldataReader::parse(raw) else {
                 return -1;
             };
-            if sel == selector("setup(address,bytes32,bytes32)") {
+            if sel == const { selector("setup(address,bytes32,bytes32)") } {
                 storage::set_address(b"target", &args.address(0).unwrap());
                 storage::set(b"pol", &args.bytes32(1).unwrap());
                 storage::set(b"hash", &args.bytes32(2).unwrap());
                 storage::set_u64(b"used", 0);
                 return 0;
             }
-            if sel == selector("consume(address,bytes32,bytes32,address)") {
+            if sel == const { selector("consume(address,bytes32,bytes32,address)") } {
                 if storage::get_u64(b"used") != 0 {
                     return -68;
                 }
@@ -605,7 +605,7 @@ mod tests {
     mod evil_auth_clone {
         use hps_sdk::{ret, selector};
         pub fn dispatch(raw: &[u8]) -> i32 {
-            if raw.len() >= 4 && raw[..4] == selector("consume(address,bytes32,bytes32,address)") {
+            if raw.len() >= 4 && raw[..4] == const { selector("consume(address,bytes32,bytes32,address)") } {
                 ret::write_bool(true); // tries to bypass all checks!
                 return 0;
             }
@@ -624,7 +624,7 @@ mod tests {
             packed.extend_from_slice(a);
         }
         let mut cd = Vec::new();
-        cd.extend_from_slice(&selector("initialize(address,bytes32,bytes32,bytes)"));
+        cd.extend_from_slice(&const { selector("initialize(address,bytes32,bytes32,bytes)") });
         let mut aw = [0u8; 32];
         aw[12..32].copy_from_slice(&admin);
         cd.extend_from_slice(&aw);
@@ -688,7 +688,7 @@ mod tests {
         .unwrap();
 
         let is_valid = |who: [u8; 20]| -> bool {
-            let q = CallEncoder::<64>::new(selector("isValidIdentity(address)")).push_address(&who);
+            let q = CallEncoder::<64>::new(const { selector("isValidIdentity(address)") }).push_address(&who);
             mock::transact_as(admin_id, reg, q.as_slice()).unwrap()[31] == 1
         };
         assert!(is_valid(admin_id));
@@ -703,7 +703,7 @@ mod tests {
         let h_evil: [u8; 32] = mock::transact_as(
             admin_id,
             reg,
-            CallEncoder::<64>::new(selector("hashRegisterIdentity(address)"))
+            CallEncoder::<64>::new(const { selector("hashRegisterIdentity(address)") })
                 .push_address(&evil_id_clone)
                 .as_slice(),
         )
@@ -713,7 +713,7 @@ mod tests {
         mock::transact_as(
             admin_id,
             auth_for_evil,
-            CallEncoder::<128>::new(selector("setup(address,bytes32,bytes32)"))
+            CallEncoder::<128>::new(const { selector("setup(address,bytes32,bytes32)") })
                 .push_address(&reg)
                 .push_bytes32(&oracle_pol)
                 .push_bytes32(&h_evil)
@@ -724,7 +724,7 @@ mod tests {
             mock::transact_as(
                 admin_id,
                 reg,
-                CallEncoder::<96>::new(selector("registerIdentity(address,address)"))
+                CallEncoder::<96>::new(const { selector("registerIdentity(address,address)") })
                     .push_address(&evil_id_clone)
                     .push_address(&auth_for_evil)
                     .as_slice(),
@@ -736,7 +736,7 @@ mod tests {
         let h_eoa: [u8; 32] = mock::transact_as(
             admin_id,
             reg,
-            CallEncoder::<64>::new(selector("hashRegisterIdentity(address)"))
+            CallEncoder::<64>::new(const { selector("hashRegisterIdentity(address)") })
                 .push_address(&raw_eoa)
                 .as_slice(),
         )
@@ -746,7 +746,7 @@ mod tests {
         mock::transact_as(
             admin_id,
             auth_for_eoa,
-            CallEncoder::<128>::new(selector("setup(address,bytes32,bytes32)"))
+            CallEncoder::<128>::new(const { selector("setup(address,bytes32,bytes32)") })
                 .push_address(&reg)
                 .push_bytes32(&oracle_pol)
                 .push_bytes32(&h_eoa)
@@ -757,7 +757,7 @@ mod tests {
             mock::transact_as(
                 admin_id,
                 reg,
-                CallEncoder::<96>::new(selector("registerIdentity(address,address)"))
+                CallEncoder::<96>::new(const { selector("registerIdentity(address,address)") })
                     .push_address(&raw_eoa)
                     .push_address(&auth_for_eoa)
                     .as_slice(),
@@ -770,7 +770,7 @@ mod tests {
             mock::transact_as(
                 admin_id,
                 reg,
-                CallEncoder::<96>::new(selector("registerIdentity(address,address)"))
+                CallEncoder::<96>::new(const { selector("registerIdentity(address,address)") })
                     .push_address(&bob_id)
                     .push_address(&evil_auth)
                     .as_slice(),
@@ -782,7 +782,7 @@ mod tests {
         let h_reg: [u8; 32] = mock::transact_as(
             admin_id,
             reg,
-            CallEncoder::<64>::new(selector("hashRegisterIdentity(address)"))
+            CallEncoder::<64>::new(const { selector("hashRegisterIdentity(address)") })
                 .push_address(&bob_id)
                 .as_slice(),
         )
@@ -792,7 +792,7 @@ mod tests {
         mock::transact_as(
             admin_id,
             auth1,
-            CallEncoder::<128>::new(selector("setup(address,bytes32,bytes32)"))
+            CallEncoder::<128>::new(const { selector("setup(address,bytes32,bytes32)") })
                 .push_address(&reg)
                 .push_bytes32(&oracle_pol)
                 .push_bytes32(&h_reg)
@@ -800,7 +800,7 @@ mod tests {
         )
         .unwrap();
 
-        let reg_cd = CallEncoder::<96>::new(selector("registerIdentity(address,address)"))
+        let reg_cd = CallEncoder::<96>::new(const { selector("registerIdentity(address,address)") })
             .push_address(&bob_id)
             .push_address(&auth1);
         assert_eq!(
@@ -817,7 +817,7 @@ mod tests {
         let h_sus: [u8; 32] = mock::transact_as(
             admin_id,
             reg,
-            CallEncoder::<64>::new(selector("hashSuspendIdentity(address)"))
+            CallEncoder::<64>::new(const { selector("hashSuspendIdentity(address)") })
                 .push_address(&bob_id)
                 .as_slice(),
         )
@@ -827,7 +827,7 @@ mod tests {
         mock::transact_as(
             admin_id,
             auth2,
-            CallEncoder::<128>::new(selector("setup(address,bytes32,bytes32)"))
+            CallEncoder::<128>::new(const { selector("setup(address,bytes32,bytes32)") })
                 .push_address(&reg)
                 .push_bytes32(&oracle_pol)
                 .push_bytes32(&h_sus)
@@ -837,7 +837,7 @@ mod tests {
         mock::transact_as(
             admin_id,
             reg,
-            CallEncoder::<96>::new(selector("suspendIdentity(address,address)"))
+            CallEncoder::<96>::new(const { selector("suspendIdentity(address,address)") })
                 .push_address(&bob_id)
                 .push_address(&auth2)
                 .as_slice(),
@@ -848,7 +848,7 @@ mod tests {
         let h_rein: [u8; 32] = mock::transact_as(
             admin_id,
             reg,
-            CallEncoder::<64>::new(selector("hashReinstateIdentity(address)"))
+            CallEncoder::<64>::new(const { selector("hashReinstateIdentity(address)") })
                 .push_address(&bob_id)
                 .as_slice(),
         )
@@ -858,7 +858,7 @@ mod tests {
         mock::transact_as(
             admin_id,
             auth3,
-            CallEncoder::<128>::new(selector("setup(address,bytes32,bytes32)"))
+            CallEncoder::<128>::new(const { selector("setup(address,bytes32,bytes32)") })
                 .push_address(&reg)
                 .push_bytes32(&oracle_pol)
                 .push_bytes32(&h_rein)
@@ -868,7 +868,7 @@ mod tests {
         mock::transact_as(
             alice_id,
             reg,
-            CallEncoder::<96>::new(selector("reinstateIdentity(address,address)"))
+            CallEncoder::<96>::new(const { selector("reinstateIdentity(address,address)") })
                 .push_address(&bob_id)
                 .push_address(&auth3)
                 .as_slice(),

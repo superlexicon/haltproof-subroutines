@@ -146,7 +146,7 @@ mod tests {
 
     fn encode_post(channel: [u8; 32], msg: &[u8]) -> Vec<u8> {
         let mut cd = Vec::new();
-        cd.extend_from_slice(&selector("postMessage(bytes32,bytes)"));
+        cd.extend_from_slice(&const { selector("postMessage(bytes32,bytes)") });
         cd.extend_from_slice(&channel);
         let mut off = [0u8; 32];
         off[31] = 0x40;
@@ -162,7 +162,7 @@ mod tests {
 
     fn encode_get(channel: [u8; 32], block: u64) -> Vec<u8> {
         let mut cd = Vec::new();
-        cd.extend_from_slice(&selector("getMessages(bytes32,uint64)"));
+        cd.extend_from_slice(&const { selector("getMessages(bytes32,uint64)") });
         cd.extend_from_slice(&channel);
         let mut bw = [0u8; 32];
         bw[24..32].copy_from_slice(&block.to_be_bytes());

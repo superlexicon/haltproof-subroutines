@@ -354,8 +354,63 @@ impl PolicySpec {
     }
 }
 
-/// Domain-separated Keccak-256 commitment binding a one-time `Authorization` object to
-/// `(target_hps, action_tag, exact_parameters)`.
+/// Fast, zero-Keccak 256-bit (4 x 64-bit) ARX/SplitMix64 sponge commitment for `ActionHasher`.
+pub const fn action_commit_256(data: &[u8]) -> [u8; 32] {
+    let mut s0: u64 = 0x6a09e667f3bcc908 ^ (data.len() as u64);
+    let mut s1: u64 =
+        0xbb67ae8584caa73b ^ ((data.len() as u64).wrapping_mul(0x9e3779b97f4a7c15));
+    let mut s2: u64 = 0x3c6ef372fe94f82b;
+    let mut s3: u64 = 0xa54ff53a5f1d36f1;
+
+    let mut i = 0usize;
+    while i < data.len() {
+        let mut word = 0u64;
+        let mut b = 0usize;
+        while b < 8 && (i + b) < data.len() {
+            word |= (data[i + b] as u64) << (b * 8);
+            b += 1;
+        }
+        if b < 8 {
+            word |= 0x80u64 << (b * 8);
+        }
+        s0 = s0.wrapping_add(word).wrapping_mul(0xbf58476d1ce4e5b9);
+        s1 = (s1 ^ s0.rotate_left(27)).wrapping_mul(0x94d049bb133111eb);
+        s2 = (s2.wrapping_add(s1 ^ word))
+            .rotate_left(31)
+            .wrapping_mul(0x9e3779b97f4a7c15);
+        s3 = (s3 ^ s2.rotate_left(17))
+            .wrapping_add(s0)
+            .wrapping_mul(0xbf58476d1ce4e5b9);
+        i += 8;
+    }
+
+    let mut r = 0;
+    while r < 2 {
+        s0 = (s0 ^ (s3 >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        s1 = (s1 ^ (s0 >> 27)).wrapping_mul(0x94d049bb133111eb);
+        s2 = (s2 ^ (s1 >> 31)).wrapping_mul(0xbf58476d1ce4e5b9);
+        s3 = (s3 ^ (s2 >> 29)).wrapping_mul(0x94d049bb133111eb);
+        r += 1;
+    }
+
+    let mut out = [0u8; 32];
+    let b0 = s0.to_be_bytes();
+    let b1 = s1.to_be_bytes();
+    let b2 = s2.to_be_bytes();
+    let b3 = s3.to_be_bytes();
+    let mut k = 0;
+    while k < 8 {
+        out[k] = b0[k];
+        out[8 + k] = b1[k];
+        out[16 + k] = b2[k];
+        out[24 + k] = b3[k];
+        k += 1;
+    }
+    out
+}
+
+/// Domain-separated 256-bit commitment binding a one-time `Authorization` object to
+/// `(target_hps, action_tag, exact_parameters)` without runtime Keccak-256.
 pub struct ActionHasher<const CAP: usize = 256> {
     buf: [u8; CAP],
     len: usize,
@@ -397,13 +452,13 @@ impl<const CAP: usize> ActionHasher<CAP> {
     }
 
     pub fn push_bytes_digest(self, data: &[u8]) -> Self {
-        let d = keccak256(data);
+        let d = action_commit_256(data);
         self.push_raw(&d)
     }
 
     pub fn finish(&self) -> [u8; 32] {
         debug_assert!(!self.overflowed);
-        keccak256(&self.buf[..self.len])
+        action_commit_256(&self.buf[..self.len])
     }
 }
 
@@ -414,7 +469,8 @@ pub fn require_valid_identity(registry: &[u8; 20], identity: &[u8; 20]) -> Resul
     if *registry == [0u8; 20] || *identity == [0u8; 20] {
         return Err(ERR_INVALID_IDENTITY);
     }
-    let cd = CallEncoder::<64>::new(selector("isValidIdentity(address)")).push_address(identity);
+    let cd =
+        CallEncoder::<64>::new(const { selector("isValidIdentity(address)") }).push_address(identity);
     match call::call_bool(registry, cd.as_slice()) {
         Ok(true) => Ok(()),
         _ => Err(ERR_INVALID_IDENTITY),
@@ -431,7 +487,7 @@ pub fn require_valid_authorization_hps(
     if *registry == [0u8; 20] || *auth_obj == [0u8; 20] {
         return Err(ERR_UNAPPROVED_CODE_HASH);
     }
-    let cd = CallEncoder::<64>::new(selector("isValidAuthorizationHps(address)"))
+    let cd = CallEncoder::<64>::new(const { selector("isValidAuthorizationHps(address)") })
         .push_address(auth_obj);
     match call::call_bool(registry, cd.as_slice()) {
         Ok(true) => Ok(()),
@@ -458,7 +514,7 @@ pub fn verify_and_consume_auth(
     if *registry != crate::context::self_address() {
         require_valid_authorization_hps(registry, auth_obj)?;
     }
-    let cd = CallEncoder::<164>::new(selector("consume(address,bytes32,bytes32,address)"))
+    let cd = CallEncoder::<164>::new(const { selector("consume(address,bytes32,bytes32,address)") })
         .push_address(expected_constitution)
         .push_bytes32(expected_policy_id)
         .push_bytes32(expected_action_hash)
@@ -727,7 +783,7 @@ pub fn verify_and_consume_auction_auth(
         return Err(ERR_AUTH_CONSUME_FAILED);
     }
     require_valid_authorization_hps(registry, auth_obj)?;
-    let cd = CallEncoder::<128>::new(selector("consumeAuction(address,bytes32,address)"))
+    let cd = CallEncoder::<128>::new(const { selector("consumeAuction(address,bytes32,address)") })
         .push_address(expected_constitution)
         .push_bytes32(expected_policy_id)
         .push_address(caller_identity);

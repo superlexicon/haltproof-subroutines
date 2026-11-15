@@ -780,7 +780,7 @@ fn handle_place_buy_order(args: &CalldataReader) -> Result<(), i32> {
     }
 
     // 2. Record buy order in the auction Authorization HPS
-    let order_cd = CallEncoder::<128>::new(selector("placeBuyOrderFor(address,uint64,uint64)"))
+    let order_cd = CallEncoder::<128>::new(const { selector("placeBuyOrderFor(address,uint64,uint64)") })
         .push_address(&buyer)
         .push_u64(price)
         .push_u64(quantity);
@@ -823,7 +823,7 @@ fn handle_cancel_buy_order(args: &CalldataReader) -> Result<(), i32> {
     let bank_ledger = storage::get_address(KEY_DEFAULT_BANK_LEDGER).ok_or(-63)?;
     let clearing_acct = storage::get_address(KEY_CLEARING_ACCOUNT).ok_or(-63)?;
 
-    let cancel_cd = CallEncoder::<96>::new(selector("cancelBuyOrderFor(address,uint64)"))
+    let cancel_cd = CallEncoder::<96>::new(const { selector("cancelBuyOrderFor(address,uint64)") })
         .push_address(&buyer)
         .push_u64(order_index);
     let raw = call::call_raw(&auth_obj, cancel_cd.as_slice())?;
@@ -879,7 +879,7 @@ fn handle_place_sell_order(args: &CalldataReader) -> Result<(), i32> {
     let price = args.u64(1).ok_or(-3)?;
     let quantity = args.u64(2).ok_or(-3)?;
 
-    let order_cd = CallEncoder::<128>::new(selector("placeSellOrderFor(address,uint64,uint64)"))
+    let order_cd = CallEncoder::<128>::new(const { selector("placeSellOrderFor(address,uint64,uint64)") })
         .push_address(&seller)
         .push_u64(price)
         .push_u64(quantity);
@@ -898,7 +898,7 @@ fn handle_settle_share_transfer_auction(args: &CalldataReader) -> Result<(), i32
     let auth_obj = args.address(1).ok_or(-3)?;
 
     let settle_cd =
-        CallEncoder::<64>::new(selector("settleTransferAuction(address)")).push_address(&auth_obj);
+        CallEncoder::<64>::new(const { selector("settleTransferAuction(address)") }).push_address(&auth_obj);
     let out = call::call_raw(&share_ledger, settle_cd.as_slice())?;
     ret::write(out);
     Ok(())
@@ -937,7 +937,7 @@ fn handle_disburse_auction_cash(args: &CalldataReader) -> Result<(), i32> {
 
     // Verify caller is the exact target share AssetLedger bound to `auth_obj`
     let caller = context::msg_sender();
-    let target_cd = CallEncoder::<16>::new(selector("targetHps()"));
+    let target_cd = CallEncoder::<16>::new(const { selector("targetHps()") });
     let Ok(raw_target) = call::call_raw(&auth_obj, target_cd.as_slice()) else {
         return Err(-62);
     };
@@ -1115,9 +1115,9 @@ fn handle_shareholder_voting_power(args: &CalldataReader) -> Result<(), i32> {
     let mut i = 0;
     while i < count {
         let c = &classes[i];
-        let bal_cd = CallEncoder::<64>::new(selector("balanceOf(address)")).push_address(&voter);
+        let bal_cd = CallEncoder::<64>::new(const { selector("balanceOf(address)") }).push_address(&voter);
         let bal = call::call_u64(&c.ledger, bal_cd.as_slice()).unwrap_or(0);
-        let sup_cd = CallEncoder::<16>::new(selector("totalOutstanding()"));
+        let sup_cd = CallEncoder::<16>::new(const { selector("totalOutstanding()") });
         let supply = call::call_u64(&c.ledger, sup_cd.as_slice()).unwrap_or(0);
 
         voter_power = voter_power.saturating_add(c.voting_power(bal));
@@ -1270,12 +1270,12 @@ mod tests {
         use hps_sdk::{ret, selector};
         pub fn dispatch(raw: &[u8]) -> i32 {
             let Some((sel, args)) = CalldataReader::parse(raw) else { return -1; };
-            if sel == selector("isValidIdentity(address)") {
+            if sel == const { selector("isValidIdentity(address)") } {
                 let a = args.address(0).unwrap();
                 ret::write_bool(a[0] != 0xEE && a != [0u8; 20]);
                 return 0;
             }
-            if sel == selector("isValidAuthorizationHps(address)") {
+            if sel == const { selector("isValidAuthorizationHps(address)") } {
                 let a = args.address(0).unwrap();
                 ret::write_bool(hps_sdk::context::code_hash_of(&a).is_some());
                 return 0;
@@ -1333,7 +1333,7 @@ mod tests {
         blob.extend_from_slice(&buf_i[..len_i]);
 
         let mut cd = Vec::new();
-        cd.extend_from_slice(&selector("initialize(address,bytes)"));
+        cd.extend_from_slice(&const { selector("initialize(address,bytes)") });
         let mut rw = [0u8; 32];
         rw[12..32].copy_from_slice(&reg);
         cd.extend_from_slice(&rw);
@@ -1350,7 +1350,7 @@ mod tests {
 
         // Fetch ACTION_ISSUE for a specific ledger (resolves global fallback cleanly)
         let ledger = [0x55; 20];
-        let get_cd = CallEncoder::<96>::new(selector("getPolicyRaw(address,bytes32)"))
+        let get_cd = CallEncoder::<96>::new(const { selector("getPolicyRaw(address,bytes32)") })
             .push_address(&ledger)
             .push_bytes32(&ACTION_ISSUE);
         let ret_bytes = mock::transact_as(board_1, con, get_cd.as_slice()).unwrap();
@@ -1368,12 +1368,12 @@ mod tests {
             use hps_sdk::{ret, selector, storage};
             pub fn dispatch(raw: &[u8]) -> i32 {
                 let Some((sel, args)) = CalldataReader::parse(raw) else { return -1; };
-                if sel == selector("arm(bytes32)") {
+                if sel == const { selector("arm(bytes32)") } {
                     storage::set(b"hash", &args.bytes32(0).unwrap());
                     storage::set_u64(b"used", 0);
                     return 0;
                 }
-                if sel == selector("consume(address,bytes32,bytes32,address)") {
+                if sel == const { selector("consume(address,bytes32,bytes32,address)") } {
                     if storage::get_u64(b"used") != 0 {
                         return -68;
                     }
@@ -1432,7 +1432,7 @@ mod tests {
         blob.extend_from_slice(&buf_b[..len_b]);
 
         let mut cd = Vec::new();
-        cd.extend_from_slice(&selector("initialize(address,bytes)"));
+        cd.extend_from_slice(&const { selector("initialize(address,bytes)") });
         let mut rw = [0u8; 32];
         rw[12..32].copy_from_slice(&reg);
         cd.extend_from_slice(&rw);
@@ -1450,7 +1450,7 @@ mod tests {
             let out = mock::transact_as(
                 manogaran,
                 con,
-                CallEncoder::<16>::new(selector("directorCount()")).as_slice(),
+                CallEncoder::<16>::new(const { selector("directorCount()") }).as_slice(),
             )
             .unwrap();
             u64::from_be_bytes(out[24..32].try_into().unwrap())
@@ -1461,7 +1461,7 @@ mod tests {
         let h_add: [u8; 32] = mock::transact_as(
             manogaran,
             con,
-            CallEncoder::<64>::new(selector("hashAddDirector(address)"))
+            CallEncoder::<64>::new(const { selector("hashAddDirector(address)") })
                 .push_address(&third_dir)
                 .as_slice(),
         )
@@ -1471,7 +1471,7 @@ mod tests {
         mock::transact_as(
             manogaran,
             auth_add,
-            CallEncoder::<64>::new(selector("arm(bytes32)"))
+            CallEncoder::<64>::new(const { selector("arm(bytes32)") })
                 .push_bytes32(&h_add)
                 .as_slice(),
         )
@@ -1479,7 +1479,7 @@ mod tests {
         mock::transact_as(
             manogaran,
             con,
-            CallEncoder::<96>::new(selector("addDirector(address,address)"))
+            CallEncoder::<96>::new(const { selector("addDirector(address,address)") })
                 .push_address(&third_dir)
                 .push_address(&auth_add)
                 .as_slice(),
@@ -1491,7 +1491,7 @@ mod tests {
         let h_rem: [u8; 32] = mock::transact_as(
             manogaran,
             con,
-            CallEncoder::<64>::new(selector("hashRemoveDirector(address)"))
+            CallEncoder::<64>::new(const { selector("hashRemoveDirector(address)") })
                 .push_address(&third_dir)
                 .as_slice(),
         )
@@ -1501,7 +1501,7 @@ mod tests {
         mock::transact_as(
             manogaran,
             auth_rem,
-            CallEncoder::<64>::new(selector("arm(bytes32)"))
+            CallEncoder::<64>::new(const { selector("arm(bytes32)") })
                 .push_bytes32(&h_rem)
                 .as_slice(),
         )
@@ -1509,7 +1509,7 @@ mod tests {
         mock::transact_as(
             manogaran,
             con,
-            CallEncoder::<96>::new(selector("removeDirector(address,address)"))
+            CallEncoder::<96>::new(const { selector("removeDirector(address,address)") })
                 .push_address(&third_dir)
                 .push_address(&auth_rem)
                 .as_slice(),
@@ -1530,12 +1530,12 @@ mod tests {
             use hps_sdk::{context, ret, selector, storage};
             pub fn dispatch(raw: &[u8]) -> i32 {
                 let Some((sel, args)) = CalldataReader::parse(raw) else { return -1; };
-                if sel == selector("arm(bytes32)") {
+                if sel == const { selector("arm(bytes32)") } {
                     storage::set(b"hash", &args.bytes32(0).unwrap());
                     storage::set_u64(b"used", 0);
                     return 0;
                 }
-                if sel == selector("consume(address,bytes32,bytes32,address)") {
+                if sel == const { selector("consume(address,bytes32,bytes32,address)") } {
                     if storage::get_u64(b"used") != 0 {
                         return -68;
                     }
@@ -1546,15 +1546,15 @@ mod tests {
                     ret::write_bool(true);
                     return 0;
                 }
-                if sel == selector("setTarget(address)") {
+                if sel == const { selector("setTarget(address)") } {
                     storage::set_address(b"target", &args.address(0).unwrap());
                     return 0;
                 }
-                if sel == selector("targetHps()") {
+                if sel == const { selector("targetHps()") } {
                     ret::write_address(&storage::get_address(b"target").unwrap_or([0u8; 20]));
                     return 0;
                 }
-                if sel == selector("placeBuyOrderFor(address,uint64,uint64)") {
+                if sel == const { selector("placeBuyOrderFor(address,uint64,uint64)") } {
                     let price = args.u64(1).unwrap();
                     let qty = args.u64(2).unwrap();
                     let idx = storage::get_u64(b"cnt");
@@ -1565,7 +1565,7 @@ mod tests {
                     ret::write_u64_word(idx);
                     return 0;
                 }
-                if sel == selector("cancelBuyOrderFor(address,uint64)") {
+                if sel == const { selector("cancelBuyOrderFor(address,uint64)") } {
                     let now = context::block_number();
                     if now > 110 {
                         return ERR_WRONG_AUCTION_STEP;
@@ -1589,7 +1589,7 @@ mod tests {
             }
             pub fn dispatch(raw: &[u8]) -> i32 {
                 let Some((sel, args)) = CalldataReader::parse(raw) else { return -1; };
-                if sel == selector("setBal(address,uint64,uint64)") {
+                if sel == const { selector("setBal(address,uint64,uint64)") } {
                     let id = args.address(0).unwrap();
                     let bal = args.u64(1).unwrap();
                     let sup = args.u64(2).unwrap();
@@ -1597,16 +1597,16 @@ mod tests {
                     storage::set_u64(b"sup", sup);
                     return 0;
                 }
-                if sel == selector("balanceOf(address)") {
+                if sel == const { selector("balanceOf(address)") } {
                     let id = args.address(0).unwrap();
                     ret::write_u64_word(storage::get_u64(bkey(&id).as_slice()));
                     return 0;
                 }
-                if sel == selector("totalOutstanding()") {
+                if sel == const { selector("totalOutstanding()") } {
                     ret::write_u64_word(storage::get_u64(b"sup"));
                     return 0;
                 }
-                if sel == selector("constitutionClearTransfer(address,address,uint64)") {
+                if sel == const { selector("constitutionClearTransfer(address,address,uint64)") } {
                     let from = args.address(0).unwrap();
                     let to = args.address(1).unwrap();
                     let amt = args.u64(2).unwrap();
@@ -1679,7 +1679,7 @@ mod tests {
         blob.extend_from_slice(&buf_b[..len_b]);
 
         let mut cd = Vec::new();
-        cd.extend_from_slice(&selector("initialize(address,bytes)"));
+        cd.extend_from_slice(&const { selector("initialize(address,bytes)") });
         let mut rw = [0u8; 32];
         rw[12..32].copy_from_slice(&reg);
         cd.extend_from_slice(&rw);
@@ -1697,7 +1697,7 @@ mod tests {
         let h_ora: [u8; 32] = mock::transact_as(
             manogaran,
             con,
-            CallEncoder::<128>::new(selector("hashSetBankOracle(address,address,uint64)"))
+            CallEncoder::<128>::new(const { selector("hashSetBankOracle(address,address,uint64)") })
                 .push_address(&bank_ledger)
                 .push_address(&bank_oracle_1)
                 .push_u64(40)
@@ -1709,7 +1709,7 @@ mod tests {
         mock::transact_as(
             manogaran,
             board_auth_1,
-            CallEncoder::<64>::new(selector("arm(bytes32)"))
+            CallEncoder::<64>::new(const { selector("arm(bytes32)") })
                 .push_bytes32(&h_ora)
                 .as_slice(),
         )
@@ -1732,7 +1732,7 @@ mod tests {
         let ora_out = mock::transact_as(
             manogaran,
             con,
-            CallEncoder::<64>::new(selector("bankOracleOf(address)"))
+            CallEncoder::<64>::new(const { selector("bankOracleOf(address)") })
                 .push_address(&bank_ledger)
                 .as_slice(),
         )
@@ -1741,7 +1741,7 @@ mod tests {
         let has_pol = mock::transact_as(
             manogaran,
             con,
-            CallEncoder::<96>::new(selector("hasPolicy(address,bytes32)"))
+            CallEncoder::<96>::new(const { selector("hasPolicy(address,bytes32)") })
                 .push_address(&bank_ledger)
                 .push_bytes32(&POLICY_BANK_ORACLE)
                 .as_slice(),
@@ -1753,7 +1753,7 @@ mod tests {
         mock::transact_as(
             manogaran,
             con,
-            CallEncoder::<128>::new(selector("setClearingAccount(address,address,address)"))
+            CallEncoder::<128>::new(const { selector("setClearingAccount(address,address,address)") })
                 .push_address(&bank_ledger)
                 .push_address(&clearing_acct)
                 .push_address(&[0u8; 20])
@@ -1763,7 +1763,7 @@ mod tests {
         mock::transact_as(
             manogaran,
             bank_ledger,
-            CallEncoder::<128>::new(selector("setBal(address,uint64,uint64)"))
+            CallEncoder::<128>::new(const { selector("setBal(address,uint64,uint64)") })
                 .push_address(&buyer_1)
                 .push_u64(500_000)
                 .push_u64(500_000)
@@ -1775,7 +1775,7 @@ mod tests {
             let out = mock::transact_as(
                 manogaran,
                 bank_ledger,
-                CallEncoder::<64>::new(selector("balanceOf(address)"))
+                CallEncoder::<64>::new(const { selector("balanceOf(address)") })
                     .push_address(&who)
                     .as_slice(),
             )
@@ -1789,7 +1789,7 @@ mod tests {
             mock::transact_as(
                 buyer_1,
                 con,
-                CallEncoder::<128>::new(selector("placeBuyOrder(address,uint64,uint64)"))
+                CallEncoder::<128>::new(const { selector("placeBuyOrder(address,uint64,uint64)") })
                     .push_address(&auc_auth)
                     .push_u64(100)
                     .push_u64(6_000)
@@ -1804,7 +1804,7 @@ mod tests {
         mock::transact_as(
             buyer_1,
             con,
-            CallEncoder::<128>::new(selector("placeBuyOrder(address,uint64,uint64)"))
+            CallEncoder::<128>::new(const { selector("placeBuyOrder(address,uint64,uint64)") })
                 .push_address(&auc_auth)
                 .push_u64(100)
                 .push_u64(3_000)
@@ -1819,7 +1819,7 @@ mod tests {
         mock::transact_as(
             buyer_1,
             con,
-            CallEncoder::<96>::new(selector("cancelBuyOrder(address,uint64)"))
+            CallEncoder::<96>::new(const { selector("cancelBuyOrder(address,uint64)") })
                 .push_address(&auc_auth)
                 .push_u64(0)
                 .as_slice(),
@@ -1834,7 +1834,7 @@ mod tests {
         mock::transact_as(
             buyer_1,
             con,
-            CallEncoder::<128>::new(selector("placeBuyOrder(address,uint64,uint64)"))
+            CallEncoder::<128>::new(const { selector("placeBuyOrder(address,uint64,uint64)") })
                 .push_address(&auc_auth)
                 .push_u64(100)
                 .push_u64(4_000)
@@ -1849,7 +1849,7 @@ mod tests {
             mock::transact_as(
                 buyer_1,
                 con,
-                CallEncoder::<96>::new(selector("cancelBuyOrder(address,uint64)"))
+                CallEncoder::<96>::new(const { selector("cancelBuyOrder(address,uint64)") })
                     .push_address(&auc_auth)
                     .push_u64(1)
                     .as_slice(),
@@ -1861,7 +1861,7 @@ mod tests {
         mock::transact_as(
             manogaran,
             auc_auth,
-            CallEncoder::<64>::new(selector("setTarget(address)"))
+            CallEncoder::<64>::new(const { selector("setTarget(address)") })
                 .push_address(&common_ledger)
                 .as_slice(),
         )
@@ -1916,7 +1916,7 @@ mod tests {
         mock::transact_as(
             manogaran,
             common_ledger,
-            CallEncoder::<128>::new(selector("setBal(address,uint64,uint64)"))
+            CallEncoder::<128>::new(const { selector("setBal(address,uint64,uint64)") })
                 .push_address(&manogaran)
                 .push_u64(50_000)
                 .push_u64(100_000)
@@ -1926,7 +1926,7 @@ mod tests {
         mock::transact_as(
             manogaran,
             pref_a_ledger,
-            CallEncoder::<128>::new(selector("setBal(address,uint64,uint64)"))
+            CallEncoder::<128>::new(const { selector("setBal(address,uint64,uint64)") })
                 .push_address(&evelyn)
                 .push_u64(20_000)
                 .push_u64(20_000)
@@ -1936,7 +1936,7 @@ mod tests {
         mock::transact_as(
             manogaran,
             class_b_ledger,
-            CallEncoder::<128>::new(selector("setBal(address,uint64,uint64)"))
+            CallEncoder::<128>::new(const { selector("setBal(address,uint64,uint64)") })
                 .push_address(&manogaran)
                 .push_u64(6_000)
                 .push_u64(6_000)
@@ -1946,7 +1946,7 @@ mod tests {
         mock::transact_as(
             manogaran,
             non_voting_ledger,
-            CallEncoder::<128>::new(selector("setBal(address,uint64,uint64)"))
+            CallEncoder::<128>::new(const { selector("setBal(address,uint64,uint64)") })
                 .push_address(&buyer_1)
                 .push_u64(50_000)
                 .push_u64(50_000)
@@ -1957,7 +1957,7 @@ mod tests {
         let mano_vp = mock::transact_as(
             manogaran,
             con,
-            CallEncoder::<64>::new(selector("shareholderVotingPower(address)"))
+            CallEncoder::<64>::new(const { selector("shareholderVotingPower(address)") })
                 .push_address(&manogaran)
                 .as_slice(),
         )
@@ -1970,7 +1970,7 @@ mod tests {
         let evelyn_vp = mock::transact_as(
             manogaran,
             con,
-            CallEncoder::<64>::new(selector("shareholderVotingPower(address)"))
+            CallEncoder::<64>::new(const { selector("shareholderVotingPower(address)") })
                 .push_address(&evelyn)
                 .as_slice(),
         )
@@ -1981,7 +1981,7 @@ mod tests {
         let buyer_vp = mock::transact_as(
             manogaran,
             con,
-            CallEncoder::<64>::new(selector("shareholderVotingPower(address)"))
+            CallEncoder::<64>::new(const { selector("shareholderVotingPower(address)") })
                 .push_address(&buyer_1)
                 .as_slice(),
         )

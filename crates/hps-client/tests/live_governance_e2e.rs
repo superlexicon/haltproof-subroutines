@@ -1570,7 +1570,7 @@ async fn simplex_hps_gas_usage_profile_on_localtestnet() {
         ("Constitution", "clearingAccount() [view]", &cd_con_clearing, &b5[2]),
         ("Constitution", "directorCount() [view]", &cd_con_dircount, &b4[0]),
         ("Constitution", "hasPolicy(address,bytes32) [view]", &cd_con_haspol, &b4[1]),
-        ("Constitution", "hashAddDirector(address) [pure Keccak256]", &cd_con_hash_add, &b4[2]),
+        ("Constitution", "hashAddDirector(address) [pure action_commit_256]", &cd_con_hash_add, &b4[2]),
         ("Constitution", "initialize(registry, 1 policy) [via Identity]", &cd_con_init, &b3[4]),
         ("Authorization", "status() [view]", &cd_auth_state, &b5[0]),
         ("Authorization", "initConstitutionAuth(...) [via Identity]", &cd_auth_init, &b4[6]),

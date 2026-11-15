@@ -167,13 +167,13 @@ fn handle_place_ask_order(args: &CalldataReader) -> Result<(), i32> {
     }
 
     let otc_self = context::self_address();
-    let bal_q = CallEncoder::<64>::new(selector("balanceOf(address)")).push_address(&seller_id);
+    let bal_q = CallEncoder::<64>::new(const { selector("balanceOf(address)") }).push_address(&seller_id);
     let seller_bal = call::call_u64(&base_ledger, bal_q.as_slice())?;
     if seller_bal < base_qty {
         return Err(-35);
     }
 
-    let alw_q = CallEncoder::<96>::new(selector("allowance(address,address)"))
+    let alw_q = CallEncoder::<96>::new(const { selector("allowance(address,address)") })
         .push_address(&seller_id)
         .push_address(&otc_self);
     let seller_alw = call::call_u64(&base_ledger, alw_q.as_slice())?;
@@ -236,7 +236,7 @@ fn handle_buy_order(args: &CalldataReader) -> Result<(), i32> {
     let total_quote = base_qty.checked_mul(ask.unit_price_quote).ok_or(-39)?;
 
     // Leg 1: Debit Buyer's Quote Asset balance and credit Seller's Identity in `quoteLedger`.
-    let quote_tf = CallEncoder::<128>::new(selector("transferFrom(address,address,uint64)"))
+    let quote_tf = CallEncoder::<128>::new(const { selector("transferFrom(address,address,uint64)") })
         .push_address(&buyer_identity)
         .push_address(&seller_id)
         .push_u64(total_quote);
@@ -245,7 +245,7 @@ fn handle_buy_order(args: &CalldataReader) -> Result<(), i32> {
     }
 
     // Leg 2: Debit Seller's Base Asset balance and credit Buyer's Identity in `baseLedger`.
-    let base_tf = CallEncoder::<128>::new(selector("transferFrom(address,address,uint64)"))
+    let base_tf = CallEncoder::<128>::new(const { selector("transferFrom(address,address,uint64)") })
         .push_address(&seller_id)
         .push_address(&buyer_identity)
         .push_u64(base_qty);
@@ -335,7 +335,7 @@ mod tests {
 
         pub fn reg_dispatch(raw: &[u8]) -> i32 {
             let Some((sel, args)) = CalldataReader::parse(raw) else { return -1; };
-            if sel == selector("isValidIdentity(address)") {
+            if sel == const { selector("isValidIdentity(address)") } {
                 let id = args.address(0).unwrap();
                 ret::write_bool(id == [0x11; 20] || id == [0x22; 20]);
                 return 0;
@@ -345,14 +345,14 @@ mod tests {
 
         pub fn ledger_dispatch(raw: &[u8]) -> i32 {
             let Some((sel, args)) = CalldataReader::parse(raw) else { return -1; };
-            if sel == selector("seed(address,uint64)") {
+            if sel == const { selector("seed(address,uint64)") } {
                 let to = args.address(0).unwrap();
                 let amt = args.u64(1).unwrap();
                 let bk = KeyBuilder::<32>::new().push(b"bal:").push(&to);
                 storage::set_u64(bk.as_slice(), amt);
                 return 0;
             }
-            if sel == selector("approve(address,uint64)") {
+            if sel == const { selector("approve(address,uint64)") } {
                 let owner = context::msg_sender();
                 let spender = args.address(0).unwrap();
                 let amt = args.u64(1).unwrap();
@@ -361,20 +361,20 @@ mod tests {
                 ret::write_bool(true);
                 return 0;
             }
-            if sel == selector("balanceOf(address)") {
+            if sel == const { selector("balanceOf(address)") } {
                 let who = args.address(0).unwrap();
                 let bk = KeyBuilder::<32>::new().push(b"bal:").push(&who);
                 ret::write_u64_word(storage::get_u64(bk.as_slice()));
                 return 0;
             }
-            if sel == selector("allowance(address,address)") {
+            if sel == const { selector("allowance(address,address)") } {
                 let owner = args.address(0).unwrap();
                 let spender = args.address(1).unwrap();
                 let ak = KeyBuilder::<64>::new().push(b"alw:").push(&owner).push(&spender);
                 ret::write_u64_word(storage::get_u64(ak.as_slice()));
                 return 0;
             }
-            if sel == selector("transferFrom(address,address,uint64)") {
+            if sel == const { selector("transferFrom(address,address,uint64)") } {
                 let from = args.address(0).unwrap();
                 let to = args.address(1).unwrap();
                 let amt = args.u64(2).unwrap();
@@ -419,7 +419,7 @@ mod tests {
         mock::transact_as(
             seller_id,
             base_ledger,
-            CallEncoder::<96>::new(selector("seed(address,uint64)"))
+            CallEncoder::<96>::new(const { selector("seed(address,uint64)") })
                 .push_address(&seller_id)
                 .push_u64(500)
                 .as_slice(),
@@ -428,7 +428,7 @@ mod tests {
         mock::transact_as(
             buyer_id,
             quote_ledger,
-            CallEncoder::<96>::new(selector("seed(address,uint64)"))
+            CallEncoder::<96>::new(const { selector("seed(address,uint64)") })
                 .push_address(&buyer_id)
                 .push_u64(50_000)
                 .as_slice(),
@@ -438,7 +438,7 @@ mod tests {
         mock::transact_as(
             seller_id,
             otc,
-            CallEncoder::<160>::new(selector("initialize(address,address,address,address)"))
+            CallEncoder::<160>::new(const { selector("initialize(address,address,address,address)") })
                 .push_address(&reg)
                 .push_address(&seller_id)
                 .push_address(&base_ledger)
@@ -450,7 +450,7 @@ mod tests {
         mock::transact_as(
             seller_id,
             base_ledger,
-            CallEncoder::<96>::new(selector("approve(address,uint64)"))
+            CallEncoder::<96>::new(const { selector("approve(address,uint64)") })
                 .push_address(&otc)
                 .push_u64(200)
                 .as_slice(),
@@ -461,7 +461,7 @@ mod tests {
         mock::transact_as(
             seller_id,
             otc,
-            CallEncoder::<128>::new(selector("placeAskOrder(bytes32,uint64,uint64)"))
+            CallEncoder::<128>::new(const { selector("placeAskOrder(bytes32,uint64,uint64)") })
                 .push_bytes32(&item_id)
                 .push_u64(200)
                 .push_u64(100)
@@ -470,7 +470,7 @@ mod tests {
         .unwrap();
 
         // Unverified identity cannot buy!
-        let buy_cd = CallEncoder::<96>::new(selector("buyOrder(bytes32,uint64)"))
+        let buy_cd = CallEncoder::<96>::new(const { selector("buyOrder(bytes32,uint64)") })
             .push_bytes32(&item_id)
             .push_u64(25);
         assert_eq!(
@@ -482,7 +482,7 @@ mod tests {
         mock::transact_as(
             buyer_id,
             quote_ledger,
-            CallEncoder::<96>::new(selector("approve(address,uint64)"))
+            CallEncoder::<96>::new(const { selector("approve(address,uint64)") })
                 .push_address(&otc)
                 .push_u64(2_500)
                 .as_slice(),
