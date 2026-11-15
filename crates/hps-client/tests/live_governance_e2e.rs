@@ -290,6 +290,8 @@ async fn full_institutional_governance_ledger_and_otc_on_localtestnet() {
         std::fs::read(dist.join("asset_ledger.wasm")).expect("dist/asset_ledger.wasm");
     let otc_wasm =
         std::fs::read(dist.join("asset_pair_otc.wasm")).expect("dist/asset_pair_otc.wasm");
+    let messaging_wasm =
+        std::fs::read(dist.join("messaging.wasm")).expect("dist/messaging.wasm");
 
     // Deployer + 9 distinct EOAs controlling 9 distinct Identity HPS instances
     let mut deployer = HpsSigner::from_hex(DEFAULT_DEV_PRIVATE_KEY, DEFAULT_CHAIN_ID).unwrap();
@@ -381,10 +383,14 @@ async fn full_institutional_governance_ledger_and_otc_on_localtestnet() {
     );
 
     // -------------------------------------------------------------------------
-    // STEP 3: Deploy & initialize IdentityRegistry (NewMemberId initially omitted)
+    // STEP 3: Deploy & initialize IdentityRegistry with canonical WASM code_hashes
     // -------------------------------------------------------------------------
     let reg_rcpt = client.deploy_hps(&deployer, &registry_wasm, &[]).await.unwrap();
     let registry_hps: H160 = reg_rcpt.hps_address.parse().unwrap();
+
+    // Deploy an unapproved subroutine (`messaging.wasm`) to simulate a malicious Identity / Authorization clone!
+    let clone_rcpt = client.deploy_hps(&deployer, &messaging_wasm, &[]).await.unwrap();
+    let malicious_clone_hps: H160 = clone_rcpt.hps_address.parse().unwrap();
 
     let mut initial_valid = Vec::new();
     for valid_id in [
@@ -400,8 +406,13 @@ async fn full_institutional_governance_ledger_and_otc_on_localtestnet() {
         initial_valid.extend_from_slice(valid_id.as_bytes());
     }
     let init_reg_cd = encode_values(
-        "initialize(address,bytes)",
-        &[AbiValue::Address(admin_id), AbiValue::Bytes(initial_valid)],
+        "initialize(address,bytes32,bytes32,bytes)",
+        &[
+            AbiValue::Address(admin_id),
+            AbiValue::Bytes32(*id_code.as_fixed_bytes()),
+            AbiValue::Bytes32(*auth_code.as_fixed_bytes()),
+            AbiValue::Bytes(initial_valid),
+        ],
     );
     let rcpt = client.send_call(&deployer, registry_hps, &init_reg_cd).await.unwrap();
     assert!(rcpt.status, "IdentityRegistry.initialize failed");
@@ -413,8 +424,51 @@ async fn full_institutional_governance_ledger_and_otc_on_localtestnet() {
         read_u64(&client, registry_hps, "isValidIdentity(address)", &[AbiValue::Address(new_member_id)]).await,
         0
     );
+    assert_eq!(
+        read_u64(&client, registry_hps, "isValidAuthorizationHps(address)", &[AbiValue::Address(auth_reg_new_member)]).await,
+        1
+    );
+    assert_eq!(
+        read_u64(&client, registry_hps, "isValidAuthorizationHps(address)", &[AbiValue::Address(malicious_clone_hps)]).await,
+        0
+    );
 
-    // Register NewMemberId via AdminId + single-account oracle Authorization (one-time use!)
+    // 3a. Attempting to register a malicious Identity clone OR a raw EOA MUST revert on-chain!
+    let bad_clone_reg_inner = encode_values(
+        "registerIdentity(address,address)",
+        &[AbiValue::Address(malicious_clone_hps), AbiValue::Address(auth_reg_new_member)],
+    );
+    let bad_clone_rcpt = client
+        .send_call(
+            &admin_eoa,
+            admin_id,
+            &encode_values(
+                "execute(address,bytes)",
+                &[AbiValue::Address(registry_hps), AbiValue::Bytes(bad_clone_reg_inner)],
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(!bad_clone_rcpt.status, "registering a malicious Identity clone MUST revert!");
+
+    let bad_eoa_reg_inner = encode_values(
+        "registerIdentity(address,address)",
+        &[AbiValue::Address(new_member_eoa.address()), AbiValue::Address(auth_reg_new_member)],
+    );
+    let bad_eoa_rcpt = client
+        .send_call(
+            &admin_eoa,
+            admin_id,
+            &encode_values(
+                "execute(address,bytes)",
+                &[AbiValue::Address(registry_hps), AbiValue::Bytes(bad_eoa_reg_inner)],
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(!bad_eoa_rcpt.status, "registering a raw EOA MUST revert!");
+
+    // 3b. Register canonical NewMemberId via AdminId + single-account oracle Authorization (one-time use!)
     let reg_action_hash = read_b32(
         &client,
         registry_hps,
@@ -673,7 +727,22 @@ async fn full_institutional_governance_ledger_and_otc_on_localtestnet() {
     );
     assert_eq!(read_u64(&client, auth_issue_gold, "isReadyToConsume()", &[]).await, 1);
 
-    // 6e. Execute `GOLD.issue(NewMemberId, 500, auth_issue_gold)` via `SellerId.issueAsset(...)`
+    // 6e. Passing a spoofed Authorization clone (`malicious_clone_hps`) MUST revert on-chain!
+    let spoofed_issue_cd = encode_values(
+        "issueAsset(address,address,uint64,address)",
+        &[
+            AbiValue::Address(gold_ledger),
+            AbiValue::Address(new_member_id),
+            AbiValue::Uint(U256::from(500u64)),
+            AbiValue::Address(malicious_clone_hps),
+        ],
+    );
+    assert!(
+        !client.send_call(&seller_eoa, seller_id, &spoofed_issue_cd).await.unwrap().status,
+        "passing spoofed Authorization clone to AssetLedger.issue MUST revert!"
+    );
+
+    // 6f. Execute `GOLD.issue(NewMemberId, 500, auth_issue_gold)` via `SellerId.issueAsset(...)`
     let issue_cd = encode_values(
         "issueAsset(address,address,uint64,address)",
         &[
@@ -692,7 +761,7 @@ async fn full_institutional_governance_ledger_and_otc_on_localtestnet() {
 
     // Replaying `auth_issue_gold` MUST revert!
     assert!(!client.send_call(&seller_eoa, seller_id, &issue_cd).await.unwrap().status);
-    println!("[6/10] 2-stage sequential + weighted GOLD issuance (+500 -> supply=1600) succeeded; out-of-order & replay rejected");
+    println!("[6/10] 2-stage sequential + weighted GOLD issuance (+500 -> supply=1600) succeeded; spoofed Auth clone, out-of-order & replay rejected");
 
     // -------------------------------------------------------------------------
     // STEP 7: Block-Height Expiry Enforcement on `Authorization`

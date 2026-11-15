@@ -251,6 +251,7 @@ fn ensure_initialized_and_valid_caller() -> Result<([u8; 20], [u8; 20]), i32> {
 }
 
 fn require_and_consume_permission(
+    registry: &[u8; 20],
     action_key: &[u8; 32],
     subject_holder: Option<&[u8; 20]>,
     action_hash: &[u8; 32],
@@ -266,6 +267,7 @@ fn require_and_consume_permission(
             (rule.constitution, rule.policy_id)
         };
     verify_and_consume_auth(
+        registry,
         auth_obj,
         &expected_con,
         &expected_pol,
@@ -380,7 +382,7 @@ fn handle_issue(args: &CalldataReader) -> Result<(), i32> {
 
     require_valid_identity(&registry, &to_identity)?;
     let action_hash = compute_issue_hash(&to_identity, amount);
-    require_and_consume_permission(&ACTION_ISSUE, None, &action_hash, &auth_obj, &caller)?;
+    require_and_consume_permission(&registry, &ACTION_ISSUE, None, &action_hash, &auth_obj, &caller)?;
 
     let new_supply = storage::get_u64(KEY_SUPPLY)
         .checked_add(amount)
@@ -417,6 +419,7 @@ fn handle_cancel(args: &CalldataReader) -> Result<(), i32> {
     require_valid_identity(&registry, &from_identity)?;
     let action_hash = compute_cancel_hash(&from_identity, amount);
     require_and_consume_permission(
+        &registry,
         &ACTION_CANCEL,
         Some(&from_identity),
         &action_hash,
@@ -469,6 +472,7 @@ fn handle_transfer(args: &CalldataReader) -> Result<(), i32> {
 
     let action_hash = compute_transfer_hash(&from_identity, &to_identity, amount);
     require_and_consume_permission(
+        &registry,
         &ACTION_TRANSFER,
         Some(&from_identity),
         &action_hash,
@@ -494,7 +498,7 @@ fn handle_transfer(args: &CalldataReader) -> Result<(), i32> {
 /// Authorize a settlement contract `spender` (such as `AssetPair_OTC`) to debit up to `amount`
 /// from the calling valid Identity's balance. Requires a one-time `Authorization` object matching `ACTION_APPROVE`.
 fn handle_approve(args: &CalldataReader) -> Result<(), i32> {
-    let (_registry, caller) = ensure_initialized_and_valid_caller()?;
+    let (registry, caller) = ensure_initialized_and_valid_caller()?;
     let spender = args.address(0).ok_or(-3)?;
     let amount = args.u64(1).ok_or(-3)?;
     let auth_obj = args.address(2).ok_or(-3)?;
@@ -504,6 +508,7 @@ fn handle_approve(args: &CalldataReader) -> Result<(), i32> {
 
     let action_hash = compute_approve_hash(&caller, &spender, amount);
     require_and_consume_permission(
+        &registry,
         &ACTION_APPROVE,
         Some(&caller),
         &action_hash,
@@ -565,7 +570,7 @@ fn handle_transfer_from(args: &CalldataReader) -> Result<(), i32> {
 /// Update or add a permission rule for `actionKey`.
 /// Requires a finalized, one-time-use **`SUPER`** `Authorization` HPS object fulfilling `ACTION_SUPER`.
 fn handle_set_permission(args: &CalldataReader) -> Result<(), i32> {
-    let (_registry, caller) = ensure_initialized_and_valid_caller()?;
+    let (registry, caller) = ensure_initialized_and_valid_caller()?;
     let action_key = args.bytes32(0).ok_or(-3)?;
     let constitution = args.address(1).ok_or(-3)?;
     let policy_id = args.bytes32(2).ok_or(-3)?;
@@ -579,7 +584,7 @@ fn handle_set_permission(args: &CalldataReader) -> Result<(), i32> {
     }
 
     let action_hash = compute_set_perm_hash(&action_key, &constitution, &policy_id);
-    require_and_consume_permission(&ACTION_SUPER, None, &action_hash, &super_auth, &caller)?;
+    require_and_consume_permission(&registry, &ACTION_SUPER, None, &action_hash, &super_auth, &caller)?;
 
     store_permission(&action_key, &constitution, &policy_id);
 
@@ -709,6 +714,12 @@ mod tests {
             if sel == selector("isValidIdentity(address)") {
                 let id = args.address(0).unwrap();
                 ret::write_bool(id != [0u8; 20] && id[0] != 0xEE);
+                return 0;
+            }
+            if sel == selector("isValidAuthorizationHps(address)") {
+                let au = args.address(0).unwrap();
+                let expected = hps_sdk::mock::dispatch_code_hash(auth_dispatch);
+                ret::write_bool(context::code_hash_of(&au) == Some(expected));
                 return 0;
             }
             -2

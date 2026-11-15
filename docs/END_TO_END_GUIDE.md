@@ -46,10 +46,10 @@ flowchart TD
 | Subroutine | WASM Size | Role & Guarantees |
 | :--- | :--- | :--- |
 | **`Identity`** (`examples/identity`) | `16.3 KB` | Programmable on-chain identity controlled by an owner EOA + optional delegates (`setDelegate`). All state-changing interactions with `IdentityRegistry`, `Constitution`, `Authorization`, `AssetLedger`, and `AssetPair_OTC` flow through `Identity` (`execute`, `initConstitutionAuth`, `initOracleAuth`, `approveAuth`, `approveAndFinalizeAuth`, `issueAsset`, `cancelAsset`, `transferAsset`, `approveAsset`). |
-| **`IdentityRegistry`** (`examples/identity-registry`) | `14.7 KB` | Canonical register of verified `Identity` HPS addresses (`Active = 1`, `Suspended = 2`, `Revoked = 3`). Every state-changing subroutine queries `isValidIdentity(address)`. Registry mutations (`registerIdentity`, `suspendIdentity`, `reinstateIdentity`, `revokeIdentity`, `rotateAdmin`, `setGovernancePolicy`) consume a one-time `Authorization` object (initialized with a single-account admin/oracle policy and upgradable to a `Constitution` policy). |
-| **`Constitution`** (`examples/constitution`) | `14.2 KB` | Stores institutional bylaws `(targetHps, policyId) -> PolicySpec` (falling back to global `targetHps = 0x00..00`). Initialized with genesis policies including `POLICY_SUPER_GOVERNANCE`. Policy updates (`setPolicy`, `deactivatePolicy`) require a finalized one-time `SUPER_GOVERNANCE` `Authorization` object. |
+| **`IdentityRegistry`** (`examples/identity-registry`) | `20.2 KB` | Canonical register of verified `Identity` HPS addresses (`Active = 1`, `Suspended = 2`, `Revoked = 3`) **and** governance-approved WASM `code_hash` allowlists for both `Identity` (`isAllowedIdentityCodeHash`) and `Authorization` (`isAllowedAuthCodeHash` / `isValidAuthorizationHps`) subroutines. Rejects raw EOAs and malicious clones (`ERR_UNAPPROVED_CODE_HASH`). |
+| **`Constitution`** (`examples/constitution`) | `14.7 KB` | Stores institutional bylaws `(targetHps, policyId) -> PolicySpec` (falling back to global `targetHps = 0x00..00`). Initialized with genesis policies including `POLICY_SUPER_GOVERNANCE`. Policy updates (`setPolicy`, `deactivatePolicy`) require a finalized one-time `SUPER_GOVERNANCE` `Authorization` object. |
 | **`Authorization`** (`examples/authorization`) | `18.9 KB` | Single-use stateful workflow engine initialized per protected call (`initializeFromConstitution`, `initializeOracle`, `initializeCustom`). Enforces sequential stage progression (`currentStage`), per-member weights (`weight >= 1`), duplicate-vote rejection, per-stage & overall block-height expiry (`context::block_number()`), explicit `finalize()`, and target-only `consume(...)` (`FINALIZED -> CONSUMED`). |
-| **`AssetLedger`** (`examples/asset-ledger`) | `23.2 KB` | Verified-identity ownership map (`Identity -> u64`), action permissions map (`ACTION_ISSUE`, `ACTION_CANCEL`, `ACTION_TRANSFER`, `ACTION_APPROVE`, `ACTION_SUPER`), private unexported `internal_credit` & `internal_debit` functions, one-time `Authorization` consumption on every state-mutating entrypoint, genesis balances + permissions initializer, and `SUPER`-authorized `setPermission`. |
+| **`AssetLedger`** (`examples/asset-ledger`) | `23.6 KB` | Verified-identity ownership map (`Identity -> u64`), action permissions map (`ACTION_ISSUE`, `ACTION_CANCEL`, `ACTION_TRANSFER`, `ACTION_APPROVE`, `ACTION_SUPER`), private unexported `internal_credit` & `internal_debit` functions, one-time `Authorization` consumption on every state-mutating entrypoint, genesis balances + permissions initializer, and `SUPER`-authorized `setPermission`. |
 | **`AssetPair_OTC`** (`examples/asset-pair-otc`) | `13.8 KB` | Verified-identity Over-The-Counter ask-book pairing a Base `AssetLedger` and Quote `AssetLedger` for atomic Delivery-vs-Payment (`buyOrder`) settlement. |
 
 ### `PolicySpec` Binary Wire Format (`hps_sdk::governance`)
@@ -112,10 +112,11 @@ cd custom-vault
 | `hps_sdk` | `event_topic("Ev(type1,type2)")` | `const fn` 32-byte `topic[0]` hash |
 | `context` | `context::msg_sender() -> [u8; 20]` | Immediate caller (`Identity` HPS address during Identity-routed calls) |
 | `context` | `context::self_address() -> [u8; 20]` | 20-byte address of the currently executing HPS instance |
+| `context` | `context::code_hash_of(&addr) -> Option<[u8; 32]>` | 32-byte `keccak256(wasm)` bytecode hash of a deployed HPS (`None` for EOAs / undeployed addresses) |
 | `context` | `context::block_number() -> u64` | Current chain block height (used for deterministic authorization expiry) |
 | `storage` | `storage::get_u64` / `set_u64` / `get_address` / `set_address` / `get_bytes32` / `set_bytes32` | Persistent RocksDB state accessors |
 | `call` | `CallEncoder::<CAP>::new(sel)` + `call::call_raw` / `call_u64` / `call_bool` / `call_abi_bytes_into` | Synchronous cross-HPS calls (`msg.sender` in callee = `self_address()`) |
-| `governance` | `PolicySpec`, `StageSpec`, `ActionHasher`, `require_valid_identity`, `verify_and_consume_auth` | Plug-and-play verified identity check + one-time `Authorization` consumption for any custom HPS |
+| `governance` | `PolicySpec`, `StageSpec`, `ActionHasher`, `require_valid_identity`, `require_valid_authorization_hps`, `verify_and_consume_auth` | Plug-and-play verified identity check + `Authorization` bytecode attestation + one-time consumption |
 | `ret` | `ret::write_u64_word`, `write_bool`, `write_address`, `write_bytes32`, `write_abi_bytes` | Return ABI values to `eth_call` or parent cross-HPS callers |
 | `events` | `events::emit(&[topic0, ...], &data)` | Emit indexed receipt logs (`<= 4` topics) |
 
@@ -146,8 +147,9 @@ fn handle_release(recipient_id: &[u8; 20], amount: u64, auth_hps: &[u8; 20]) -> 
         .push_u64(amount)
         .finish();
 
-    // 3. Atomically verify & consume the finalized one-time Authorization HPS instance
+    // 3. Atomically verify `auth_hps` WASM code_hash & consume the finalized one-time Authorization
     verify_and_consume_auth(
+        &registry,
         auth_hps,
         &constitution,
         &ACTION_RELEASE_ESCROW,

@@ -192,6 +192,7 @@ fn handle_set_policy(args: &CalldataReader) -> Result<(), i32> {
     let action_hash = compute_set_policy_hash(&target_hps, &policy_id, raw_spec);
     let me = context::self_address();
     verify_and_consume_auth(
+        &registry,
         &super_auth,
         &me,
         &POLICY_SUPER_GOVERNANCE,
@@ -205,7 +206,7 @@ fn handle_set_policy(args: &CalldataReader) -> Result<(), i32> {
 }
 
 fn handle_deactivate_policy(args: &CalldataReader) -> Result<(), i32> {
-    let (_registry, caller) = ensure_initialized_and_valid_caller()?;
+    let (registry, caller) = ensure_initialized_and_valid_caller()?;
     let target_hps = args.address(0).ok_or(-3)?;
     let policy_id = args.bytes32(1).ok_or(-3)?;
     let super_auth = args.address(2).ok_or(-3)?;
@@ -222,6 +223,7 @@ fn handle_deactivate_policy(args: &CalldataReader) -> Result<(), i32> {
 
     let action_hash = compute_deactivate_hash(&target_hps, &policy_id);
     verify_and_consume_auth(
+        &registry,
         &super_auth,
         &me,
         &POLICY_SUPER_GOVERNANCE,
@@ -318,6 +320,11 @@ mod tests {
             if sel == selector("isValidIdentity(address)") {
                 let a = args.address(0).unwrap();
                 ret::write_bool(a[0] != 0xEE && a != [0u8; 20]);
+                return 0;
+            }
+            if sel == selector("isValidAuthorizationHps(address)") {
+                let a = args.address(0).unwrap();
+                ret::write_bool(hps_sdk::context::code_hash_of(&a).is_some());
                 return 0;
             }
             -2

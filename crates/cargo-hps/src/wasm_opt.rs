@@ -19,6 +19,7 @@ const ALLOWED_ENV_IMPORTS: &[&str] = &[
     "get_calldata",
     "get_msg_sender",
     "get_self_address",
+    "host_get_code_hash",
     "get_block_number",
     "host_emit_event",
     "host_call_contract",

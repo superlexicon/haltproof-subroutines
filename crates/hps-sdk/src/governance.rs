@@ -51,6 +51,7 @@ pub const fn oracle_policy_id(oracle_identity: &[u8; 20]) -> [u8; 32] {
 pub const ERR_INVALID_IDENTITY: i32 = -70;
 pub const ERR_AUTH_CONSUME_FAILED: i32 = -71;
 pub const ERR_POLICY_INVALID: i32 = -72;
+pub const ERR_UNAPPROVED_CODE_HASH: i32 = -73;
 
 /// Single authorizer entry within a sequential authorization stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -380,7 +381,8 @@ impl<const CAP: usize> ActionHasher<CAP> {
 }
 
 /// Verify via cross-HPS call into `IdentityRegistry` (`isValidIdentity(address)`) that `identity`
-/// is registered and currently active (`status == 1`).
+/// is registered, currently active (`status == 1`), **and** deployed from an approved `Identity`
+/// WASM bytecode hash (`code_hash`).
 pub fn require_valid_identity(registry: &[u8; 20], identity: &[u8; 20]) -> Result<(), i32> {
     if *registry == [0u8; 20] || *identity == [0u8; 20] {
         return Err(ERR_INVALID_IDENTITY);
@@ -392,19 +394,42 @@ pub fn require_valid_identity(registry: &[u8; 20], identity: &[u8; 20]) -> Resul
     }
 }
 
-/// Verify and atomically mark a finalized `Authorization` HPS object as **consumed** (one-time use).
+/// Verify via cross-HPS call into `IdentityRegistry` (`isValidAuthorizationHps(address)`) that
+/// `auth_obj` is deployed from an approved `Authorization` WASM bytecode hash (`code_hash`),
+/// preventing spoofed/clone `Authorization` subroutines.
+pub fn require_valid_authorization_hps(
+    registry: &[u8; 20],
+    auth_obj: &[u8; 20],
+) -> Result<(), i32> {
+    if *registry == [0u8; 20] || *auth_obj == [0u8; 20] {
+        return Err(ERR_UNAPPROVED_CODE_HASH);
+    }
+    let cd = CallEncoder::<64>::new(selector("isValidAuthorizationHps(address)"))
+        .push_address(auth_obj);
+    match call::call_bool(registry, cd.as_slice()) {
+        Ok(true) => Ok(()),
+        _ => Err(ERR_UNAPPROVED_CODE_HASH),
+    }
+}
+
+/// Verify `auth_obj` is an approved `Authorization` HPS in `IdentityRegistry` and atomically mark
+/// it as **consumed** (one-time use).
 ///
 /// Inside `auth_obj`, `context::msg_sender()` is the calling HPS (`AssetLedger`, `Constitution`,
 /// or `IdentityRegistry`), which `auth_obj` verifies against its bound `targetHps`.
 pub fn verify_and_consume_auth(
+    registry: &[u8; 20],
     auth_obj: &[u8; 20],
     expected_constitution: &[u8; 20],
     expected_policy_id: &[u8; 32],
     expected_action_hash: &[u8; 32],
     caller_identity: &[u8; 20],
 ) -> Result<(), i32> {
-    if *auth_obj == [0u8; 20] {
+    if *registry == [0u8; 20] || *auth_obj == [0u8; 20] {
         return Err(ERR_AUTH_CONSUME_FAILED);
+    }
+    if *registry != crate::context::self_address() {
+        require_valid_authorization_hps(registry, auth_obj)?;
     }
     let cd = CallEncoder::<164>::new(selector("consume(address,bytes32,bytes32,address)"))
         .push_address(expected_constitution)

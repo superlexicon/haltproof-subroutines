@@ -23,6 +23,8 @@ pub mod layout {
     pub const CALLDATA_CAP: usize = 0x10000; // 64 KiB
     pub const SENDER_BUF: usize = 0x20000;
     pub const SELF_ADDR_BUF: usize = 0x20020;
+    pub const CODE_HASH_ADDR_BUF: usize = 0x20040;
+    pub const CODE_HASH_OUT_BUF: usize = 0x20060;
     pub const SUBCALL_RET_BUF: usize = 0x22000;
     pub const SUBCALL_RET_CAP: usize = 0x8000; // 32 KiB
     pub const KEY_BUF: usize = 0x30000;
@@ -49,6 +51,7 @@ mod sys {
         pub fn get_calldata(buf_ptr: i32) -> i32;
         pub fn get_msg_sender(buf_ptr: i32);
         pub fn get_self_address(buf_ptr: i32);
+        pub fn host_get_code_hash(addr_ptr: i32, out_ptr: i32) -> i32;
         pub fn get_block_number(buf_ptr: i32);
         pub fn host_emit_event(topics_ptr: i32, topics_len: i32, data_ptr: i32, data_len: i32);
         pub fn host_call_contract(
@@ -81,6 +84,7 @@ pub mod mock {
         /// Per-HPS isolated key-value state: `address -> (key -> val)`
         pub states: BTreeMap<[u8; 20], BTreeMap<Vec<u8>, Vec<u8>>>,
         pub handlers: BTreeMap<[u8; 20], DispatchFn>,
+        pub code_hashes: BTreeMap<[u8; 20], [u8; 32]>,
         pub calldata: Vec<u8>,
         pub sender: [u8; 20],
         pub self_address: [u8; 20],
@@ -109,10 +113,41 @@ pub mod mock {
         HOST.with(|h| h.borrow_mut().block_number = block_number);
     }
 
+    pub fn dispatch_code_hash(handler: DispatchFn) -> [u8; 32] {
+        let ptr_bytes = (handler as usize).to_be_bytes();
+        crate::keccak::keccak256(&ptr_bytes)
+    }
+
     pub fn register_hps(address: [u8; 20], handler: DispatchFn) {
+        let default_hash = dispatch_code_hash(handler);
+        register_hps_with_code_hash(address, default_hash, handler);
+    }
+
+    pub fn register_hps_with_code_hash(address: [u8; 20], code_hash: [u8; 32], handler: DispatchFn) {
         HOST.with(|h| {
-            h.borrow_mut().handlers.insert(address, handler);
+            let mut b = h.borrow_mut();
+            b.handlers.insert(address, handler);
+            if code_hash != [0u8; 32] {
+                b.code_hashes.insert(address, code_hash);
+            } else {
+                b.code_hashes.remove(&address);
+            }
         });
+    }
+
+    pub fn set_code_hash(address: [u8; 20], code_hash: [u8; 32]) {
+        HOST.with(|h| {
+            let mut b = h.borrow_mut();
+            if code_hash == [0u8; 32] {
+                b.code_hashes.remove(&address);
+            } else {
+                b.code_hashes.insert(address, code_hash);
+            }
+        });
+    }
+
+    pub fn code_hash_of(address: &[u8; 20]) -> Option<[u8; 32]> {
+        HOST.with(|h| h.borrow().code_hashes.get(address).copied())
     }
 
     pub fn set_calldata(calldata: &[u8]) {
@@ -237,6 +272,41 @@ pub mod context {
         #[cfg(not(target_arch = "wasm32"))]
         {
             crate::mock::HOST.with(|h| h.borrow().self_address)
+        }
+    }
+
+    /// Return the 32-byte `keccak256(wasm)` bytecode hash of the Haltproof Subroutine deployed at
+    /// `target`, or `None` if `target` is an EOA or has no deployed subroutine bytecode.
+    pub fn code_hash_of(target: &[u8; 20]) -> Option<[u8; 32]> {
+        #[cfg(target_arch = "wasm32")]
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                target.as_ptr(),
+                layout::CODE_HASH_ADDR_BUF as *mut u8,
+                20,
+            );
+            let rc = sys::host_get_code_hash(
+                layout::CODE_HASH_ADDR_BUF as i32,
+                layout::CODE_HASH_OUT_BUF as i32,
+            );
+            if rc != 1 {
+                return None;
+            }
+            let mut out = [0u8; 32];
+            core::ptr::copy_nonoverlapping(
+                layout::CODE_HASH_OUT_BUF as *const u8,
+                out.as_mut_ptr(),
+                32,
+            );
+            if out == [0u8; 32] {
+                None
+            } else {
+                Some(out)
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            crate::mock::code_hash_of(target)
         }
     }
 
