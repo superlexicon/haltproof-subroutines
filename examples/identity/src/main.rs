@@ -30,6 +30,7 @@ hps_entry! {
     "setDelegate(address,bool)"                                                       => handle_set_delegate,
     "transferOwnership(address)"                                                      => handle_transfer_ownership,
     "execute(address,bytes)"                                                          => handle_execute,
+    "initCharterAuth(address,address,address,address,bytes32,bytes32)"                => handle_init_constitution_auth,
     "initConstitutionAuth(address,address,address,address,bytes32,bytes32)"           => handle_init_constitution_auth,
     "initOracleAuth(address,address,address,address,bytes32,uint64)"                  => handle_init_oracle_auth,
     "initTransferAuction(address,address,address,address)"                            => handle_init_transfer_auction,
@@ -40,14 +41,13 @@ hps_entry! {
     "cancelBuyOrder(address,uint64)"                                                  => handle_cancel_buy_order,
     "placeSellOrder(address,uint64,uint64)"                                           => handle_place_sell_order,
     "settleTransferAuction(address,address)"                                          => handle_settle_transfer_auction,
-    "placeBuyOrderViaConstitution(address,address,uint64,uint64)"                     => handle_place_buy_order_via_con,
-    "cancelBuyOrderViaConstitution(address,address,uint64)"                           => handle_cancel_buy_order_via_con,
-    "placeSellOrderViaConstitution(address,address,uint64,uint64)"                    => handle_place_sell_order_via_con,
-    "settleAuctionViaConstitution(address,address,address)"                           => handle_settle_auction_via_con,
+    "placeBuyOrderViaShareCapital(address,address,uint64,uint64)"                     => handle_place_buy_order_via_sc,
+    "cancelBuyOrderViaShareCapital(address,address,uint64)"                           => handle_cancel_buy_order_via_sc,
+    "placeSellOrderViaShareCapital(address,address,uint64,uint64)"                    => handle_place_sell_order_via_sc,
+    "settleAuctionViaShareCapital(address,address,address)"                           => handle_settle_auction_via_sc,
     "transferBankBalance(address,address,uint64)"                                     => handle_transfer_bank_balance,
-    "setBankOracle(address,address,address,uint64,address)"                           => handle_set_bank_oracle,
-    "setProductOracle(address,address,address,uint64,address)"                        => handle_set_product_oracle,
-    "setClearingAccount(address,address,address,address)"                             => handle_set_clearing_account,
+    "setShareEscrowAccount(address,address,address,address)"                          => handle_set_share_escrow_account,
+    "setOperatingAccount(address,address,address,address)"                            => handle_set_operating_account,
     "registerShareClass(address,address,uint64,uint64,uint64,address)"                => handle_register_share_class,
     "authorizeFuturesUnderwriting(address,address,uint64,address)"                    => handle_authorize_futures_underwriting,
     "underwriteFutures(address,uint64)"                                               => handle_underwrite_futures,
@@ -70,8 +70,9 @@ hps_entry! {
     "grantRole(address,bytes32,address,address)"                                      => handle_grant_role,
     "revokeRole(address,bytes32,address,address)"                                     => handle_revoke_role,
     "defineRole(address,bytes32,address)"                                             => handle_define_role,
-    "setFunctionAuth(address,bytes4,bytes32,address)"                                 => handle_set_function_auth,
-    "activateConstitution(address,address)"                                           => handle_activate_constitution,
+    "setFunctionAuth(address,address,bytes4,bytes32,address)"                         => handle_set_function_auth,
+    "authorizeModule(address,address,bytes32,bool,address)"                           => handle_authorize_module,
+    "activateCharter(address,address)"                                                => handle_activate_charter,
     "owner()"                                                                         => handle_owner,
     "isAuthorized(address)"                                                           => handle_is_authorized,
     "hasApprovedAuth(address)"                                                        => handle_has_approved_auth,
@@ -363,9 +364,9 @@ fn handle_cancel_buy_order(args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
-fn handle_place_buy_order_via_con(args: &CalldataReader) -> Result<(), i32> {
+fn handle_place_buy_order_via_sc(args: &CalldataReader) -> Result<(), i32> {
     require_authorized()?;
-    let constitution = args.address(0).ok_or(-3)?;
+    let share_capital = args.address(0).ok_or(-3)?;
     let auth_obj = args.address(1).ok_or(-3)?;
     let price = args.u64(2).ok_or(-3)?;
     let quantity = args.u64(3).ok_or(-3)?;
@@ -375,28 +376,28 @@ fn handle_place_buy_order_via_con(args: &CalldataReader) -> Result<(), i32> {
         .push_address(&auth_obj)
         .push_u64(price)
         .push_u64(quantity);
-    let order_idx = call::call_u64(&constitution, sub_cd.as_slice())?;
+    let order_idx = call::call_u64(&share_capital, sub_cd.as_slice())?;
     ret::write_u64_word(order_idx);
     Ok(())
 }
 
-fn handle_cancel_buy_order_via_con(args: &CalldataReader) -> Result<(), i32> {
+fn handle_cancel_buy_order_via_sc(args: &CalldataReader) -> Result<(), i32> {
     require_authorized()?;
-    let constitution = args.address(0).ok_or(-3)?;
+    let share_capital = args.address(0).ok_or(-3)?;
     let auth_obj = args.address(1).ok_or(-3)?;
     let order_index = args.u64(2).ok_or(-3)?;
 
     let sub_cd = CallEncoder::<96>::new(const { selector("cancelBuyOrder(address,uint64)") })
         .push_address(&auth_obj)
         .push_u64(order_index);
-    let refunded = call::call_u64(&constitution, sub_cd.as_slice())?;
+    let refunded = call::call_u64(&share_capital, sub_cd.as_slice())?;
     ret::write_u64_word(refunded);
     Ok(())
 }
 
-fn handle_place_sell_order_via_con(args: &CalldataReader) -> Result<(), i32> {
+fn handle_place_sell_order_via_sc(args: &CalldataReader) -> Result<(), i32> {
     require_authorized()?;
-    let constitution = args.address(0).ok_or(-3)?;
+    let share_capital = args.address(0).ok_or(-3)?;
     let auth_obj = args.address(1).ok_or(-3)?;
     let price = args.u64(2).ok_or(-3)?;
     let quantity = args.u64(3).ok_or(-3)?;
@@ -406,21 +407,23 @@ fn handle_place_sell_order_via_con(args: &CalldataReader) -> Result<(), i32> {
         .push_address(&auth_obj)
         .push_u64(price)
         .push_u64(quantity);
-    let order_idx = call::call_u64(&constitution, sub_cd.as_slice())?;
+    let order_idx = call::call_u64(&share_capital, sub_cd.as_slice())?;
     ret::write_u64_word(order_idx);
     Ok(())
 }
 
-fn handle_settle_auction_via_con(args: &CalldataReader) -> Result<(), i32> {
+fn handle_settle_auction_via_sc(args: &CalldataReader) -> Result<(), i32> {
     require_authorized()?;
-    let constitution = args.address(0).ok_or(-3)?;
+    let share_capital = args.address(0).ok_or(-3)?;
     let share_ledger = args.address(1).ok_or(-3)?;
     let auth_obj = args.address(2).ok_or(-3)?;
 
-    let sub_cd = CallEncoder::<96>::new(const { selector("settleShareTransferAuction(address,address)") })
+    let sub_cd = CallEncoder::<96>::new(const {
+        selector("settleShareTransferAuction(address,address)")
+    })
     .push_address(&share_ledger)
     .push_address(&auth_obj);
-    let out = call::call_raw(&constitution, sub_cd.as_slice())?;
+    let out = call::call_raw(&share_capital, sub_cd.as_slice())?;
     ret::write(out);
     Ok(())
 }
@@ -442,66 +445,41 @@ fn handle_transfer_bank_balance(args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
-fn handle_set_bank_oracle(args: &CalldataReader) -> Result<(), i32> {
+fn handle_set_share_escrow_account(args: &CalldataReader) -> Result<(), i32> {
     require_authorized()?;
-    let constitution = args.address(0).ok_or(-3)?;
+    let share_capital = args.address(0).ok_or(-3)?;
     let bank_ledger = args.address(1).ok_or(-3)?;
-    let oracle_identity = args.address(2).ok_or(-3)?;
-    let expiry_blocks = args.u64(3).ok_or(-3)?;
-    let board_auth = args.address(4).ok_or(-3)?;
-
-    let sub_cd = CallEncoder::<160>::new(const {
-        const { selector("setBankOracle(address,address,uint64,address)") }
-    })
-    .push_address(&bank_ledger)
-    .push_address(&oracle_identity)
-    .push_u64(expiry_blocks)
-    .push_address(&board_auth);
-    let ok = call::call_bool(&constitution, sub_cd.as_slice())?;
-    if !ok {
-        return Err(-24);
-    }
-    ret::write_bool(true);
-    Ok(())
-}
-
-fn handle_set_product_oracle(args: &CalldataReader) -> Result<(), i32> {
-    require_authorized()?;
-    let constitution = args.address(0).ok_or(-3)?;
-    let product_ledger = args.address(1).ok_or(-3)?;
-    let oracle_identity = args.address(2).ok_or(-3)?;
-    let expiry_blocks = args.u64(3).ok_or(-3)?;
-    let board_auth = args.address(4).ok_or(-3)?;
-
-    let sub_cd = CallEncoder::<160>::new(const {
-        const { selector("setProductOracle(address,address,uint64,address)") }
-    })
-    .push_address(&product_ledger)
-    .push_address(&oracle_identity)
-    .push_u64(expiry_blocks)
-    .push_address(&board_auth);
-    let ok = call::call_bool(&constitution, sub_cd.as_slice())?;
-    if !ok {
-        return Err(-24);
-    }
-    ret::write_bool(true);
-    Ok(())
-}
-
-fn handle_set_clearing_account(args: &CalldataReader) -> Result<(), i32> {
-    require_authorized()?;
-    let constitution = args.address(0).ok_or(-3)?;
-    let bank_ledger = args.address(1).ok_or(-3)?;
-    let clearing_account = args.address(2).ok_or(-3)?;
-    let board_auth = args.address(3).ok_or(-3)?;
+    let escrow_account = args.address(2).ok_or(-3)?;
+    let auth_obj = args.address(3).ok_or(-3)?;
 
     let sub_cd = CallEncoder::<128>::new(const {
-        const { selector("setClearingAccount(address,address,address)") }
+        selector("setShareEscrowAccount(address,address,address)")
     })
     .push_address(&bank_ledger)
-    .push_address(&clearing_account)
-    .push_address(&board_auth);
-    let ok = call::call_bool(&constitution, sub_cd.as_slice())?;
+    .push_address(&escrow_account)
+    .push_address(&auth_obj);
+    let ok = call::call_bool(&share_capital, sub_cd.as_slice())?;
+    if !ok {
+        return Err(-24);
+    }
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_set_operating_account(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let product_ledger = args.address(0).ok_or(-3)?;
+    let bank_ledger = args.address(1).ok_or(-3)?;
+    let rev_account = args.address(2).ok_or(-3)?;
+    let auth_obj = args.address(3).ok_or(-3)?;
+
+    let sub_cd = CallEncoder::<128>::new(const {
+        selector("setOperatingAccount(address,address,address)")
+    })
+    .push_address(&bank_ledger)
+    .push_address(&rev_account)
+    .push_address(&auth_obj);
+    let ok = call::call_bool(&product_ledger, sub_cd.as_slice())?;
     if !ok {
         return Err(-24);
     }
@@ -849,18 +827,20 @@ fn handle_define_role(args: &CalldataReader) -> Result<(), i32> {
 
 fn handle_set_function_auth(args: &CalldataReader) -> Result<(), i32> {
     require_authorized()?;
-    let constitution = args.address(0).ok_or(-3)?;
-    let fn_selector = args.bytes4(1).ok_or(-3)?;
-    let policy_id = args.bytes32(2).ok_or(-3)?;
-    let auth_obj = args.address(3).ok_or(-3)?;
+    let charter = args.address(0).ok_or(-3)?;
+    let target_hps = args.address(1).ok_or(-3)?;
+    let fn_selector = args.bytes4(2).ok_or(-3)?;
+    let policy_id = args.bytes32(3).ok_or(-3)?;
+    let auth_obj = args.address(4).ok_or(-3)?;
 
-    let sub_cd = CallEncoder::<128>::new(const {
-        selector("setFunctionAuth(bytes4,bytes32,address)")
+    let sub_cd = CallEncoder::<160>::new(const {
+        selector("setFunctionAuth(address,bytes4,bytes32,address)")
     })
+    .push_address(&target_hps)
     .push_bytes4(&fn_selector)
     .push_bytes32(&policy_id)
     .push_address(&auth_obj);
-    let ok = call::call_bool(&constitution, sub_cd.as_slice())?;
+    let ok = call::call_bool(&charter, sub_cd.as_slice())?;
     if !ok {
         return Err(-24);
     }
@@ -868,15 +848,37 @@ fn handle_set_function_auth(args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
-fn handle_activate_constitution(args: &CalldataReader) -> Result<(), i32> {
+fn handle_authorize_module(args: &CalldataReader) -> Result<(), i32> {
     require_authorized()?;
-    let constitution = args.address(0).ok_or(-3)?;
+    let charter = args.address(0).ok_or(-3)?;
+    let module_hps = args.address(1).ok_or(-3)?;
+    let capability = args.bytes32(2).ok_or(-3)?;
+    let active = args.bool(3).ok_or(-3)?;
+    let auth_obj = args.address(4).ok_or(-3)?;
+
+    let sub_cd = CallEncoder::<160>::new(const {
+        selector("authorizeModule(address,bytes32,bool,address)")
+    })
+    .push_address(&module_hps)
+    .push_bytes32(&capability)
+    .push_bool(active)
+    .push_address(&auth_obj);
+    let ok = call::call_bool(&charter, sub_cd.as_slice())?;
+    if !ok {
+        return Err(-24);
+    }
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_activate_charter(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let charter = args.address(0).ok_or(-3)?;
     let shareholder_auth = args.address(1).ok_or(-3)?;
 
-    let sub_cd =
-        CallEncoder::<64>::new(const { selector("activateConstitution(address)") })
-            .push_address(&shareholder_auth);
-    let ok = call::call_bool(&constitution, sub_cd.as_slice())?;
+    let sub_cd = CallEncoder::<64>::new(const { selector("activateCharter(address)") })
+        .push_address(&shareholder_auth);
+    let ok = call::call_bool(&charter, sub_cd.as_slice())?;
     if !ok {
         return Err(-24);
     }

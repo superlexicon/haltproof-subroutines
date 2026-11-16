@@ -1,195 +1,125 @@
 # End-to-End Haltproof Subroutine (HPS) & Institutional Governance Guide
 
-This guide walks through developing, testing, compiling, deploying, and integrating **Haltproof Subroutine-driven applications** on Lexicon using `haltproof-subroutines` (`cargo hps`) and `lexicon-node --localtestnet` — from single-subroutine state machines to the complete **7-subroutine institutional governance, sequential/weighted authorization, verified identity register, asset ledger, OTC, and high-TPS messaging stack**.
+This guide walks through developing, testing, compiling, deploying, and integrating **Haltproof Subroutine-driven institutional applications** on Lexicon using `haltproof-subroutines` (`cargo hps`) and `lexicon-node --localtestnet` — across all **11 composable subroutines**: `Identity`, `IdentityRegistry`, `CorporateCharter`, `ShareCapital`, `Authorization`, `AssetLedger`, `ProductLedger`, `AccountingLedger`, `AssetPair_OTC`, `DexClob`, and `Messaging`.
 
 ---
 
-## 1. Architecture Overview: Why "Haltproof Subroutines" (HPS)?
+## 1. Why "Haltproof Subroutines" (HPS)?
 
-Lexicon models replicated on-chain programs as **Haltproof Subroutines (HPS)** — deterministic, fuel-bounded state-transition subroutines replicated across ISP-independent broadcast radio subnets that neither hang individual nodes nor depend on centralized cloud infrastructure or token fee markets:
+Lexicon models replicated on-chain programs as **Haltproof Subroutines (HPS)** — deterministic, fuel-bounded WebAssembly state-transition subroutines replicated across ISP-independent broadcast radio subnets:
 
-1. **Deterministic, Fuel-Bounded WASM Execution**: Written in `#![no_std]` Rust using `hps-sdk` and compiled to WebAssembly (`wasm32-unknown-unknown`) executed by Lexicon's **Wasmtime** VM (`1 fuel = 1 gas`, strictly bounded per call so every invocation is guaranteed to terminate cleanly).
-2. **Synchronous Cross-HPS Calls & Atomic Rollback**: Subroutines can invoke other deployed subroutines synchronously via `hps_sdk::call` (`host_call_contract`, up to depth `8`), sharing the transaction's fuel budget with automatic state rollback if any nested or top-level call returns `< 0` or traps.
-3. **Zero-Fee Operations (No Token Balance Required)**: Users and apps never need native tokens to deploy or invoke Haltproof Subroutines. Spam is bounded structurally via per-transaction fuel caps (`10,000,000` gas), per-account nonce horizons, and physical RF TDMA/LBT rules.
+1. **Deterministic, Fuel-Bounded WASM Execution**: Written in `#![no_std]` Rust using `hps-sdk` and compiled to WebAssembly (`wasm32-unknown-unknown`) executed by Lexicon's **Wasmtime** VM (`1 fuel = 1 gas`). All function selectors (`selector(...)`) and event topics (`event_topic(...)`) are evaluated at compile time (`const { ... }`) with zero runtime Keccak-256 loops inside WASM.
+2. **Synchronous Cross-HPS Calls & Atomic Rollback**: Subroutines invoke peer subroutines via `hps_sdk::call` (`host_call_contract`, up to depth `8`), sharing the transaction's fuel budget with automatic state rollback if any nested or top-level call returns `< 0` or traps.
+3. **Parallel Execution Target Declarations**: Lexicon's parallel scheduler executes transactions with disjoint target address sets concurrently. Multi-HPS transactions declare touched addresses via `HpsClient::send_call_with_targets` / `send_call_batch` (`cargo hps send --touch ...`). Separating `CorporateCharter`, `ShareCapital`, `ProductLedger`, `AccountingLedger`, and `DexClob` ensures commercial purchases, equity settlements, and DEX matching run in parallel without write-locking the governance Charter.
 4. **2-Step Content-Addressed Deployment**:
    - **Step 1 (`store_bytecode`)**: Uploads `[32-byte keccak256(wasm)] || [wasm]` to `0x0000000000000000000000000000000000000100` once per unique WASM binary.
-   - **Step 2 (`instantiate`)**: Sends `to = null` with `[32-byte code_hash] || [init_args]`, binding an HPS instance at `keccak256(rlp(sender, nonce))[12:]`. Once a `.wasm` binary's `code_hash` is stored, dozens of `Identity` or one-time `Authorization` instances can be instantiated cheaply via `HpsClient::instantiate_hps` / `instantiate_batch`.
-5. **Local vs Subnet Parity**: `lexicon-node --localtestnet` runs the exact same JSON-RPC, WebSocket, `LayeredMempool`, `WasmtimeAdapter`, `NetworkState`, and RocksDB `FlatKvDb` storage as a live multi-validator radio subnet — simply replacing over-the-air TDMA rounds with a 1-node 4-second block timer.
+   - **Step 2 (`instantiate`)**: Sends `to = null` with `[32-byte code_hash] || [init_args]`, instantiating lightweight HPS instances (`Identity`, `Authorization`, `AssetLedger`, etc.) at `keccak256(rlp(sender, nonce))[12:]`.
 
 ---
 
-## 2. Institutional Governance & Asset Ledger Architecture
-
-Conventional computer science permission models (`users / groups / flat permissions`) break down in institutional financial workflows because they cannot express:
-1. **Strict Sequential Multi-Stage Processes**: e.g., *an officer from Group A MUST authorize Stage 0 first, and only after Stage 0 completes may Group B authorize Stage 1*; AND
-2. **Weighted Joint Quorums with Block-Time Deadlines**: e.g., *Group B Lead carries weight `2`, Group B Officer carries weight `1`, Stage 1 requires weight `3` within `20` blocks, and the entire authorization expires if not finalized and consumed within `40` blocks*.
-
-`haltproof-subroutines` provides a first-class, reusable architecture across `hps_sdk::governance` and six composable subroutines:
+## 2. Institutional Corporate Architecture (Option 4A)
 
 ```mermaid
 flowchart TD
     EOA["Signer EOA (secp256k1)"] --> ID["Identity HPS (examples/identity)"]
-    ID -->|"1. Verify active status"| REG["IdentityRegistry HPS (examples/identity-registry)"]
-    ID -->|"2. Initialize & approve stages"| AUTH["Authorization HPS (examples/authorization)"]
-    AUTH -->|"Pull PolicySpec"| CONST["Constitution HPS (examples/constitution)"]
-    AUTH -->|"Verify signer Identity"| REG
-    ID -->|"3. Execute issue / cancel / transfer / approve / setPermission"| LEDGER["AssetLedger HPS (examples/asset-ledger)"]
-    LEDGER -->|"Verify caller & subject Identities"| REG
-    LEDGER -->|"One-time consume(target, constitution, policyId, actionHash)"| AUTH
-    ID -->|"4. Place ask / buy order"| OTC["AssetPair_OTC HPS (examples/asset-pair-otc)"]
-    OTC -->|"Verify seller & buyer Identities"| REG
-    OTC -->|"Atomic transferFrom (Base & Quote)"| LEDGER
+    ID -->|"Attested caller"| REG["IdentityRegistry HPS (examples/identity-registry)"]
+    ID -->|"Approve stages & ratify"| AUTH["Authorization HPS (examples/authorization)"]
+    AUTH -->|"Read PolicySpec, Roles & Share Voting"| CHR["CorporateCharter HPS (examples/corporate-charter)"]
+    CHR -->|"ShareClassSpecs"| SHLED["Share Class AssetLedgers (examples/asset-ledger)"]
+    CHR -->|"CAP_EQUITY_SETTLEMENT"| SC["ShareCapital HPS (examples/share-capital)"]
+    CHR -->|"CAP_MERCHANT_PAYMENT + getFunctionAuth"| PL["ProductLedger HPS (examples/product-ledger)"]
+    SC -->|"Futures mint/burn & 3-step auction escrow"| FUT["Futures & Bank AssetLedgers"]
+    FUT <-->|"Attached CLOB"| DEX["DexClob HPS (examples/dex-clob)"]
+    PL -->|"Clear operatingRevenueAccount"| FUT
+    PL -->|"Append immutable SaleRecord"| ACC["AccountingLedger HPS (examples/accounting-ledger)"]
+    ID -->|"Atomic OTC DvP"| OTC["AssetPair_OTC HPS (examples/asset-pair-otc)"]
 ```
 
-### Subroutine Responsibilities
+### Subroutine Responsibilities Summary
 
-| Subroutine | WASM Size | Role & Guarantees |
-| :--- | :--- | :--- |
-| **`Identity`** (`examples/identity`) | `16.3 KB` | Programmable on-chain identity controlled by an owner EOA + optional delegates (`setDelegate`). All state-changing interactions with `IdentityRegistry`, `Constitution`, `Authorization`, `AssetLedger`, and `AssetPair_OTC` flow through `Identity` (`execute`, `initConstitutionAuth`, `initOracleAuth`, `approveAuth`, `approveAndFinalizeAuth`, `issueAsset`, `cancelAsset`, `transferAsset`, `approveAsset`). |
-| **`IdentityRegistry`** (`examples/identity-registry`) | `20.2 KB` | Canonical register of verified `Identity` HPS addresses (`Active = 1`, `Suspended = 2`, `Revoked = 3`) **and** governance-approved WASM `code_hash` allowlists for both `Identity` (`isAllowedIdentityCodeHash`) and `Authorization` (`isAllowedAuthCodeHash` / `isValidAuthorizationHps`) subroutines. Rejects raw EOAs and malicious clones (`ERR_UNAPPROVED_CODE_HASH`). |
-| **`Constitution`** (`examples/constitution`) | `14.7 KB` | Stores institutional bylaws `(targetHps, policyId) -> PolicySpec` (falling back to global `targetHps = 0x00..00`). Initialized with genesis policies including `POLICY_SUPER_GOVERNANCE`. Policy updates (`setPolicy`, `deactivatePolicy`) require a finalized one-time `SUPER_GOVERNANCE` `Authorization` object. |
-| **`Authorization`** (`examples/authorization`) | `18.9 KB` | Single-use stateful workflow engine initialized per protected call (`initializeFromConstitution`, `initializeOracle`, `initializeCustom`). Enforces sequential stage progression (`currentStage`), per-member weights (`weight >= 1`), duplicate-vote rejection, per-stage & overall block-height expiry (`context::block_number()`), explicit `finalize()`, and target-only `consume(...)` (`FINALIZED -> CONSUMED`). |
-| **`AssetLedger`** (`examples/asset-ledger`) | `23.6 KB` | Verified-identity ownership map (`Identity -> u64`), action permissions map (`ACTION_ISSUE`, `ACTION_CANCEL`, `ACTION_TRANSFER`, `ACTION_APPROVE`, `ACTION_SUPER`), private unexported `internal_credit` & `internal_debit` functions, one-time `Authorization` consumption on every state-mutating entrypoint, genesis balances + permissions initializer, and `SUPER`-authorized `setPermission`. |
-| **`AssetPair_OTC`** (`examples/asset-pair-otc`) | `13.8 KB` | Verified-identity Over-The-Counter ask-book pairing a Base `AssetLedger` and Quote `AssetLedger` for atomic Delivery-vs-Payment (`buyOrder`) settlement. |
-
-### `PolicySpec` Binary Wire Format (`hps_sdk::governance`)
-
-Encoded deterministically in `#![no_std]` with zero heap allocations:
-- `[version = 1 (1B)][stage_count: u8 (1..=8)][overall_expiry_blocks: u64 BE]`
-- Repeated `stage_count` times (`StageSpec`):
-  - `[required_weight: u64 BE][stage_expiry_blocks: u64 BE][member_count: u8 (1..=16)]`
-  - Repeated `member_count` times (`AuthorizerMember`):
-    - `[identity_hps: 20B][weight: u64 BE (>= 1)]`
-
-### Dynamic Holder-Self Policy (`POLICY_HOLDER_SELF`)
-
-In `AssetLedger`, institutional supply actions (`ACTION_ISSUE`, `ACTION_CANCEL`, `ACTION_SUPER`) typically bind to multi-stage `Constitution` policies, while per-holder actions (`ACTION_TRANSFER`, `ACTION_APPROVE`) can bind either to a `Constitution` policy or to `([0u8; 20], POLICY_HOLDER_SELF)`. When bound to `POLICY_HOLDER_SELF`, `AssetLedger` dynamically resolves the expected policy to `oracle_policy_id(&holderIdentity)` (`b"HPS_ORACLE_V" || holderIdentity`), allowing any newly registered valid `Identity` to authorize transfers or allowances of **its own** balance via a one-time `Authorization` object (`initOracleAuth`) without amending the `Constitution` for each user.
+| Subroutine | WASM Size | Responsibility |
+| :--- | :---: | :--- |
+| **`Identity`** (`examples/identity`) | `33.9 KB` | EOA owner + delegate controlled on-chain identity account (`execute`, `initCharterAuth`, `activateCharter`, `approveAuth`, `approveAndFinalizeAuth`, asset/market helpers). |
+| **`IdentityRegistry`** (`examples/identity-registry`) | `19.2 KB` | Verified `Identity` lifecycle (`Active / Suspended / Revoked`) + governance-approved WASM `code_hash` attestation for `Identity` and `Authorization` instances. |
+| **`CorporateCharter`** (`examples/corporate-charter`) | `58.4 KB` | Constitutional root of trust: starts in `PENDING_RATIFICATION (1)` until the **First Shareholder Resolution** (`activateCharter`) passes; stores `ShareClassSpec`s, Directors, pre-defined Roles (`0..N` members), `PolicySpec`s, scoped `(targetHps, fnSelector) -> policyId` rules, and authorized module capabilities. |
+| **`ShareCapital`** (`examples/share-capital`) | `26.9 KB` | Share-backed futures underwriting (`authorizeFuturesUnderwriting`, `underwriteFutures`, `closeUnderwrittenFutures`) and restricted 3-step share-transfer call auctions using a segregated **`shareEscrowAccount`**. |
+| **`Authorization`** (`examples/authorization`) | `38.7 KB` | Single-use stateful approval process engine enforcing sequential stage progression, member/role weights, unanimous `ROLE_ALL_MEMBERS_WEIGHT`, dynamic `ROLE_SHAREHOLDER` voting power, block-height expiry, and target-only `consume`. |
+| **`AssetLedger`** (`examples/asset-ledger`) | `46.6 KB` | Fungible share / bank / futures ledger pinned to a single `CorporateCharter`, supporting process-gated `issue`/`cancel`/`transfer`/`approve`, client-signed `transferDirect`, 3-step auction clearing, and attachable `DexClob`. |
+| **`ProductLedger`** (`examples/product-ledger`) | `28.2 KB` | Commercial SKU catalog & immediate-fulfilment checkout (`buyProduct`), settling buyer payments into a segregated **`operatingRevenueAccount`** and logging revenue in `AccountingLedger`. |
+| **`AccountingLedger`** (`examples/accounting-ledger`) | `14.9 KB` | Passive read/append sales & revenue accounting journal (`recordSale`, `totalRevenue`, `getSale`) with strict segregation of duties (zero fund-movement authority). |
+| **`AssetPair_OTC`** (`examples/asset-pair-otc`) | `12.2 KB` | Verified-identity Over-The-Counter ask book with atomic dual-ledger `transferFrom` DvP settlement. |
+| **`DexClob`** (`examples/dex-clob`) | `34.4 KB` | MEV-proof discrete-time FIFO central limit orderbook attachable to any `AssetLedger` (`O(log P)` static arena AVL price-level tree + `O(1)` doubly-linked FIFO queues + cohort pro-rata clearing). |
+| **`Messaging`** (`examples/messaging`) | `4.5 KB` | High-TPS channel messaging subroutine (`postMessage`, `getMessages`). |
 
 ---
 
-## 3. Environment Setup & Running `--localtestnet`
+## 3. Environment Setup, Building & Verification
 
 ```bash
-# 1. Install prebuilt `lexicon-node` (from superlexicon/lexicon-bin)
-git clone https://github.com/superlexicon/lexicon-bin.git
-(cd lexicon-bin && bash install.sh)
-
-# 2. Add WASM target & install `cargo hps`
+# 1. Install WASM target & cargo-hps
 rustup target add wasm32-unknown-unknown
 cargo install --path crates/cargo-hps
 
-# 3. Run offline native unit tests across all workspace crates (< 0.1s)
+# 2. Run all offline native unit tests across all 13 workspace crates (< 0.2s)
 cargo test --workspace
 
-# 4. Build all 7 WASM Haltproof Subroutines into dist/
-for pkg in messaging identity-registry identity constitution authorization asset-ledger asset-pair-otc; do
-  cargo hps build -p "$pkg"
+# 3. Compile all 11 WASM Haltproof Subroutines into dist/
+for pkg in identity identity-registry corporate-charter share-capital authorization \
+           asset-ledger asset-pair-otc messaging product-ledger accounting-ledger dex-clob; do
+  cargo hps build -p "$pkg" --out-dir dist
 done
-```
 
-To run the complete 10-stage live Wasmtime verification suite against an isolated `lexicon-node --localtestnet`:
-
-```bash
-cargo test -p hps-client --test live_governance_e2e -- --ignored --nocapture
+# 4. Run live Wasmtime E2E suites against isolated `lexicon-node --localtestnet` (sequentially)
+cargo test -p hps-client --test live_governance_e2e -- --ignored --test-threads=1 --nocapture
+cargo test -p hps-client --test superlexicon_pe_e2e -- --ignored --test-threads=1 --nocapture
 ```
 
 ---
 
-## 4. Authoring Custom Haltproof Subroutines with `hps-sdk`
+## 4. Protecting Custom Subroutines with `CorporateCharter` + `Authorization`
 
-Scaffold a new project:
-
-```bash
-cargo hps new custom-vault
-cd custom-vault
-```
-
-### SDK Reference Cheat Sheet
-
-| Module | Function / Type | Purpose |
-| :--- | :--- | :--- |
-| `hps_sdk` | `selector("fn(type1,type2)")` | `const fn` 4-byte Keccak-256 function selector |
-| `hps_sdk` | `event_topic("Ev(type1,type2)")` | `const fn` 32-byte `topic[0]` hash |
-| `context` | `context::msg_sender() -> [u8; 20]` | Immediate caller (`Identity` HPS address during Identity-routed calls) |
-| `context` | `context::self_address() -> [u8; 20]` | 20-byte address of the currently executing HPS instance |
-| `context` | `context::code_hash_of(&addr) -> Option<[u8; 32]>` | 32-byte `keccak256(wasm)` bytecode hash of a deployed HPS (`None` for EOAs / undeployed addresses) |
-| `context` | `context::block_number() -> u64` | Current chain block height (used for deterministic authorization expiry) |
-| `storage` | `storage::get_u64` / `set_u64` / `get_address` / `set_address` / `get_bytes32` / `set_bytes32` | Persistent RocksDB state accessors |
-| `call` | `CallEncoder::<CAP>::new(sel)` + `call::call_raw` / `call_u64` / `call_bool` / `call_abi_bytes_into` | Synchronous cross-HPS calls (`msg.sender` in callee = `self_address()`) |
-| `governance` | `PolicySpec`, `StageSpec`, `ActionHasher`, `require_valid_identity`, `require_valid_authorization_hps`, `verify_and_consume_auth` | Plug-and-play verified identity check + `Authorization` bytecode attestation + one-time consumption |
-| `ret` | `ret::write_u64_word`, `write_bool`, `write_address`, `write_bytes32`, `write_abi_bytes` | Return ABI values to `eth_call` or parent cross-HPS callers |
-| `events` | `events::emit(&[topic0, ...], &data)` | Emit indexed receipt logs (`<= 4` topics) |
-
-### Protecting Any Custom HPS Function with `IdentityRegistry` + `Authorization`
-
-Any new subroutine can adopt the exact same verified-identity and one-time process authorization guarantees in ~10 lines of Rust using `hps_sdk::governance`:
+Any custom subroutine can query `CorporateCharter` for its active status and per-function required `policyId`, then verify and consume a one-time `Authorization` object in a few lines of `#![no_std]` Rust:
 
 ```rust
 use hps_sdk::governance::{
-    require_valid_identity, verify_and_consume_auth, ActionHasher,
+    query_charter_function_auth, require_active_charter, require_valid_identity,
+    verify_and_consume_auth, ActionHasher, POLICY_BOARD_RESOLUTION,
 };
-use hps_sdk::{context, storage};
+use hps_sdk::{context, selector, storage};
 
-const ACTION_RELEASE_ESCROW: [u8; 32] = *b"ESCROW_ACTION_RELEASE___________";
+const SEL_UPDATE_LIMIT: [u8; 4] = selector("updateRiskLimit(uint64,address)");
+const ACTION_UPDATE_LIMIT: [u8; 32] = *b"RISK_ACTION_UPDATE_LIMIT________";
 
-fn handle_release(recipient_id: &[u8; 20], amount: u64, auth_hps: &[u8; 20]) -> Result<(), i32> {
-    let registry = storage::get_address(b"cfg:registry").ok_or(-10)?;
-    let constitution = storage::get_address(b"cfg:constitution").ok_or(-10)?;
+fn handle_update_risk_limit(new_limit: u64, auth_hps: &[u8; 20]) -> Result<(), i32> {
+    let registry = storage::get_address(b"cfg:reg").ok_or(-10)?;
+    let charter = storage::get_address(b"cfg:chr").ok_or(-10)?;
     let caller_id = context::msg_sender();
 
-    // 1. Verify both calling Identity and recipient Identity are active in IdentityRegistry
+    // 1. Ensure CorporateCharter has passed its First Shareholder Resolution & caller is valid
+    require_active_charter(&charter)?;
     require_valid_identity(&registry, &caller_id)?;
-    require_valid_identity(&registry, recipient_id)?;
 
-    // 2. Compute deterministic parameter-bound action hash (scoped to self_address())
-    let action_hash = ActionHasher::<128>::new(&context::self_address(), &ACTION_RELEASE_ESCROW)
-        .push_address(recipient_id)
-        .push_u64(amount)
+    // 2. Resolve required policy configured in CorporateCharter for (self, SEL_UPDATE_LIMIT)
+    let me = context::self_address();
+    let req_policy = query_charter_function_auth(&charter, &me, &SEL_UPDATE_LIMIT)
+        .unwrap_or(POLICY_BOARD_RESOLUTION);
+
+    // 3. Compute deterministic commitment hash & atomically consume one-time Authorization
+    let action_hash = ActionHasher::<128>::new(&me, &ACTION_UPDATE_LIMIT)
+        .push_u64(new_limit)
         .finish();
+    verify_and_consume_auth(&registry, auth_hps, &charter, &req_policy, &action_hash, &caller_id)?;
 
-    // 3. Atomically verify `auth_hps` WASM code_hash & consume the finalized one-time Authorization
-    verify_and_consume_auth(
-        &registry,
-        auth_hps,
-        &constitution,
-        &ACTION_RELEASE_ESCROW,
-        &action_hash,
-        &caller_id,
-    )?;
-
-    // 4. Perform state transition...
+    storage::set_u64(b"cfg:limit", new_limit);
     Ok(())
 }
 ```
 
 ---
 
-## 5. Integrating Rust (`hps-client`) & Web/TypeScript (`ts-client`) Apps
+## 5. Deep-Dive Specifications
 
-### Rust Backend / Service (`hps-client`)
-
-`HpsClient` supports both single-call deployment (`deploy_hps`) and content-addressed bytecode sharing (`store_bytecode` + `instantiate_hps` / `instantiate_batch`), ideal for spinning up fresh one-time `Authorization` HPS objects per institutional workflow:
-
-```rust
-use hps_client::{HpsClient, HpsSigner, DEFAULT_CHAIN_ID, DEFAULT_DEV_PRIVATE_KEY};
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let client = HpsClient::new("http://127.0.0.1:8545");
-    let signer = HpsSigner::from_hex(DEFAULT_DEV_PRIVATE_KEY, DEFAULT_CHAIN_ID)?;
-
-    // Store `authorization.wasm` once, then instantiate fresh one-time Authorization objects anytime
-    let auth_wasm = std::fs::read("dist/authorization.wasm")?;
-    let auth_code_hash = client.store_bytecode(&signer, &auth_wasm).await?;
-    let auth_instance = client.instantiate_hps(&signer, auth_code_hash, &[]).await?;
-    println!("Fresh one-time Authorization HPS: {auth_instance:?}");
-    Ok(())
-}
-```
-
-### Moving from `--localtestnet` to a Live Radio Subnet
-
-When moving from `--localtestnet` to a live Semtech LR2021 FLRC subnet, **zero HPS or ABI changes are required**:
-1. **Confirmation Cadence:** `--localtestnet` confirms blocks every `4s`; a live 3–8 validator radio subnet confirms blocks every `~5–9s` across the 4-phase TDMA window, so keep receipt polling timeouts at `>= 30s`.
-2. **Compact Bytecode:** Always compile with `cargo hps build` (`4.5–23.2 KB` across all 7 reference subroutines, well under the `100 KB` radio limit).
-3. **Nonce Horizon (`max_nonce_gap`):** Live radio subnets enforce a default future-nonce horizon of `10` in-flight transactions per sender address (`256` on `--localtestnet`).
+- **[`docs/CORPORATE_CHARTER_ROLES_AND_AUTHORIZATION.md`](CORPORATE_CHARTER_ROLES_AND_AUTHORIZATION.md)** — `CorporateCharter` construction blobs, First Shareholder Resolution activation state machine, pre-defined unassigned roles, `StageRole` & `FunctionAuthRule` wire formats, and authorized sibling module capabilities.
+- **[`docs/SHARE_CAPITAL_OPERATIONS_AND_DEX_CLOB.md`](SHARE_CAPITAL_OPERATIONS_AND_DEX_CLOB.md)** — Segregation of duties (`shareEscrowAccount` vs. `operatingRevenueAccount` vs. `AccountingLedger`), multi-class share futures underwriting, 3-step call-auction ROFR settlement, and `DexClob` MEV-proof AVL orderbook mechanics.
+- **[`docs/ABI_AND_ERROR_REFERENCE.md`](ABI_AND_ERROR_REFERENCE.md)** — Complete function signatures, artifact sizes, and canonical error codes across all 11 subroutines.
+- **[`docs/SUPERLEXICON_PE_AND_FSM_VERIFICATION.md`](SUPERLEXICON_PE_AND_FSM_VERIFICATION.md)** — Superlexicon Pte. Ltd. 49-shareholder private-equity specification and TLA+ / Kani formal verification templates.

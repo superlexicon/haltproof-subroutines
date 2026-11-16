@@ -247,13 +247,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "constitution"
-version = "0.1.0"
-dependencies = [
- "hps-sdk",
-]
-
-[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -274,6 +267,13 @@ name = "core_detect"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f8f80099a98041a3d1622845c271458a2d73e688351bf3cb999266764b81d48"
+
+[[package]]
+name = "corporate-charter"
+version = "0.1.0"
+dependencies = [
+ "hps-sdk",
+]
 
 [[package]]
 name = "cpufeatures"
@@ -1252,6 +1252,13 @@ checksum = "77fd7028345d415a4034cf8777cd4f8ab1851274233b45f84e3d955502d93874"
 dependencies = [
  "digest",
  "keccak",
+]
+
+[[package]]
+name = "share-capital"
+version = "0.1.0"
+dependencies = [
+ "hps-sdk",
 ]
 
 [[package]]

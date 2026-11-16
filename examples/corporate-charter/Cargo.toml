@@ -1,0 +1,13 @@
+[package]
+name = "corporate-charter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Corporate Charter Haltproof Subroutine (HPS): shareholder ratification state, authorized share classes, organs & roles, policies, scoped per-function auth, and authorized company modules"
+
+[[bin]]
+name = "corporate_charter"
+path = "src/main.rs"
+
+[dependencies]
+hps-sdk = { path = "../../crates/hps-sdk" }

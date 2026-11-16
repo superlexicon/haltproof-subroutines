@@ -2,10 +2,14 @@
 //! action commitment hashing, and cross-HPS verification helpers shared across:
 //! - `identity-registry`
 //! - `identity`
-//! - `constitution`
+//! - `corporate-charter`
+//! - `share-capital`
 //! - `authorization`
 //! - `asset-ledger`
+//! - `product-ledger`
+//! - `accounting-ledger`
 //! - `asset-pair-otc`
+//! - `dex-clob`
 
 use crate::call::{self, CallEncoder};
 use crate::keccak::keccak256;
@@ -17,19 +21,23 @@ pub const MAX_MEMBERS_PER_STAGE: usize = 64;
 pub const MAX_ROLES_PER_STAGE: usize = 4;
 pub const MAX_ENCODED_POLICY_BYTES: usize = 4096;
 
-/// Lifecycle states of a `Constitution` Haltproof Subroutine.
-/// Newly constructed Constitutions start in `CONSTITUTION_STATE_PENDING_RATIFICATION` (inactive)
-/// and become valid/active (`CONSTITUTION_STATE_ACTIVE`) only after a First Shareholder Resolution
-/// (`activateConstitution`) is passed.
-pub const CONSTITUTION_STATE_UNINITIALIZED: u64 = 0;
-pub const CONSTITUTION_STATE_PENDING_RATIFICATION: u64 = 1;
-pub const CONSTITUTION_STATE_ACTIVE: u64 = 2;
+/// Lifecycle states of a `CorporateCharter` Haltproof Subroutine.
+/// Newly constructed CorporateCharters start in `CHARTER_STATE_PENDING_RATIFICATION` (inactive)
+/// and become valid/active (`CHARTER_STATE_ACTIVE`) only after a First Shareholder Resolution
+/// (`activateCharter`) is passed.
+pub const CHARTER_STATE_UNINITIALIZED: u64 = 0;
+pub const CHARTER_STATE_PENDING_RATIFICATION: u64 = 1;
+pub const CHARTER_STATE_ACTIVE: u64 = 2;
+
+pub const CONSTITUTION_STATE_UNINITIALIZED: u64 = CHARTER_STATE_UNINITIALIZED;
+pub const CONSTITUTION_STATE_PENDING_RATIFICATION: u64 = CHARTER_STATE_PENDING_RATIFICATION;
+pub const CONSTITUTION_STATE_ACTIVE: u64 = CHARTER_STATE_ACTIVE;
 
 /// Special `required_weight` sentinel on a role-backed `StageSpec` requiring unanimous approval
 /// from all currently assigned members of the stage's role(s) (with `>= 1` active member).
 pub const ROLE_ALL_MEMBERS_WEIGHT: u64 = u64::MAX;
 
-/// Canonical 32-byte action keys used in `AssetLedger` permissions and `Constitution` policies.
+/// Canonical 32-byte action keys used in `CorporateCharter`, `ShareCapital`, `AssetLedger`, and `ProductLedger`.
 pub const ACTION_ISSUE: [u8; 32] = keccak256(b"ISSUE");
 pub const ACTION_CANCEL: [u8; 32] = keccak256(b"CANCEL");
 pub const ACTION_TRANSFER: [u8; 32] = keccak256(b"TRANSFER");
@@ -37,10 +45,9 @@ pub const ACTION_APPROVE: [u8; 32] = keccak256(b"APPROVE");
 pub const ACTION_SUPER: [u8; 32] = keccak256(b"SUPER");
 pub const ACTION_ADD_DIRECTOR: [u8; 32] = keccak256(b"ADD_DIRECTOR");
 pub const ACTION_REMOVE_DIRECTOR: [u8; 32] = keccak256(b"REMOVE_DIRECTOR");
-pub const ACTION_SET_BANK_ORACLE: [u8; 32] = keccak256(b"SET_BANK_ORACLE");
-pub const ACTION_SET_CLEARING_ACCOUNT: [u8; 32] = keccak256(b"SET_CLEARING_ACCOUNT");
+pub const ACTION_SET_SHARE_ESCROW: [u8; 32] = keccak256(b"SET_SHARE_ESCROW");
+pub const ACTION_SET_OPERATING_ACCOUNT: [u8; 32] = keccak256(b"SET_OPERATING_ACCOUNT");
 pub const ACTION_REGISTER_SHARE_CLASS: [u8; 32] = keccak256(b"REGISTER_SHARE_CLASS");
-pub const ACTION_SET_PRODUCT_ORACLE: [u8; 32] = keccak256(b"SET_PRODUCT_ORACLE");
 pub const ACTION_UPSERT_PRODUCT: [u8; 32] = keccak256(b"UPSERT_PRODUCT");
 pub const ACTION_RESTOCK_PRODUCT: [u8; 32] = keccak256(b"RESTOCK_PRODUCT");
 pub const ACTION_SET_PRODUCT_PRICE: [u8; 32] = keccak256(b"SET_PRODUCT_PRICE");
@@ -48,20 +55,28 @@ pub const ACTION_GRANT_ROLE: [u8; 32] = keccak256(b"GRANT_ROLE");
 pub const ACTION_REVOKE_ROLE: [u8; 32] = keccak256(b"REVOKE_ROLE");
 pub const ACTION_DEFINE_ROLE: [u8; 32] = keccak256(b"DEFINE_ROLE");
 pub const ACTION_SET_FUNCTION_AUTH: [u8; 32] = keccak256(b"SET_FUNCTION_AUTH");
-pub const ACTION_ACTIVATE_CONSTITUTION: [u8; 32] = keccak256(b"ACTIVATE_CONSTITUTION");
+pub const ACTION_AUTHORIZE_MODULE: [u8; 32] = keccak256(b"AUTHORIZE_MODULE");
+pub const ACTION_ACTIVATE_CHARTER: [u8; 32] = keccak256(b"ACTIVATE_CHARTER");
+pub const ACTION_ACTIVATE_CONSTITUTION: [u8; 32] = ACTION_ACTIVATE_CHARTER;
 pub const ACTION_REGISTER_PRODUCT_LEDGER: [u8; 32] = keccak256(b"REGISTER_PRODUCT_LEDGER");
 pub const ACTION_AUTHORIZE_FUTURES_UNDERWRITING: [u8; 32] =
     keccak256(b"AUTHORIZE_FUTURES_UNDERWRITING");
 pub const ACTION_SET_ATTACHED_DEX: [u8; 32] = keccak256(b"SET_ATTACHED_DEX");
 
-/// Canonical governance & administrative Role IDs defined in `Constitution`.
+/// Governed sibling-module capabilities registered in `CorporateCharter` so pinned `AssetLedger`
+/// and `Authorization` instances trust authorized company modules (`ShareCapital`, `ProductLedger`)
+/// without violating single-Charter pinning or segregation of duties.
+pub const CAP_EQUITY_SETTLEMENT: [u8; 32] = keccak256(b"CAP_EQUITY_SETTLEMENT");
+pub const CAP_MERCHANT_PAYMENT: [u8; 32] = keccak256(b"CAP_MERCHANT_PAYMENT");
+
+/// Canonical governance & administrative Role IDs defined in `CorporateCharter`.
 pub const ROLE_SHAREHOLDER: [u8; 32] = keccak256(b"ROLE_SHAREHOLDER");
 pub const ROLE_DIRECTOR: [u8; 32] = keccak256(b"ROLE_DIRECTOR");
 pub const ROLE_PRODUCT_MANAGER: [u8; 32] = keccak256(b"ROLE_PRODUCT_MANAGER");
 pub const ROLE_TREASURY_MANAGER: [u8; 32] = keccak256(b"ROLE_TREASURY_MANAGER");
 pub const ROLE_BANK_ORACLE: [u8; 32] = keccak256(b"ROLE_BANK_ORACLE");
 
-/// Canonical policy IDs for `Constitution`, `AssetLedger`, `ProductLedger`, and `IdentityRegistry` governance.
+/// Canonical policy IDs for `CorporateCharter`, `ShareCapital`, `AssetLedger`, `ProductLedger`, and `IdentityRegistry` governance.
 pub const POLICY_SUPER_GOVERNANCE: [u8; 32] = keccak256(b"SUPER_GOVERNANCE");
 pub const POLICY_SHAREHOLDER_SUPERMAJORITY: [u8; 32] = keccak256(b"SHAREHOLDER_SUPERMAJORITY");
 pub const POLICY_FIRST_SHAREHOLDER_RESOLUTION: [u8; 32] =
@@ -71,7 +86,6 @@ pub const POLICY_PRODUCT_MANAGEMENT: [u8; 32] = keccak256(b"PRODUCT_MANAGEMENT")
 pub const POLICY_SHARE_TRANSFER_AUCTION: [u8; 32] = keccak256(b"SHARE_TRANSFER_AUCTION");
 pub const POLICY_FUTURES_UNDERWRITING: [u8; 32] = keccak256(b"FUTURES_UNDERWRITING");
 pub const POLICY_BANK_ORACLE: [u8; 32] = keccak256(b"BANK_ORACLE");
-pub const POLICY_PRODUCT_ORACLE: [u8; 32] = keccak256(b"PRODUCT_ORACLE");
 pub const POLICY_ADMIN_ORACLE: [u8; 32] = keccak256(b"ADMIN_ORACLE");
 /// Dynamic policy sentinel for `ACTION_TRANSFER` / `ACTION_APPROVE` requiring a one-time
 /// `Authorization` object approved & finalized by the debited holder Identity itself.
@@ -116,11 +130,15 @@ pub const ERR_FUTURES_CAP_EXCEEDED: i32 = -87;
 pub const ERR_DEX_NOT_ATTACHED: i32 = -88;
 pub const ERR_ORDERBOOK_FULL: i32 = -89;
 pub const ERR_INVALID_DEX_ORDER: i32 = -90;
-pub const ERR_CONSTITUTION_NOT_ACTIVE: i32 = -91;
-pub const ERR_CONSTITUTION_ALREADY_ACTIVE: i32 = -92;
+pub const ERR_CHARTER_NOT_ACTIVE: i32 = -91;
+pub const ERR_CHARTER_ALREADY_ACTIVE: i32 = -92;
+pub const ERR_CONSTITUTION_NOT_ACTIVE: i32 = ERR_CHARTER_NOT_ACTIVE;
+pub const ERR_CONSTITUTION_ALREADY_ACTIVE: i32 = ERR_CHARTER_ALREADY_ACTIVE;
 pub const ERR_ROLE_NOT_DEFINED: i32 = -93;
 pub const ERR_FUNCTION_AUTH_NOT_SET: i32 = -94;
-pub const ERR_CONSTITUTION_MISMATCH: i32 = -19;
+pub const ERR_UNAUTHORIZED_MODULE: i32 = -95;
+pub const ERR_CHARTER_MISMATCH: i32 = -19;
+pub const ERR_CONSTITUTION_MISMATCH: i32 = ERR_CHARTER_MISMATCH;
 
 /// Order side/step tags for `POLICY_SHARE_TRANSFER_AUCTION` 3-step share transfer auctions.
 pub const ORDER_SIDE_BUY_STEP1: u8 = 1;
@@ -130,8 +148,8 @@ pub const ORDER_SIDE_CANCELLED: u8 = 4;
 pub const MAX_AUCTION_ORDERS: usize = 64;
 pub const MAX_ENCODED_AUCTION_BOOK_BYTES: usize = 4 + MAX_AUCTION_ORDERS * 37;
 pub const MAX_SHARE_CLASSES: usize = 8;
-pub const MAX_BANK_LEDGERS: usize = 8;
 pub const MAX_DEFINED_ROLES: usize = 32;
+pub const MAX_AUTHORIZED_MODULES: usize = 16;
 
 /// Single explicit authorizer entry within a sequential authorization stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,18 +186,34 @@ impl Default for StageRole {
     }
 }
 
-/// Per-function authorization binding (`fn_selector -> policy_id`) stored in `Constitution`.
+/// Scoped per-function authorization binding (`(target_hps, fn_selector) -> policy_id`) stored in
+/// `CorporateCharter`. `target_hps == [0u8; 20]` targets `CorporateCharter` itself (and acts as
+/// wildcard fallback if no module-specific override exists).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FunctionAuthRule {
+    pub target_hps: [u8; 20],
     pub fn_selector: [u8; 4],
     pub policy_id: [u8; 32],
 }
 
 impl FunctionAuthRule {
-    pub const ENCODED_LEN: usize = 36;
+    pub const ENCODED_LEN: usize = 56;
 
-    pub const fn new(fn_selector: [u8; 4], policy_id: [u8; 32]) -> Self {
+    pub const fn for_charter(fn_selector: [u8; 4], policy_id: [u8; 32]) -> Self {
         Self {
+            target_hps: [0u8; 20],
+            fn_selector,
+            policy_id,
+        }
+    }
+
+    pub const fn for_target(
+        target_hps: [u8; 20],
+        fn_selector: [u8; 4],
+        policy_id: [u8; 32],
+    ) -> Self {
+        Self {
+            target_hps,
             fn_selector,
             policy_id,
         }
@@ -187,8 +221,9 @@ impl FunctionAuthRule {
 
     pub fn encode(&self) -> [u8; Self::ENCODED_LEN] {
         let mut out = [0u8; Self::ENCODED_LEN];
-        out[0..4].copy_from_slice(&self.fn_selector);
-        out[4..36].copy_from_slice(&self.policy_id);
+        out[0..20].copy_from_slice(&self.target_hps);
+        out[20..24].copy_from_slice(&self.fn_selector);
+        out[24..56].copy_from_slice(&self.policy_id);
         out
     }
 
@@ -196,15 +231,60 @@ impl FunctionAuthRule {
         if raw.len() != Self::ENCODED_LEN {
             return None;
         }
-        let fn_selector = [raw[0], raw[1], raw[2], raw[3]];
+        let mut target_hps = [0u8; 20];
+        target_hps.copy_from_slice(&raw[0..20]);
+        let fn_selector = [raw[20], raw[21], raw[22], raw[23]];
         let mut policy_id = [0u8; 32];
-        policy_id.copy_from_slice(&raw[4..36]);
+        policy_id.copy_from_slice(&raw[24..56]);
         if fn_selector == [0u8; 4] || policy_id == [0u8; 32] {
             return None;
         }
         Some(Self {
+            target_hps,
             fn_selector,
             policy_id,
+        })
+    }
+}
+
+/// Authorized company module binding (`(module_hps, capability)`) registered in `CorporateCharter`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthorizedModuleSpec {
+    pub module_hps: [u8; 20],
+    pub capability: [u8; 32],
+}
+
+impl AuthorizedModuleSpec {
+    pub const ENCODED_LEN: usize = 52;
+
+    pub const fn new(module_hps: [u8; 20], capability: [u8; 32]) -> Self {
+        Self {
+            module_hps,
+            capability,
+        }
+    }
+
+    pub fn encode(&self) -> [u8; Self::ENCODED_LEN] {
+        let mut out = [0u8; Self::ENCODED_LEN];
+        out[0..20].copy_from_slice(&self.module_hps);
+        out[20..52].copy_from_slice(&self.capability);
+        out
+    }
+
+    pub fn decode(raw: &[u8]) -> Option<Self> {
+        if raw.len() != Self::ENCODED_LEN {
+            return None;
+        }
+        let mut module_hps = [0u8; 20];
+        module_hps.copy_from_slice(&raw[0..20]);
+        let mut capability = [0u8; 32];
+        capability.copy_from_slice(&raw[20..52]);
+        if module_hps == [0u8; 20] || capability == [0u8; 32] {
+            return None;
+        }
+        Some(Self {
+            module_hps,
+            capability,
         })
     }
 }
@@ -690,6 +770,59 @@ pub fn require_valid_authorization_hps(
     match call::call_bool(registry, cd.as_slice()) {
         Ok(true) => Ok(()),
         _ => Err(ERR_UNAPPROVED_CODE_HASH),
+    }
+}
+
+/// Verify that `charter` has passed its First Shareholder Resolution (`state() == CHARTER_STATE_ACTIVE`).
+pub fn require_active_charter(charter: &[u8; 20]) -> Result<(), i32> {
+    if *charter == [0u8; 20] {
+        return Err(ERR_CHARTER_NOT_ACTIVE);
+    }
+    let st_cd = CallEncoder::<16>::new(const { selector("state()") });
+    match call::call_u64(charter, st_cd.as_slice()) {
+        Ok(CHARTER_STATE_ACTIVE) => Ok(()),
+        _ => Err(ERR_CHARTER_NOT_ACTIVE),
+    }
+}
+
+/// Query `CorporateCharter.isAuthorizedModule(moduleHps, capability)`.
+pub fn is_authorized_charter_module(
+    charter: &[u8; 20],
+    module_hps: &[u8; 20],
+    capability: &[u8; 32],
+) -> bool {
+    if *charter == [0u8; 20] || *module_hps == [0u8; 20] || *capability == [0u8; 32] {
+        return false;
+    }
+    let cd = CallEncoder::<96>::new(const { selector("isAuthorizedModule(address,bytes32)") })
+        .push_address(module_hps)
+        .push_bytes32(capability);
+    matches!(call::call_bool(charter, cd.as_slice()), Ok(true))
+}
+
+/// Query `CorporateCharter.getFunctionAuth(targetHps, fnSelector)` and return `Some(policy_id)`
+/// when non-zero.
+pub fn query_charter_function_auth(
+    charter: &[u8; 20],
+    target_hps: &[u8; 20],
+    fn_selector: &[u8; 4],
+) -> Option<[u8; 32]> {
+    if *charter == [0u8; 20] || *fn_selector == [0u8; 4] {
+        return None;
+    }
+    let cd = CallEncoder::<96>::new(const { selector("getFunctionAuth(address,bytes4)") })
+        .push_address(target_hps)
+        .push_bytes4(fn_selector);
+    let raw = call::call_raw(charter, cd.as_slice()).ok()?;
+    if raw.len() < 32 {
+        return None;
+    }
+    let mut pol = [0u8; 32];
+    pol.copy_from_slice(&raw[0..32]);
+    if pol == [0u8; 32] {
+        None
+    } else {
+        Some(pol)
     }
 }
 

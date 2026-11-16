@@ -1,0 +1,13 @@
+[package]
+name = "share-capital"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Share Capital Haltproof Subroutine (HPS): share-backed futures underwriting and restricted 3-step share-transfer call-auction brokerage with segregated shareholder escrow"
+
+[[bin]]
+name = "share_capital"
+path = "src/main.rs"
+
+[dependencies]
+hps-sdk = { path = "../../crates/hps-sdk" }

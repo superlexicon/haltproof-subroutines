@@ -1,20 +1,18 @@
 //! Product Ledger **Haltproof Subroutine (HPS)** built with `hps-sdk`.
 //!
-//! Represents an institutional product inventory & catalog ledger owned/controlled by a single
-//! `Constitution` HPS and paired with an `AccountingLedger` HPS:
-//! - Each row in `ProductLedger` represents a product (`productId`), its `unitsAvailable` for sale,
-//!   its `latestPrice`, its cumulative `totalUnitsSold`, and its 32-byte UTF-8 SKU/name label.
-//! - Catalog & inventory updates (`upsertProduct`, `restockProduct`, `setProductPrice`) are governed
-//!   by the Board-appointed Product Oracle / Catalog Manager Identity (`POLICY_PRODUCT_ORACLE` on
-//!   the pinned `Constitution` HPS).
-//! - Any verified buyer `Identity` can place an immediate-fulfilment buy order via
-//!   `buyProduct(bytes32 productId, uint64 quantity)`:
-//!   1. Reverts immediately with `ERR_INSUFFICIENT_PRODUCT_UNITS (-82)` if `unitsAvailable < quantity`.
-//!   2. Atomically clears `quantity * latestPrice` from the buyer's sub-account in the company's
-//!      Bank Balance `AssetLedger` into the `Constitution`'s clearing/revenue account (reverting
-//!      if the buyer has insufficient bank balance).
-//!   3. Decrements `unitsAvailable` by `quantity` and increments `totalUnitsSold`.
-//!   4. Records the sale and increments `totalRevenue` in the linked `AccountingLedger` HPS.
+//! Institutional product inventory, catalog, and checkout ledger pinned to a single
+//! `IdentityRegistry`, a single `CorporateCharter`, and an `AccountingLedger`:
+//! - Catalog & inventory updates (`upsertProduct`, `restockProduct`, `setProductPrice`) are invoked
+//!   directly on `ProductLedger` and governed by `CorporateCharter.getFunctionAuth(self, selector)`
+//!   (defaulting to `POLICY_PRODUCT_MANAGEMENT` / `ROLE_PRODUCT_MANAGER`).
+//! - Customer checkout (`buyProduct(bytes32 productId, uint64 quantity)`):
+//!   1. Verifies `CorporateCharter` is `ACTIVE` and `buyer` is an active `Identity`.
+//!   2. Reverts with `ERR_INSUFFICIENT_PRODUCT_UNITS (-82)` if `unitsAvailable < quantity`.
+//!   3. Settles `quantity * latestPrice` from `buyer` directly into `ProductLedger`'s configured
+//!      **`operatingRevenueAccount`** (segregated from `ShareCapital`'s shareholder auction escrow)
+//!      on `operatingBankLedger` via `charterModuleClearTransfer` (`CAP_MERCHANT_PAYMENT`).
+//!   4. Decrements `unitsAvailable` and logs the immutable sale entry in `AccountingLedger.recordSale`
+//!      (preserving strict accounting segregation of duties).
 
 #![cfg_attr(target_arch = "wasm32", no_std)]
 #![cfg_attr(target_arch = "wasm32", no_main)]
@@ -22,17 +20,20 @@
 use hps_sdk::abi::CalldataReader;
 use hps_sdk::call::{self, CallEncoder};
 use hps_sdk::governance::{
-    require_valid_identity, verify_and_consume_auth, ActionHasher, ACTION_RESTOCK_PRODUCT,
-    ACTION_SET_PRODUCT_PRICE, ACTION_UPSERT_PRODUCT, CONSTITUTION_STATE_ACTIVE,
-    ERR_CONSTITUTION_MISMATCH, ERR_CONSTITUTION_NOT_ACTIVE, ERR_INSUFFICIENT_PRODUCT_UNITS,
-    ERR_INVALID_PRODUCT_PARAMS, ERR_MISSING_ROLE, ERR_PRODUCT_NOT_FOUND,
-    POLICY_PRODUCT_MANAGEMENT, POLICY_PRODUCT_ORACLE, ROLE_PRODUCT_MANAGER,
+    query_charter_function_auth, require_active_charter, require_valid_identity,
+    verify_and_consume_auth, ActionHasher, ACTION_RESTOCK_PRODUCT, ACTION_SET_OPERATING_ACCOUNT,
+    ACTION_SET_PRODUCT_PRICE, ACTION_UPSERT_PRODUCT, ERR_AUTH_CONSUME_FAILED, ERR_CHARTER_MISMATCH,
+    ERR_INSUFFICIENT_PRODUCT_UNITS, ERR_INVALID_PRODUCT_PARAMS, ERR_MISSING_ROLE,
+    ERR_PRODUCT_NOT_FOUND, POLICY_BOARD_RESOLUTION, POLICY_PRODUCT_MANAGEMENT,
+    ROLE_PRODUCT_MANAGER,
 };
 use hps_sdk::storage::KeyBuilder;
 use hps_sdk::{context, event_topic, events, hps_entry, ret, selector, storage};
 
 const PRODUCT_LEDGER_INITIALIZED: [u8; 32] =
     event_topic("ProductLedgerInitialized(address,address,uint64)");
+const OPERATING_ACCOUNT_SET: [u8; 32] =
+    event_topic("OperatingAccountSet(address,address,address)");
 const PRODUCT_UPSERTED: [u8; 32] =
     event_topic("ProductUpserted(bytes32,uint64,uint64,address)");
 const PRODUCT_RESTOCKED: [u8; 32] =
@@ -43,10 +44,20 @@ const PRODUCT_PURCHASED: [u8; 32] = event_topic(
     "ProductPurchased(bytes32,address,uint64,uint64,uint64,uint64,uint64)",
 );
 
+const SEL_SET_OPERATING_ACCOUNT: [u8; 4] =
+    selector("setOperatingAccount(address,address,address)");
+const SEL_UPSERT_PRODUCT: [u8; 4] =
+    selector("upsertProduct(bytes32,uint64,uint64,bytes,address)");
+const SEL_RESTOCK_PRODUCT: [u8; 4] = selector("restockProduct(bytes32,uint64,uint64,address)");
+const SEL_SET_PRODUCT_PRICE: [u8; 4] = selector("setProductPrice(bytes32,uint64,address)");
+
 const KEY_INIT: &[u8] = b"prd:init";
 const KEY_REGISTRY: &[u8] = b"prd:reg";
-const KEY_CONSTITUTION: &[u8] = b"prd:con";
+const KEY_CHARTER: &[u8] = b"prd:chr";
+const KEY_INITIALIZER: &[u8] = b"prd:init_by";
 const KEY_ACCOUNTING: &[u8] = b"prd:acc";
+const KEY_OP_BANK_LEDGER: &[u8] = b"prd:bank_led";
+const KEY_OP_REV_ACCOUNT: &[u8] = b"prd:rev_acct";
 const KEY_PRODUCT_COUNT: &[u8] = b"prd:cnt";
 
 const PRODUCT_ROW_LEN: usize = 58;
@@ -100,22 +111,28 @@ impl ProductRow {
 }
 
 hps_entry! {
-    "initialize(address,address,address,bytes)"                         => handle_initialize,
-    "upsertProduct(bytes32,uint64,uint64,bytes,address)"                => handle_upsert_product,
-    "restockProduct(bytes32,uint64,uint64,address)"                     => handle_restock_product,
-    "setProductPrice(bytes32,uint64,address)"                           => handle_set_product_price,
-    "buyProduct(bytes32,uint64)"                                        => handle_buy_product,
-    "getProduct(bytes32)"                                               => handle_get_product,
-    "unitsAvailableOf(bytes32)"                                         => handle_units_available_of,
-    "latestPriceOf(bytes32)"                                            => handle_latest_price_of,
-    "productCount()"                                                    => handle_product_count,
-    "productIdAt(uint64)"                                               => handle_product_id_at,
-    "associatedConstitution()"                                          => handle_associated_constitution,
-    "accountingLedger()"                                                => handle_accounting_ledger,
-    "identityRegistry()"                                                => handle_identity_registry,
-    "hashUpsertProduct(bytes32,uint64,uint64,bytes)"                    => handle_hash_upsert_product,
-    "hashRestockProduct(bytes32,uint64,uint64)"                         => handle_hash_restock_product,
-    "hashSetProductPrice(bytes32,uint64)"                               => handle_hash_set_product_price,
+    "initialize(address,address,address,bytes)"                                 => handle_initialize_4,
+    "initializeWithBank(address,address,address,address,address,bytes)"         => handle_initialize_6,
+    "setOperatingAccount(address,address,address)"                              => handle_set_operating_account,
+    "upsertProduct(bytes32,uint64,uint64,bytes,address)"                        => handle_upsert_product,
+    "restockProduct(bytes32,uint64,uint64,address)"                             => handle_restock_product,
+    "setProductPrice(bytes32,uint64,address)"                                   => handle_set_product_price,
+    "buyProduct(bytes32,uint64)"                                                => handle_buy_product,
+    "getProduct(bytes32)"                                                       => handle_get_product,
+    "unitsAvailableOf(bytes32)"                                                 => handle_units_available_of,
+    "latestPriceOf(bytes32)"                                                    => handle_latest_price_of,
+    "productCount()"                                                            => handle_product_count,
+    "productIdAt(uint64)"                                                       => handle_product_id_at,
+    "associatedCharter()"                                                       => handle_associated_charter,
+    "associatedConstitution()"                                                  => handle_associated_charter,
+    "accountingLedger()"                                                        => handle_accounting_ledger,
+    "operatingBankLedger()"                                                     => handle_operating_bank_ledger,
+    "operatingRevenueAccount()"                                                 => handle_operating_revenue_account,
+    "identityRegistry()"                                                        => handle_identity_registry,
+    "hashSetOperatingAccount(address,address)"                                  => handle_hash_set_operating_account,
+    "hashUpsertProduct(bytes32,uint64,uint64,bytes)"                            => handle_hash_upsert_product,
+    "hashRestockProduct(bytes32,uint64,uint64)"                                 => handle_hash_restock_product,
+    "hashSetProductPrice(bytes32,uint64)"                                       => handle_hash_set_product_price,
 }
 
 fn addr_topic(addr: &[u8; 20]) -> [u8; 32] {
@@ -160,6 +177,16 @@ fn save_product(product_id: &[u8; 32], row: &ProductRow) {
     }
 }
 
+fn compute_set_operating_account_hash(
+    bank_ledger: &[u8; 20],
+    revenue_account: &[u8; 20],
+) -> [u8; 32] {
+    ActionHasher::<160>::new(&context::self_address(), &ACTION_SET_OPERATING_ACCOUNT)
+        .push_address(bank_ledger)
+        .push_address(revenue_account)
+        .finish()
+}
+
 fn compute_upsert_hash(
     product_id: &[u8; 32],
     units_available: u64,
@@ -193,120 +220,108 @@ fn compute_set_price_hash(product_id: &[u8; 32], new_price: u64) -> [u8; 32] {
         .finish()
 }
 
-fn ensure_initialized_and_valid_caller() -> Result<([u8; 20], [u8; 20], [u8; 20]), i32> {
+fn ensure_active_and_valid_caller() -> Result<([u8; 20], [u8; 20], [u8; 20]), i32> {
     if storage::get_u64(KEY_INIT) != 1 {
         return Err(-10);
     }
     let registry = storage::get_address(KEY_REGISTRY).ok_or(-10)?;
-    let constitution = storage::get_address(KEY_CONSTITUTION).ok_or(-10)?;
+    let charter = storage::get_address(KEY_CHARTER).ok_or(-10)?;
+    require_active_charter(&charter)?;
     let caller = context::msg_sender();
-    if caller != constitution {
-        require_valid_identity(&registry, &caller)?;
-    }
-    Ok((registry, constitution, caller))
+    require_valid_identity(&registry, &caller)?;
+    Ok((registry, charter, caller))
 }
 
-/// Verify that a catalog/inventory mutation is authorized by an `Identity` holding
-/// `ROLE_PRODUCT_MANAGER` on the pinned `Constitution` HPS (or the per-ledger Product Oracle):
-/// - If `caller == constitution` (invoked via `Constitution.upsertProduct` / `restockProduct` /
-///   `setProductPrice`), `Constitution` has already verified `ROLE_PRODUCT_MANAGER`.
-/// - If `auth_obj != 0x0`, atomically verifies and consumes the one-time `Authorization` HPS object
-///   under `ROLE_PRODUCT_MANAGER` (or `POLICY_PRODUCT_ORACLE`).
-/// - If `auth_obj == 0x0`, checks `constitution.hasRole(ROLE_PRODUCT_MANAGER, caller)` first,
-///   falling back to `constitution.productOracleOf(self_address) == caller`, and returning
-///   `Err(ERR_MISSING_ROLE)` (`-85`) otherwise.
-fn require_product_oracle_auth(
+/// Verify catalog mutation authorization against `CorporateCharter.getFunctionAuth(self, fnSelector)`:
+/// - If `auth_obj != 0x0`, consumes `auth_obj` matching `(charter, req_pol, action_hash)`.
+/// - If `auth_obj == 0x0`, permits direct role-holder execution ONLY when `req_pol` is
+///   `POLICY_PRODUCT_MANAGEMENT` (`ROLE_PRODUCT_MANAGER`) or a defined single role in `CorporateCharter`;
+///   if `CorporateCharter` configured a custom multi-stage policy (e.g., `POLICY_DUAL_PRODUCT_CFO`),
+///   `auth_obj == 0x0` is rejected so multi-stage governance cannot be bypassed!
+fn require_product_catalog_auth(
     registry: &[u8; 20],
-    constitution: &[u8; 20],
+    charter: &[u8; 20],
+    fn_selector: &[u8; 4],
     action_hash: &[u8; 32],
     auth_obj: &[u8; 20],
     caller: &[u8; 20],
 ) -> Result<(), i32> {
-    let st_cd = CallEncoder::<16>::new(const { selector("state()") });
-    if let Ok(st) = call::call_u64(constitution, st_cd.as_slice()) {
-        if st != CONSTITUTION_STATE_ACTIVE {
-            return Err(ERR_CONSTITUTION_NOT_ACTIVE);
-        }
-    }
-
-    if *caller == *constitution {
-        return Ok(());
-    }
+    let me = context::self_address();
+    let explicit_pol = query_charter_function_auth(charter, &me, fn_selector);
 
     if *auth_obj != [0u8; 20] {
-        let pid_cd = CallEncoder::<16>::new(const { selector("policyId()") });
-        let policy_id = if let Ok(raw_pid) = call::call_raw(auth_obj, pid_cd.as_slice()) {
-            if raw_pid.len() >= 32 && raw_pid[..32] == ROLE_PRODUCT_MANAGER {
-                ROLE_PRODUCT_MANAGER
-            } else if raw_pid.len() >= 32 && raw_pid[..32] == POLICY_PRODUCT_MANAGEMENT {
-                POLICY_PRODUCT_MANAGEMENT
-            } else {
-                POLICY_PRODUCT_ORACLE
-            }
+        let req_pol = if let Some(pol) = explicit_pol {
+            pol
         } else {
-            POLICY_PRODUCT_ORACLE
+            let pid_cd = CallEncoder::<16>::new(const { selector("policyId()") });
+            if let Ok(raw_pid) = call::call_raw(auth_obj, pid_cd.as_slice()) {
+                if raw_pid.len() >= 32 && raw_pid[..32] == ROLE_PRODUCT_MANAGER {
+                    ROLE_PRODUCT_MANAGER
+                } else {
+                    POLICY_PRODUCT_MANAGEMENT
+                }
+            } else {
+                POLICY_PRODUCT_MANAGEMENT
+            }
         };
-        return verify_and_consume_auth(
-            registry,
-            auth_obj,
-            constitution,
-            &policy_id,
-            action_hash,
-            caller,
-        );
+        return verify_and_consume_auth(registry, auth_obj, charter, &req_pol, action_hash, caller);
     }
+
+    let role_to_check = match explicit_pol {
+        None | Some(POLICY_PRODUCT_MANAGEMENT) => ROLE_PRODUCT_MANAGER,
+        Some(pol) => {
+            let def_cd = CallEncoder::<64>::new(const { selector("isRoleDefined(bytes32)") })
+                .push_bytes32(&pol);
+            if !matches!(call::call_bool(charter, def_cd.as_slice()), Ok(true)) {
+                return Err(ERR_AUTH_CONSUME_FAILED);
+            }
+            pol
+        }
+    };
 
     let role_cd = CallEncoder::<96>::new(const { selector("hasRole(bytes32,address)") })
-        .push_bytes32(&ROLE_PRODUCT_MANAGER)
+        .push_bytes32(&role_to_check)
         .push_address(caller);
-    if let Ok(true) = call::call_bool(constitution, role_cd.as_slice()) {
-        return Ok(());
+    if matches!(call::call_bool(charter, role_cd.as_slice()), Ok(true)) {
+        Ok(())
+    } else {
+        Err(ERR_MISSING_ROLE)
     }
-
-    let me = context::self_address();
-    let ora_cd =
-        CallEncoder::<64>::new(const { selector("productOracleOf(address)") }).push_address(&me);
-    let Ok(raw_ora) = call::call_raw(constitution, ora_cd.as_slice()) else {
-        return Err(ERR_MISSING_ROLE);
-    };
-    if raw_ora.len() < 32 {
-        return Err(ERR_MISSING_ROLE);
-    }
-    let mut appointed_oracle = [0u8; 20];
-    appointed_oracle.copy_from_slice(&raw_ora[12..32]);
-    if appointed_oracle == [0u8; 20] || *caller != appointed_oracle {
-        return Err(ERR_MISSING_ROLE);
-    }
-    Ok(())
 }
 
-/// Initialize `ProductLedger` pinned to a single `IdentityRegistry`, single `Constitution`, and
-/// single `AccountingLedger`, optionally seeding initial product rows (`N * 80` bytes of
-/// `[productId: 32B][unitsAvailable: u64 BE (8B)][latestPrice: u64 BE (8B)][name: 32B]`).
-fn handle_initialize(args: &CalldataReader) -> Result<(), i32> {
+fn execute_initialize(
+    registry: &[u8; 20],
+    charter: &[u8; 20],
+    accounting_ledger: &[u8; 20],
+    op_bank_ledger: &[u8; 20],
+    op_rev_account: &[u8; 20],
+    initial_products: &[u8],
+) -> Result<(), i32> {
     if storage::get_u64(KEY_INIT) != 0 {
         return Err(-11);
     }
-    let registry = args.address(0).ok_or(-3)?;
-    let constitution = args.address(1).ok_or(-3)?;
-    let accounting_ledger = args.address(2).ok_or(-3)?;
-    let initial_products = args.dynamic_bytes(3).ok_or(-3)?;
-
-    if registry == [0u8; 20]
-        || constitution == [0u8; 20]
-        || accounting_ledger == [0u8; 20]
+    if *registry == [0u8; 20]
+        || *charter == [0u8; 20]
+        || *accounting_ledger == [0u8; 20]
         || initial_products.len() % GENESIS_PRODUCT_PACK_LEN != 0
+        || ((*op_bank_ledger == [0u8; 20]) != (*op_rev_account == [0u8; 20]))
     {
-        return Err(ERR_CONSTITUTION_MISMATCH);
+        return Err(ERR_CHARTER_MISMATCH);
     }
 
     let caller = context::msg_sender();
-    require_valid_identity(&registry, &caller)?;
+    require_valid_identity(registry, &caller)?;
+    if *op_rev_account != [0u8; 20] {
+        require_valid_identity(registry, op_rev_account)?;
+        storage::set_address(KEY_OP_BANK_LEDGER, op_bank_ledger);
+        storage::set_address(KEY_OP_REV_ACCOUNT, op_rev_account);
+    }
 
     storage::set_u64(KEY_INIT, 1);
-    storage::set_address(KEY_REGISTRY, &registry);
-    storage::set_address(KEY_CONSTITUTION, &constitution);
-    storage::set_address(KEY_ACCOUNTING, &accounting_ledger);
+    storage::set_address(KEY_REGISTRY, registry);
+    storage::set_address(KEY_CHARTER, charter);
+    storage::set_address(KEY_INITIALIZER, &caller);
+    storage::set_address(KEY_ACCOUNTING, accounting_ledger);
     storage::set_u64(KEY_PRODUCT_COUNT, 0);
 
     let count = initial_products.len() / GENESIS_PRODUCT_PACK_LEN;
@@ -351,8 +366,8 @@ fn handle_initialize(args: &CalldataReader) -> Result<(), i32> {
     events::emit(
         &[
             PRODUCT_LEDGER_INITIALIZED,
-            addr_topic(&constitution),
-            addr_topic(&accounting_ledger),
+            addr_topic(charter),
+            addr_topic(accounting_ledger),
         ],
         &(count as u64).to_be_bytes(),
     );
@@ -360,10 +375,86 @@ fn handle_initialize(args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
-/// Add a new product or overwrite an existing product's available units, price, and name.
-/// Governed by `POLICY_PRODUCT_ORACLE` (Board-appointed Product Oracle / Catalog Manager).
+fn handle_initialize_4(args: &CalldataReader) -> Result<(), i32> {
+    let registry = args.address(0).ok_or(-3)?;
+    let charter = args.address(1).ok_or(-3)?;
+    let accounting_ledger = args.address(2).ok_or(-3)?;
+    let initial_products = args.dynamic_bytes(3).ok_or(-3)?;
+    execute_initialize(
+        &registry,
+        &charter,
+        &accounting_ledger,
+        &[0u8; 20],
+        &[0u8; 20],
+        initial_products,
+    )
+}
+
+fn handle_initialize_6(args: &CalldataReader) -> Result<(), i32> {
+    let registry = args.address(0).ok_or(-3)?;
+    let charter = args.address(1).ok_or(-3)?;
+    let accounting_ledger = args.address(2).ok_or(-3)?;
+    let op_bank_ledger = args.address(3).ok_or(-3)?;
+    let op_rev_account = args.address(4).ok_or(-3)?;
+    let initial_products = args.dynamic_bytes(5).ok_or(-3)?;
+    execute_initialize(
+        &registry,
+        &charter,
+        &accounting_ledger,
+        &op_bank_ledger,
+        &op_rev_account,
+        initial_products,
+    )
+}
+
+fn handle_set_operating_account(args: &CalldataReader) -> Result<(), i32> {
+    let (registry, charter, caller) = ensure_active_and_valid_caller()?;
+    let bank_ledger = args.address(0).ok_or(-3)?;
+    let rev_account = args.address(1).ok_or(-3)?;
+    let auth_obj = args.address(2).ok_or(-3)?;
+
+    if bank_ledger == [0u8; 20] || rev_account == [0u8; 20] {
+        return Err(ERR_INVALID_PRODUCT_PARAMS);
+    }
+    require_valid_identity(&registry, &rev_account)?;
+
+    let me = context::self_address();
+    let explicit_pol = query_charter_function_auth(&charter, &me, &SEL_SET_OPERATING_ACCOUNT);
+    if auth_obj == [0u8; 20]
+        && storage::get_address(KEY_OP_REV_ACCOUNT).is_none()
+        && explicit_pol.is_none()
+    {
+        let is_dir_cd = CallEncoder::<64>::new(const { selector("isDirector(address)") })
+            .push_address(&caller);
+        let is_dir = matches!(call::call_bool(&charter, is_dir_cd.as_slice()), Ok(true));
+        let init_by = storage::get_address(KEY_INITIALIZER).unwrap_or([0u8; 20]);
+        if !is_dir && caller != init_by {
+            return Err(-61);
+        }
+    } else {
+        let req_pol = explicit_pol.unwrap_or(POLICY_BOARD_RESOLUTION);
+        let action_hash = compute_set_operating_account_hash(&bank_ledger, &rev_account);
+        verify_and_consume_auth(&registry, &auth_obj, &charter, &req_pol, &action_hash, &caller)?;
+    }
+
+    storage::set_address(KEY_OP_BANK_LEDGER, &bank_ledger);
+    storage::set_address(KEY_OP_REV_ACCOUNT, &rev_account);
+
+    events::emit(
+        &[
+            OPERATING_ACCOUNT_SET,
+            addr_topic(&bank_ledger),
+            addr_topic(&rev_account),
+            addr_topic(&auth_obj),
+        ],
+        &[],
+    );
+    ret::write_bool(true);
+    Ok(())
+}
+
 fn handle_upsert_product(args: &CalldataReader) -> Result<(), i32> {
-    let (registry, constitution, caller) = ensure_initialized_and_valid_caller()?;
+    let (registry, charter, caller) = ensure_active_and_valid_caller()?;
     let product_id = args.bytes32(0).ok_or(-3)?;
     let units_available = args.u64(1).ok_or(-3)?;
     let latest_price = args.u64(2).ok_or(-3)?;
@@ -375,13 +466,21 @@ fn handle_upsert_product(args: &CalldataReader) -> Result<(), i32> {
     }
 
     let action_hash = compute_upsert_hash(&product_id, units_available, latest_price, raw_name);
-    require_product_oracle_auth(&registry, &constitution, &action_hash, &auth_obj, &caller)?;
+    require_product_catalog_auth(
+        &registry,
+        &charter,
+        &SEL_UPSERT_PRODUCT,
+        &action_hash,
+        &auth_obj,
+        &caller,
+    )?;
 
     let prev_sold = load_product(&product_id)
         .map(|r| r.total_units_sold)
         .unwrap_or(0);
     let mut name = [0u8; 32];
     name[..raw_name.len()].copy_from_slice(raw_name);
+
     let row = ProductRow {
         active: true,
         name_len: raw_name.len() as u8,
@@ -396,29 +495,36 @@ fn handle_upsert_product(args: &CalldataReader) -> Result<(), i32> {
     ev[0..8].copy_from_slice(&units_available.to_be_bytes());
     ev[8..16].copy_from_slice(&latest_price.to_be_bytes());
     events::emit(&[PRODUCT_UPSERTED, product_id, addr_topic(&caller)], &ev);
+
     ret::write_bool(true);
     Ok(())
 }
 
-/// Restock `additionalUnits` for an existing product (and optionally update `latestPrice` if
-/// `newPrice > 0`). Governed by `POLICY_PRODUCT_ORACLE`.
 fn handle_restock_product(args: &CalldataReader) -> Result<(), i32> {
-    let (registry, constitution, caller) = ensure_initialized_and_valid_caller()?;
+    let (registry, charter, caller) = ensure_active_and_valid_caller()?;
     let product_id = args.bytes32(0).ok_or(-3)?;
     let additional_units = args.u64(1).ok_or(-3)?;
     let new_price = args.u64(2).ok_or(-3)?;
     let auth_obj = args.address(3).ok_or(-3)?;
 
-    if additional_units == 0 {
+    if additional_units == 0 && new_price == 0 {
         return Err(ERR_INVALID_PRODUCT_PARAMS);
     }
+
     let mut row = load_product(&product_id).ok_or(ERR_PRODUCT_NOT_FOUND)?;
     if !row.active {
         return Err(ERR_PRODUCT_NOT_FOUND);
     }
 
     let action_hash = compute_restock_hash(&product_id, additional_units, new_price);
-    require_product_oracle_auth(&registry, &constitution, &action_hash, &auth_obj, &caller)?;
+    require_product_catalog_auth(
+        &registry,
+        &charter,
+        &SEL_RESTOCK_PRODUCT,
+        &action_hash,
+        &auth_obj,
+        &caller,
+    )?;
 
     row.units_available = row
         .units_available
@@ -434,13 +540,13 @@ fn handle_restock_product(args: &CalldataReader) -> Result<(), i32> {
     ev[8..16].copy_from_slice(&row.units_available.to_be_bytes());
     ev[16..24].copy_from_slice(&row.latest_price.to_be_bytes());
     events::emit(&[PRODUCT_RESTOCKED, product_id, addr_topic(&caller)], &ev);
+
     ret::write_u64_word(row.units_available);
     Ok(())
 }
 
-/// Update `latestPrice` for an existing product. Governed by `POLICY_PRODUCT_ORACLE`.
 fn handle_set_product_price(args: &CalldataReader) -> Result<(), i32> {
-    let (registry, constitution, caller) = ensure_initialized_and_valid_caller()?;
+    let (registry, charter, caller) = ensure_active_and_valid_caller()?;
     let product_id = args.bytes32(0).ok_or(-3)?;
     let new_price = args.u64(1).ok_or(-3)?;
     let auth_obj = args.address(2).ok_or(-3)?;
@@ -448,39 +554,37 @@ fn handle_set_product_price(args: &CalldataReader) -> Result<(), i32> {
     if new_price == 0 {
         return Err(ERR_INVALID_PRODUCT_PARAMS);
     }
+
     let mut row = load_product(&product_id).ok_or(ERR_PRODUCT_NOT_FOUND)?;
     if !row.active {
         return Err(ERR_PRODUCT_NOT_FOUND);
     }
 
     let action_hash = compute_set_price_hash(&product_id, new_price);
-    require_product_oracle_auth(&registry, &constitution, &action_hash, &auth_obj, &caller)?;
+    require_product_catalog_auth(
+        &registry,
+        &charter,
+        &SEL_SET_PRODUCT_PRICE,
+        &action_hash,
+        &auth_obj,
+        &caller,
+    )?;
 
-    let prev_price = row.latest_price;
+    let old_price = row.latest_price;
     row.latest_price = new_price;
     save_product(&product_id, &row);
 
     let mut ev = [0u8; 16];
-    ev[0..8].copy_from_slice(&prev_price.to_be_bytes());
+    ev[0..8].copy_from_slice(&old_price.to_be_bytes());
     ev[8..16].copy_from_slice(&new_price.to_be_bytes());
-    events::emit(
-        &[PRODUCT_PRICE_UPDATED, product_id, addr_topic(&caller)],
-        &ev,
-    );
+    events::emit(&[PRODUCT_PRICE_UPDATED, product_id, addr_topic(&caller)], &ev);
+
     ret::write_bool(true);
     Ok(())
 }
 
-/// Immediate-fulfilment buy order (`productId`, `quantity`):
-/// 1. Verifies `buyer` is an active Identity in `IdentityRegistry`.
-/// 2. Checks that the product exists and `unitsAvailable >= quantity` (reverts with
-///    `ERR_INSUFFICIENT_PRODUCT_UNITS (-82)` if stock is insufficient).
-/// 3. Clears `totalCost = quantity * latestPrice` from `buyer`'s sub-account in the company's
-///    Bank Balance `AssetLedger` via `Constitution.settleProductPayment(buyer, totalCost)`.
-/// 4. Decrements `unitsAvailable` and increments `totalUnitsSold`.
-/// 5. Records the sale and updates `totalRevenue` in `AccountingLedger`.
 fn handle_buy_product(args: &CalldataReader) -> Result<(), i32> {
-    let (_registry, constitution, buyer) = ensure_initialized_and_valid_caller()?;
+    let (_registry, _charter, buyer) = ensure_active_and_valid_caller()?;
     let product_id = args.bytes32(0).ok_or(-3)?;
     let quantity = args.u64(1).ok_or(-3)?;
     if quantity == 0 {
@@ -498,13 +602,17 @@ fn handle_buy_product(args: &CalldataReader) -> Result<(), i32> {
     let unit_price = row.latest_price;
     let total_cost = quantity.checked_mul(unit_price).ok_or(-15)?;
 
-    // 1. Settle payment from buyer's bank sub-account into Constitution's clearing/revenue account
-    let pay_cd = CallEncoder::<96>::new(const {
-        const { selector("settleProductPayment(address,uint64)") }
+    let bank_ledger = storage::get_address(KEY_OP_BANK_LEDGER).ok_or(-63)?;
+    let rev_account = storage::get_address(KEY_OP_REV_ACCOUNT).ok_or(-63)?;
+
+    // 1. Settle payment from buyer's bank sub-account directly into `operatingRevenueAccount`
+    let pay_cd = CallEncoder::<128>::new(const {
+        selector("charterModuleClearTransfer(address,address,uint64)")
     })
     .push_address(&buyer)
+    .push_address(&rev_account)
     .push_u64(total_cost);
-    let paid = call::call_bool(&constitution, pay_cd.as_slice())?;
+    let paid = call::call_bool(&bank_ledger, pay_cd.as_slice())?;
     if !paid {
         return Err(-16);
     }
@@ -514,10 +622,10 @@ fn handle_buy_product(args: &CalldataReader) -> Result<(), i32> {
     row.total_units_sold = row.total_units_sold.saturating_add(quantity);
     save_product(&product_id, &row);
 
-    // 3. Record sale and increment totalRevenue in the linked AccountingLedger
+    // 3. Record sale entry in the linked AccountingLedger (bookkeeping only)
     let accounting = storage::get_address(KEY_ACCOUNTING).ok_or(-10)?;
     let rec_cd = CallEncoder::<192>::new(const {
-        const { selector("recordSale(bytes32,address,uint64,uint64,uint64)") }
+        selector("recordSale(bytes32,address,uint64,uint64,uint64)")
     })
     .push_bytes32(&product_id)
     .push_address(&buyer)
@@ -541,7 +649,6 @@ fn handle_buy_product(args: &CalldataReader) -> Result<(), i32> {
 fn handle_get_product(args: &CalldataReader) -> Result<(), i32> {
     let product_id = args.bytes32(0).ok_or(-3)?;
     let row = load_product(&product_id).ok_or(ERR_PRODUCT_NOT_FOUND)?;
-    // 5 ABI words (160 B): (uint64 unitsAvailable, uint64 latestPrice, uint64 totalUnitsSold, bool active, bytes32 nameWord)
     let mut out = [0u8; 160];
     out[24..32].copy_from_slice(&row.units_available.to_be_bytes());
     out[56..64].copy_from_slice(&row.latest_price.to_be_bytes());
@@ -594,21 +701,38 @@ fn handle_product_id_at(args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
-fn handle_associated_constitution(_args: &CalldataReader) -> Result<(), i32> {
-    let con = storage::get_address(KEY_CONSTITUTION).unwrap_or([0u8; 20]);
-    ret::write_address(&con);
+fn handle_associated_charter(_args: &CalldataReader) -> Result<(), i32> {
+    ret::write_address(&storage::get_address(KEY_CHARTER).unwrap_or([0u8; 20]));
     Ok(())
 }
 
 fn handle_accounting_ledger(_args: &CalldataReader) -> Result<(), i32> {
-    let acc = storage::get_address(KEY_ACCOUNTING).unwrap_or([0u8; 20]);
-    ret::write_address(&acc);
+    ret::write_address(&storage::get_address(KEY_ACCOUNTING).unwrap_or([0u8; 20]));
+    Ok(())
+}
+
+fn handle_operating_bank_ledger(_args: &CalldataReader) -> Result<(), i32> {
+    ret::write_address(&storage::get_address(KEY_OP_BANK_LEDGER).unwrap_or([0u8; 20]));
+    Ok(())
+}
+
+fn handle_operating_revenue_account(_args: &CalldataReader) -> Result<(), i32> {
+    ret::write_address(&storage::get_address(KEY_OP_REV_ACCOUNT).unwrap_or([0u8; 20]));
     Ok(())
 }
 
 fn handle_identity_registry(_args: &CalldataReader) -> Result<(), i32> {
-    let reg = storage::get_address(KEY_REGISTRY).unwrap_or([0u8; 20]);
-    ret::write_address(&reg);
+    ret::write_address(&storage::get_address(KEY_REGISTRY).unwrap_or([0u8; 20]));
+    Ok(())
+}
+
+fn handle_hash_set_operating_account(args: &CalldataReader) -> Result<(), i32> {
+    let bank_ledger = args.address(0).ok_or(-3)?;
+    let rev_account = args.address(1).ok_or(-3)?;
+    ret::write_word(&compute_set_operating_account_hash(
+        &bank_ledger,
+        &rev_account,
+    ));
     Ok(())
 }
 
@@ -649,6 +773,7 @@ fn handle_hash_set_product_price(args: &CalldataReader) -> Result<(), i32> {
 mod tests {
     use super::*;
     use hps_sdk::call::CallEncoder;
+    use hps_sdk::governance::CHARTER_STATE_ACTIVE;
     use hps_sdk::keccak::keccak256;
     use hps_sdk::{mock, selector};
 
@@ -667,21 +792,21 @@ mod tests {
     }
 
     #[test]
-    fn immediate_fulfilment_buy_order_clears_bank_updates_inventory_and_accounting_revenue() {
+    fn immediate_fulfilment_buy_order_clears_operating_bank_and_records_accounting_journal() {
         mock::reset();
         let registry = [0x10; 20];
-        let constitution = [0x20; 20];
+        let charter = [0x20; 20];
         let accounting = [0x30; 20];
         let product_ledger = [0x40; 20];
-        let catalog_oracle = [0x50; 20];
+        let bank_ledger = [0x60; 20];
+        let rev_account = [0x70; 20];
+        let catalog_mgr = [0x50; 20];
         let founder = [0x01; 20];
         let buyer_1 = [0x02; 20];
         let buyer_2 = [0x03; 20];
 
         mock::register_hps(registry, |raw| {
-            let Some((sel, _)) = CalldataReader::parse(raw) else {
-                return -1;
-            };
+            let Some((sel, _)) = CalldataReader::parse(raw) else { return -1; };
             if sel == const { selector("isValidIdentity(address)") } {
                 ret::write_bool(true);
                 return 0;
@@ -689,51 +814,56 @@ mod tests {
             -2
         });
 
-        // Mock Constitution tracking buyer bank balances & appointed Product Oracle
-        mock::register_hps(constitution, |raw| {
-            let Some((sel, args)) = CalldataReader::parse(raw) else {
-                return -1;
-            };
-            if sel == const { selector("setBankBal(address,uint64)") } {
+        mock::register_hps(charter, |raw| {
+            let Some((sel, args)) = CalldataReader::parse(raw) else { return -1; };
+            if sel == const { selector("state()") } {
+                ret::write_u64_word(CHARTER_STATE_ACTIVE);
+                return 0;
+            }
+            if sel == const { selector("getFunctionAuth(address,bytes4)") } {
+                ret::write_word(&[0u8; 32]);
+                return 0;
+            }
+            if sel == const { selector("hasRole(bytes32,address)") } {
+                let rid = args.bytes32(0).unwrap();
+                let who = args.address(1).unwrap();
+                ret::write_bool(rid == ROLE_PRODUCT_MANAGER && who == [0x50; 20]);
+                return 0;
+            }
+            -2
+        });
+
+        mock::register_hps(bank_ledger, |raw| {
+            let Some((sel, args)) = CalldataReader::parse(raw) else { return -1; };
+            if sel == const { selector("setBal(address,uint64)") } {
                 let who = args.address(0).unwrap();
                 let bal = args.u64(1).unwrap();
-                let k = KeyBuilder::<32>::new().push(b"mbal:").push(&who);
-                storage::set_u64(k.as_slice(), bal);
+                storage::set_u64(&who, bal);
                 ret::write_bool(true);
                 return 0;
             }
-            if sel == const { selector("bankBalOf(address)") } {
-                let who = args.address(0).unwrap();
-                let k = KeyBuilder::<32>::new().push(b"mbal:").push(&who);
-                ret::write_u64_word(storage::get_u64(k.as_slice()));
+            if sel == const { selector("balOf(address)") } {
+                ret::write_u64_word(storage::get_u64(&args.address(0).unwrap()));
                 return 0;
             }
-            if sel == const { selector("productOracleOf(address)") } {
-                ret::write_address(&[0x50; 20]);
-                return 0;
-            }
-            if sel == const { selector("settleProductPayment(address,uint64)") } {
-                let buyer = args.address(0).unwrap();
-                let cost = args.u64(1).unwrap();
-                let k = KeyBuilder::<32>::new().push(b"mbal:").push(&buyer);
-                let cur = storage::get_u64(k.as_slice());
-                if cur < cost {
+            if sel == const { selector("charterModuleClearTransfer(address,address,uint64)") } {
+                let from = args.address(0).unwrap();
+                let to = args.address(1).unwrap();
+                let amt = args.u64(2).unwrap();
+                let cur = storage::get_u64(&from);
+                if cur < amt {
                     return -16;
                 }
-                storage::set_u64(k.as_slice(), cur - cost);
-                let ck = b"mbal:clearing";
-                storage::set_u64(ck, storage::get_u64(ck) + cost);
+                storage::set_u64(&from, cur - amt);
+                storage::set_u64(&to, storage::get_u64(&to) + amt);
                 ret::write_bool(true);
                 return 0;
             }
             -2
         });
 
-        // Mock AccountingLedger recording sales & revenue
         mock::register_hps(accounting, |raw| {
-            let Some((sel, args)) = CalldataReader::parse(raw) else {
-                return -1;
-            };
+            let Some((sel, args)) = CalldataReader::parse(raw) else { return -1; };
             if sel == const { selector("recordSale(bytes32,address,uint64,uint64,uint64)") } {
                 let qty = args.u64(2).unwrap();
                 let total = args.u64(4).unwrap();
@@ -748,18 +878,11 @@ mod tests {
                 ret::write_u64_word(storage::get_u64(b"macc:rev"));
                 return 0;
             }
-            if sel == const { selector("saleCount()") } {
-                ret::write_u64_word(storage::get_u64(b"macc:cnt"));
-                return 0;
-            }
             -2
         });
 
         mock::register_hps(product_ledger, dispatch_calldata);
 
-        // Seed 2 initial products:
-        // 1. SLX-LR2021-RADIO: 10 units @ 2,500 SGD
-        // 2. SLX-VALIDATOR-APPLIANCE: 4 units @ 12,000 SGD
         let sku_radio = keccak256(b"SLX-LR2021-RADIO");
         let sku_appliance = keccak256(b"SLX-VALIDATOR-APPLIANCE");
         let mut init_bytes = Vec::new();
@@ -779,39 +902,32 @@ mod tests {
         mock::transact_as(
             founder,
             product_ledger,
-            CallEncoder::<384>::new(const {
-                selector("initialize(address,address,address,bytes)")
+            CallEncoder::<512>::new(const {
+                selector("initializeWithBank(address,address,address,address,address,bytes)")
             })
             .push_address(&registry)
-            .push_address(&constitution)
+            .push_address(&charter)
             .push_address(&accounting)
-            .push_u64(128)
+            .push_address(&bank_ledger)
+            .push_address(&rev_account)
+            .push_u64(192)
             .push_dynamic_bytes_tail(&init_bytes)
             .as_slice(),
         )
         .unwrap();
 
-        // Fund buyer_1 with 30,000 SGD and buyer_2 with 20,000 SGD
-        mock::transact_as(
-            founder,
-            constitution,
-            CallEncoder::<96>::new(const { selector("setBankBal(address,uint64)") })
-                .push_address(&buyer_1)
-                .push_u64(30_000)
-                .as_slice(),
-        )
-        .unwrap();
-        mock::transact_as(
-            founder,
-            constitution,
-            CallEncoder::<96>::new(const { selector("setBankBal(address,uint64)") })
-                .push_address(&buyer_2)
-                .push_u64(20_000)
-                .as_slice(),
-        )
-        .unwrap();
+        for (who, bal) in [(buyer_1, 30_000u64), (buyer_2, 20_000u64)] {
+            mock::transact_as(
+                founder,
+                bank_ledger,
+                CallEncoder::<96>::new(const { selector("setBal(address,uint64)") })
+                    .push_address(&who)
+                    .push_u64(bal)
+                    .as_slice(),
+            )
+            .unwrap();
+        }
 
-        // 1. Buyer 1 buys 3 units of SLX-LR2021-RADIO @ 2,500 = 7,500 SGD -> immediate fulfilment!
         let sale_0 = mock::transact_as(
             buyer_1,
             product_ledger,
@@ -823,18 +939,6 @@ mod tests {
         .unwrap();
         assert_eq!(u64::from_be_bytes(sale_0[24..32].try_into().unwrap()), 0);
 
-        // Verify unitsAvailable dropped from 10 -> 7 and AccountingLedger revenue == 7,500
-        let rem_radio = mock::transact_as(
-            founder,
-            product_ledger,
-            CallEncoder::<64>::new(const { selector("unitsAvailableOf(bytes32)") })
-                .push_bytes32(&sku_radio)
-                .as_slice(),
-        )
-        .unwrap();
-        assert_eq!(u64::from_be_bytes(rem_radio[24..32].try_into().unwrap()), 7);
-
-        // 2. Attempting to buy 5 units of SLX-VALIDATOR-APPLIANCE when only 4 are available MUST revert with ERR_INSUFFICIENT_PRODUCT_UNITS (-82)
         assert_eq!(
             mock::transact_as(
                 buyer_1,
@@ -846,8 +950,6 @@ mod tests {
             ),
             Err(ERR_INSUFFICIENT_PRODUCT_UNITS)
         );
-
-        // 3. Attempting to buy 2 units of SLX-VALIDATOR-APPLIANCE (24,000 SGD) by buyer_2 (who only has 20,000 SGD) MUST revert with -16!
         assert_eq!(
             mock::transact_as(
                 buyer_2,
@@ -860,9 +962,26 @@ mod tests {
             Err(-16)
         );
 
-        // 4. Product Oracle updates price of SLX-LR2021-RADIO to 3,000 SGD and restocks +5 units (7 -> 12)
+        // Unauthorized caller without ROLE_PRODUCT_MANAGER cannot restock
+        assert_eq!(
+            mock::transact_as(
+                founder,
+                product_ledger,
+                CallEncoder::<160>::new(const {
+                    selector("restockProduct(bytes32,uint64,uint64,address)")
+                })
+                .push_bytes32(&sku_radio)
+                .push_u64(5)
+                .push_u64(3_000)
+                .push_address(&[0u8; 20])
+                .as_slice(),
+            ),
+            Err(ERR_MISSING_ROLE)
+        );
+
+        // `catalog_mgr` holding `ROLE_PRODUCT_MANAGER` restocks +5 @ 3,000 SGD
         mock::transact_as(
-            catalog_oracle,
+            catalog_mgr,
             product_ledger,
             CallEncoder::<160>::new(const {
                 selector("restockProduct(bytes32,uint64,uint64,address)")
@@ -875,7 +994,6 @@ mod tests {
         )
         .unwrap();
 
-        // 5. Buyer 2 buys 4 units of SLX-LR2021-RADIO at the new price 3,000 = 12,000 SGD
         mock::transact_as(
             buyer_2,
             product_ledger,
@@ -886,19 +1004,15 @@ mod tests {
         )
         .unwrap();
 
-        // Verify remaining units = 12 - 4 = 8, and total AccountingLedger revenue = 7,500 + 12,000 = 19,500 SGD across 2 sales
-        let rem_radio_after = mock::transact_as(
+        let rev_bal = mock::transact_as(
             founder,
-            product_ledger,
-            CallEncoder::<64>::new(const { selector("unitsAvailableOf(bytes32)") })
-                .push_bytes32(&sku_radio)
+            bank_ledger,
+            CallEncoder::<64>::new(const { selector("balOf(address)") })
+                .push_address(&rev_account)
                 .as_slice(),
         )
         .unwrap();
-        assert_eq!(
-            u64::from_be_bytes(rem_radio_after[24..32].try_into().unwrap()),
-            8
-        );
+        assert_eq!(u64::from_be_bytes(rev_bal[24..32].try_into().unwrap()), 19_500);
 
         let tot_rev = mock::transact_as(
             founder,
@@ -906,9 +1020,6 @@ mod tests {
             CallEncoder::<16>::new(const { selector("totalRevenue()") }).as_slice(),
         )
         .unwrap();
-        assert_eq!(
-            u64::from_be_bytes(tot_rev[24..32].try_into().unwrap()),
-            19_500
-        );
+        assert_eq!(u64::from_be_bytes(tot_rev[24..32].try_into().unwrap()), 19_500);
     }
 }

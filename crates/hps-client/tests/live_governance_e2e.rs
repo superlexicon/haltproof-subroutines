@@ -283,7 +283,7 @@ async fn full_institutional_governance_ledger_and_otc_on_localtestnet() {
     let registry_wasm =
         std::fs::read(dist.join("identity_registry.wasm")).expect("dist/identity_registry.wasm");
     let constitution_wasm =
-        std::fs::read(dist.join("constitution.wasm")).expect("dist/constitution.wasm");
+        std::fs::read(dist.join("corporate_charter.wasm")).expect("dist/corporate_charter.wasm");
     let auth_wasm =
         std::fs::read(dist.join("authorization.wasm")).expect("dist/authorization.wasm");
     let ledger_wasm =
@@ -596,14 +596,14 @@ async fn full_institutional_governance_ledger_and_otc_on_localtestnet() {
     assert_eq!(read_u64(&client, constitution_hps, "state()", &[]).await, 1);
     assert_eq!(read_u64(&client, constitution_hps, "isActive()", &[]).await, 0);
 
-    let act_con_hash = read_b32(&client, constitution_hps, "hashActivateConstitution()", &[]).await;
+    let act_con_hash = read_b32(&client, constitution_hps, "hashActivateCharter()", &[]).await;
     assert!(
         client
             .send_call(
                 &super1_eoa,
                 super1_id,
                 &encode_values(
-                    "initConstitutionAuth(address,address,address,address,bytes32,bytes32)",
+                    "initCharterAuth(address,address,address,address,bytes32,bytes32)",
                     &[
                         AbiValue::Address(auth_activate_const),
                         AbiValue::Address(registry_hps),
@@ -617,7 +617,7 @@ async fn full_institutional_governance_ledger_and_otc_on_localtestnet() {
             .await
             .unwrap()
             .status,
-        "initConstitutionAuth for activateConstitution failed"
+        "initCharterAuth for activateCharter failed"
     );
     assert!(
         client
@@ -629,7 +629,7 @@ async fn full_institutional_governance_ledger_and_otc_on_localtestnet() {
             .await
             .unwrap()
             .status,
-        "super1 approveAuth for activateConstitution failed"
+        "super1 approveAuth for activateCharter failed"
     );
     assert!(
         client
@@ -644,7 +644,7 @@ async fn full_institutional_governance_ledger_and_otc_on_localtestnet() {
             .await
             .unwrap()
             .status,
-        "super2 approveAndFinalizeAuth for activateConstitution failed"
+        "super2 approveAndFinalizeAuth for activateCharter failed"
     );
     assert!(
         client
@@ -652,7 +652,7 @@ async fn full_institutional_governance_ledger_and_otc_on_localtestnet() {
                 &super1_eoa,
                 super1_id,
                 &encode_values(
-                    "activateConstitution(address,address)",
+                    "activateCharter(address,address)",
                     &[
                         AbiValue::Address(constitution_hps),
                         AbiValue::Address(auth_activate_const),
@@ -662,11 +662,11 @@ async fn full_institutional_governance_ledger_and_otc_on_localtestnet() {
             .await
             .unwrap()
             .status,
-        "activateConstitution failed"
+        "activateCharter failed"
     );
     assert_eq!(read_u64(&client, constitution_hps, "state()", &[]).await, 2);
     assert_eq!(read_u64(&client, constitution_hps, "isActive()", &[]).await, 1);
-    println!("[4/10] Constitution initialized & ratified via First Shareholder Resolution with SUPER_GOVERNANCE, 2-stage weighted ACTION_ISSUE, and 2-stage ACTION_CANCEL");
+    println!("[4/10] CorporateCharter initialized & ratified via First Shareholder Resolution with SUPER_GOVERNANCE, 2-stage weighted ACTION_ISSUE, and 2-stage ACTION_CANCEL");
 
     // -------------------------------------------------------------------------
     // STEP 5: Instantiate & initialize GOLD and USD AssetLedgers with genesis balances & permissions
@@ -1387,7 +1387,7 @@ async fn simplex_hps_gas_usage_profile_on_localtestnet() {
     let dist = workspace_root().join("dist");
     let identity_wasm = std::fs::read(dist.join("identity.wasm")).unwrap();
     let registry_wasm = std::fs::read(dist.join("identity_registry.wasm")).unwrap();
-    let constitution_wasm = std::fs::read(dist.join("constitution.wasm")).unwrap();
+    let constitution_wasm = std::fs::read(dist.join("corporate_charter.wasm")).unwrap();
     let auth_wasm = std::fs::read(dist.join("authorization.wasm")).unwrap();
     let ledger_wasm = std::fs::read(dist.join("asset_ledger.wasm")).unwrap();
     let messaging_wasm = std::fs::read(dist.join("messaging.wasm")).unwrap();
@@ -1589,9 +1589,9 @@ async fn simplex_hps_gas_usage_profile_on_localtestnet() {
             AbiValue::Uint(U256::from(100u64)),
         ],
     );
-    let act_hash_profile = read_b32(&client, constitution, "hashActivateConstitution()", &[]).await;
+    let act_hash_profile = read_b32(&client, constitution, "hashActivateCharter()", &[]).await;
     let cd_auth_init = encode_values(
-        "initConstitutionAuth(address,address,address,address,bytes32,bytes32)",
+        "initCharterAuth(address,address,address,address,bytes32,bytes32)",
         &[
             AbiValue::Address(auth_hps),
             AbiValue::Address(registry),
@@ -1618,9 +1618,9 @@ async fn simplex_hps_gas_usage_profile_on_localtestnet() {
         .await
         .unwrap();
 
-    // Batch 5: Authorization `status()` + `approveAndFinalizeAuth` + Constitution `clearingAccount()`
+    // Batch 5: Authorization `status()` + `approveAndFinalizeAuth` + CorporateCharter `state()`
     let cd_auth_state = encode_values("status()", &[]);
-    let cd_con_clearing = encode_values("clearingAccount()", &[]);
+    let cd_con_state = encode_values("state()", &[]);
     let cd_auth_approve_fin = encode_values("approveAndFinalizeAuth(address)", &[AbiValue::Address(auth_hps)]);
     let b5 = client
         .send_call_batch(
@@ -1628,15 +1628,15 @@ async fn simplex_hps_gas_usage_profile_on_localtestnet() {
             &[
                 (auth_hps, cd_auth_state.clone(), vec![]),
                 (alice_id, cd_auth_approve_fin.clone(), vec![auth_hps, registry, constitution]),
-                (constitution, cd_con_clearing.clone(), vec![]),
+                (constitution, cd_con_state.clone(), vec![]),
             ],
         )
         .await
         .unwrap();
 
-    // Batch 6: Activate Constitution via First Shareholder Resolution (`activateConstitution`)
+    // Batch 6: Activate CorporateCharter via First Shareholder Resolution (`activateCharter`)
     let cd_con_activate = encode_values(
-        "activateConstitution(address,address)",
+        "activateCharter(address,address)",
         &[AbiValue::Address(constitution), AbiValue::Address(auth_hps)],
     );
     let b6 = client
@@ -1657,12 +1657,12 @@ async fn simplex_hps_gas_usage_profile_on_localtestnet() {
         ("IdentityRegistry", "isValidIdentity(address) [status + code_hash check]", &cd_reg_valid_id, &b3[2]),
         ("IdentityRegistry", "isValidAuthorizationHps(address) [code_hash check]", &cd_reg_valid_auth, &b3[3]),
         ("IdentityRegistry", "initialize(admin,idCode,authCode,1 id)", &cd_reg_init, &b2[3]),
-        ("Constitution", "clearingAccount() [view]", &cd_con_clearing, &b5[2]),
-        ("Constitution", "directorCount() [view]", &cd_con_dircount, &b4[0]),
-        ("Constitution", "hasPolicy(address,bytes32) [view]", &cd_con_haspol, &b4[1]),
-        ("Constitution", "hashAddDirector(address) [pure action_commit_256]", &cd_con_hash_add, &b4[2]),
-        ("Constitution", "initialize(registry, 1 policy) [via Identity]", &cd_con_init, &b3[4]),
-        ("Constitution", "activateConstitution(auth) [via Identity]", &cd_con_activate, &b6[0]),
+        ("CorporateCharter", "state() [view]", &cd_con_state, &b5[2]),
+        ("CorporateCharter", "directorCount() [view]", &cd_con_dircount, &b4[0]),
+        ("CorporateCharter", "hasPolicy(address,bytes32) [view]", &cd_con_haspol, &b4[1]),
+        ("CorporateCharter", "hashAddDirector(address) [pure action_commit_256]", &cd_con_hash_add, &b4[2]),
+        ("CorporateCharter", "initialize(registry, 1 policy) [via Identity]", &cd_con_init, &b3[4]),
+        ("CorporateCharter", "activateCharter(auth) [via Identity]", &cd_con_activate, &b6[0]),
         ("Authorization", "status() [view]", &cd_auth_state, &b5[0]),
         ("Authorization", "initConstitutionAuth(...) [via Identity]", &cd_auth_init, &b4[6]),
         ("Authorization", "approveAndFinalizeAuth(...) [1-stage via Identity]", &cd_auth_approve_fin, &b5[1]),
@@ -1707,11 +1707,12 @@ async fn product_ledger_and_accounting_ledger_e2e_on_localtestnet() {
     let dist = workspace_root().join("dist");
     let identity_wasm = std::fs::read(dist.join("identity.wasm")).unwrap();
     let registry_wasm = std::fs::read(dist.join("identity_registry.wasm")).unwrap();
-    let constitution_wasm = std::fs::read(dist.join("constitution.wasm")).unwrap();
+    let constitution_wasm = std::fs::read(dist.join("corporate_charter.wasm")).unwrap();
     let auth_wasm = std::fs::read(dist.join("authorization.wasm")).unwrap();
     let ledger_wasm = std::fs::read(dist.join("asset_ledger.wasm")).unwrap();
     let product_wasm = std::fs::read(dist.join("product_ledger.wasm")).unwrap();
     let accounting_wasm = std::fs::read(dist.join("accounting_ledger.wasm")).unwrap();
+    let share_capital_wasm = std::fs::read(dist.join("share_capital.wasm")).unwrap();
     let dex_wasm = std::fs::read(dist.join("dex_clob.wasm")).unwrap();
 
     let mut deployer = HpsSigner::from_hex(DEFAULT_DEV_PRIVATE_KEY, DEFAULT_CHAIN_ID).unwrap();
@@ -1724,6 +1725,7 @@ async fn product_ledger_and_accounting_ledger_e2e_on_localtestnet() {
     let led_code = client.store_bytecode(&deployer, &ledger_wasm).await.unwrap();
     let prod_code = client.store_bytecode(&deployer, &product_wasm).await.unwrap();
     let acc_code = client.store_bytecode(&deployer, &accounting_wasm).await.unwrap();
+    let sc_code = client.store_bytecode(&deployer, &share_capital_wasm).await.unwrap();
     let dex_code = client.store_bytecode(&deployer, &dex_wasm).await.unwrap();
 
     // Instantiate: 6 Identities, 1 IdentityRegistry, 1 Constitution, 1 Bank AssetLedger,
@@ -1935,11 +1937,13 @@ async fn product_ledger_and_accounting_ledger_e2e_on_localtestnet() {
         ],
     );
     let init_prod_inner = encode_values(
-        "initialize(address,address,address,bytes)",
+        "initializeWithBank(address,address,address,address,address,bytes)",
         &[
             AbiValue::Address(registry),
             AbiValue::Address(constitution),
             AbiValue::Address(accounting_ledger),
+            AbiValue::Address(bank_ledger),
+            AbiValue::Address(clearing_acct_id),
             AbiValue::Bytes(init_products),
         ],
     );
@@ -1978,42 +1982,54 @@ async fn product_ledger_and_accounting_ledger_e2e_on_localtestnet() {
                         "execute(address,bytes)",
                         &[AbiValue::Address(product_ledger), AbiValue::Bytes(init_prod_inner)],
                     ),
-                    vec![product_ledger, registry, constitution, accounting_ledger],
+                    vec![
+                        product_ledger,
+                        registry,
+                        constitution,
+                        accounting_ledger,
+                        bank_ledger,
+                        clearing_acct_id,
+                    ],
                 ),
             ],
         )
         .await
         .unwrap();
 
-    // Verify Constitution starts in PENDING_RATIFICATION (state == 1, isActive == 0)
-    // and calling setClearingAccount before passing the First Shareholder Resolution reverts!
+    // Verify CorporateCharter starts in PENDING_RATIFICATION (state == 1, isActive == 0)
+    // and calling buyProduct before passing the First Shareholder Resolution reverts!
     assert_eq!(read_u64(&client, constitution, "state()", &[]).await, 1);
     assert_eq!(read_u64(&client, constitution, "isActive()", &[]).await, 0);
-    let set_clearing_cd = encode_values(
-        "setClearingAccount(address,address,address,address)",
-        &[
-            AbiValue::Address(constitution),
-            AbiValue::Address(bank_ledger),
-            AbiValue::Address(clearing_acct_id),
-            AbiValue::Address(H160::zero()),
-        ],
-    );
     let pre_activate_rcpt = client
         .send_call_with_targets(
             &deployer,
-            mano_id,
-            &set_clearing_cd,
-            &[constitution, registry, bank_ledger, clearing_acct_id],
+            buyer1_id,
+            &encode_values(
+                "buyProduct(address,bytes32,uint64)",
+                &[
+                    AbiValue::Address(product_ledger),
+                    AbiValue::Bytes32(sku_radio),
+                    AbiValue::Uint(U256::from(1u64)),
+                ],
+            ),
+            &[
+                product_ledger,
+                constitution,
+                accounting_ledger,
+                bank_ledger,
+                registry,
+                clearing_acct_id,
+            ],
         )
         .await
         .unwrap();
     assert!(
         !pre_activate_rcpt.status,
-        "setClearingAccount before First Shareholder Resolution activation MUST revert"
+        "buyProduct before First Shareholder Resolution activation MUST revert"
     );
 
-    // Pass First Shareholder Resolution (`activateConstitution`) and then configure clearing account
-    let hash_activate_con = read_b32(&client, constitution, "hashActivateConstitution()", &[]).await;
+    // Pass First Shareholder Resolution (`activateCharter`) and authorize `ProductLedger` (`CAP_MERCHANT_PAYMENT`)
+    let hash_activate_con = read_b32(&client, constitution, "hashActivateCharter()", &[]).await;
     let act_rcpts = client
         .send_call_batch(
             &deployer,
@@ -2021,7 +2037,7 @@ async fn product_ledger_and_accounting_ledger_e2e_on_localtestnet() {
                 (
                     mano_id,
                     encode_values(
-                        "initConstitutionAuth(address,address,address,address,bytes32,bytes32)",
+                        "initCharterAuth(address,address,address,address,bytes32,bytes32)",
                         &[
                             AbiValue::Address(activate_con_auth),
                             AbiValue::Address(registry),
@@ -2049,7 +2065,7 @@ async fn product_ledger_and_accounting_ledger_e2e_on_localtestnet() {
                 (
                     mano_id,
                     encode_values(
-                        "activateConstitution(address,address)",
+                        "activateCharter(address,address)",
                         &[
                             AbiValue::Address(constitution),
                             AbiValue::Address(activate_con_auth),
@@ -2059,8 +2075,17 @@ async fn product_ledger_and_accounting_ledger_e2e_on_localtestnet() {
                 ),
                 (
                     mano_id,
-                    set_clearing_cd,
-                    vec![constitution, registry, bank_ledger, clearing_acct_id],
+                    encode_values(
+                        "authorizeModule(address,address,bytes32,bool,address)",
+                        &[
+                            AbiValue::Address(constitution),
+                            AbiValue::Address(product_ledger),
+                            AbiValue::Bytes32(hps_sdk::governance::CAP_MERCHANT_PAYMENT),
+                            AbiValue::Bool(true),
+                            AbiValue::Address(H160::zero()),
+                        ],
+                    ),
+                    vec![constitution, registry, product_ledger],
                 ),
             ],
         )
@@ -2475,6 +2500,7 @@ async fn product_ledger_and_accounting_ledger_e2e_on_localtestnet() {
                 (led_code, Vec::new()),
                 (led_code, Vec::new()),
                 (auth_code, Vec::new()),
+                (sc_code, Vec::new()),
             ],
         )
         .await
@@ -2483,6 +2509,7 @@ async fn product_ledger_and_accounting_ledger_e2e_on_localtestnet() {
     let pref_a_ledger = fut_insts[1];
     let futures_ledger = fut_insts[2];
     let futures_auth = fut_insts[3];
+    let share_capital = fut_insts[4];
 
     let mut common_allocs = Vec::new();
     common_allocs.extend_from_slice(mano_id.as_bytes());
@@ -2601,6 +2628,39 @@ async fn product_ledger_and_accounting_ledger_e2e_on_localtestnet() {
                     ),
                     vec![constitution, registry, pref_a_ledger],
                 ),
+                (
+                    mano_id,
+                    encode_values(
+                        "execute(address,bytes)",
+                        &[
+                            AbiValue::Address(share_capital),
+                            AbiValue::Bytes(encode_values(
+                                "initialize(address,address,address,address)",
+                                &[
+                                    AbiValue::Address(registry),
+                                    AbiValue::Address(constitution),
+                                    AbiValue::Address(H160::zero()),
+                                    AbiValue::Address(H160::zero()),
+                                ],
+                            )),
+                        ],
+                    ),
+                    vec![share_capital, registry, constitution],
+                ),
+                (
+                    mano_id,
+                    encode_values(
+                        "authorizeModule(address,address,bytes32,bool,address)",
+                        &[
+                            AbiValue::Address(constitution),
+                            AbiValue::Address(share_capital),
+                            AbiValue::Bytes32(hps_sdk::governance::CAP_EQUITY_SETTLEMENT),
+                            AbiValue::Bool(true),
+                            AbiValue::Address(H160::zero()),
+                        ],
+                    ),
+                    vec![constitution, registry, share_capital],
+                ),
             ],
         )
         .await
@@ -2611,7 +2671,7 @@ async fn product_ledger_and_accounting_ledger_e2e_on_localtestnet() {
 
     let hash_auth_fut = read_b32(
         &client,
-        constitution,
+        share_capital,
         "hashAuthorizeFuturesUnderwriting(address,uint64)",
         &[
             AbiValue::Address(futures_ledger),
@@ -2627,12 +2687,12 @@ async fn product_ledger_and_accounting_ledger_e2e_on_localtestnet() {
                 (
                     mano_id,
                     encode_values(
-                        "initConstitutionAuth(address,address,address,address,bytes32,bytes32)",
+                        "initCharterAuth(address,address,address,address,bytes32,bytes32)",
                         &[
                             AbiValue::Address(futures_auth),
                             AbiValue::Address(registry),
                             AbiValue::Address(constitution),
-                            AbiValue::Address(constitution),
+                            AbiValue::Address(share_capital),
                             AbiValue::Bytes32(POLICY_SUPER_GOVERNANCE),
                             AbiValue::Bytes32(hash_auth_fut),
                         ],
@@ -2641,6 +2701,7 @@ async fn product_ledger_and_accounting_ledger_e2e_on_localtestnet() {
                         futures_auth,
                         registry,
                         constitution,
+                        share_capital,
                         mano_id,
                         evelyn_id,
                         common_ledger,
@@ -2677,13 +2738,14 @@ async fn product_ledger_and_accounting_ledger_e2e_on_localtestnet() {
                     encode_values(
                         "authorizeFuturesUnderwriting(address,address,uint64,address)",
                         &[
-                            AbiValue::Address(constitution),
+                            AbiValue::Address(share_capital),
                             AbiValue::Address(futures_ledger),
                             AbiValue::Uint(U256::from(10u64)),
                             AbiValue::Address(futures_auth),
                         ],
                     ),
                     vec![
+                        share_capital,
                         constitution,
                         registry,
                         futures_ledger,
@@ -2701,7 +2763,7 @@ async fn product_ledger_and_accounting_ledger_e2e_on_localtestnet() {
     }
 
     // `buyer1_id` (100,000 Preferred Shares A @ 50% conversion = 50,000 common-equivalent)
-    // underwrites 5,000 units of the single-class futures contract (`10% * 50,000 = 5,000`)
+    // underwrites 5,000 units of the single-class futures contract (`10% * 50,000 = 5,000`) via `ShareCapital`
     let uw_rcpt = client
         .send_call_with_targets(
             &deployer,
@@ -2709,11 +2771,12 @@ async fn product_ledger_and_accounting_ledger_e2e_on_localtestnet() {
             &encode_values(
                 "underwriteFutures(address,uint64)",
                 &[
-                    AbiValue::Address(constitution),
+                    AbiValue::Address(share_capital),
                     AbiValue::Uint(U256::from(5_000u64)),
                 ],
             ),
             &[
+                share_capital,
                 constitution,
                 registry,
                 common_ledger,
@@ -2744,11 +2807,12 @@ async fn product_ledger_and_accounting_ledger_e2e_on_localtestnet() {
             &encode_values(
                 "underwriteFutures(address,uint64)",
                 &[
-                    AbiValue::Address(constitution),
+                    AbiValue::Address(share_capital),
                     AbiValue::Uint(U256::from(1u64)),
                 ],
             ),
             &[
+                share_capital,
                 constitution,
                 registry,
                 common_ledger,
@@ -3106,7 +3170,7 @@ async fn initialize_with_governance_roles_function_auth_and_ratification_e2e_on_
     let dist = workspace_root().join("dist");
     let identity_wasm = std::fs::read(dist.join("identity.wasm")).unwrap();
     let registry_wasm = std::fs::read(dist.join("identity_registry.wasm")).unwrap();
-    let constitution_wasm = std::fs::read(dist.join("constitution.wasm")).unwrap();
+    let constitution_wasm = std::fs::read(dist.join("corporate_charter.wasm")).unwrap();
     let auth_wasm = std::fs::read(dist.join("authorization.wasm")).unwrap();
     let ledger_wasm = std::fs::read(dist.join("asset_ledger.wasm")).unwrap();
     let product_wasm = std::fs::read(dist.join("product_ledger.wasm")).unwrap();
@@ -3309,39 +3373,28 @@ async fn initialize_with_governance_roles_function_auth_and_ratification_e2e_on_
         policies_blob.extend_from_slice(&encode_constitution_entry(H160::zero(), pid, spec));
     }
 
-    let sel_activate = function_selector("activateConstitution(address)");
-    let sel_set_fn_auth = function_selector("setFunctionAuth(bytes4,bytes32,address)");
+    let sel_activate = function_selector("activateCharter(address)");
+    let sel_set_fn_auth = function_selector("setFunctionAuth(address,bytes4,bytes32,address)");
     let sel_define_role = function_selector("defineRole(bytes32,address)");
     let sel_grant_role = function_selector("grantRole(bytes32,address,address)");
-    let sel_upsert_prod =
-        function_selector("upsertProduct(address,bytes32,uint64,uint64,bytes,address)");
-    let sel_set_price = function_selector("setProductPrice(address,bytes32,uint64,address)");
+    let sel_upsert_prod = function_selector("upsertProduct(bytes32,uint64,uint64,bytes,address)");
+    let sel_set_price = function_selector("setProductPrice(bytes32,uint64,address)");
 
     let fn_rules = [
-        FunctionAuthRule {
-            fn_selector: sel_activate,
-            policy_id: POLICY_FIRST_SHAREHOLDER_RESOLUTION,
-        },
-        FunctionAuthRule {
-            fn_selector: sel_set_fn_auth,
-            policy_id: POLICY_SUPER_GOVERNANCE,
-        },
-        FunctionAuthRule {
-            fn_selector: sel_define_role,
-            policy_id: POLICY_BOARD_RESOLUTION,
-        },
-        FunctionAuthRule {
-            fn_selector: sel_grant_role,
-            policy_id: POLICY_BOARD_RESOLUTION,
-        },
-        FunctionAuthRule {
-            fn_selector: sel_upsert_prod,
-            policy_id: POLICY_PRODUCT_MANAGEMENT,
-        },
-        FunctionAuthRule {
-            fn_selector: sel_set_price,
-            policy_id: POLICY_PRODUCT_MANAGEMENT,
-        },
+        FunctionAuthRule::for_charter(sel_activate, POLICY_FIRST_SHAREHOLDER_RESOLUTION),
+        FunctionAuthRule::for_charter(sel_set_fn_auth, POLICY_SUPER_GOVERNANCE),
+        FunctionAuthRule::for_charter(sel_define_role, POLICY_BOARD_RESOLUTION),
+        FunctionAuthRule::for_charter(sel_grant_role, POLICY_BOARD_RESOLUTION),
+        FunctionAuthRule::for_target(
+            h160_bytes(product_ledger),
+            sel_upsert_prod,
+            POLICY_PRODUCT_MANAGEMENT,
+        ),
+        FunctionAuthRule::for_target(
+            h160_bytes(product_ledger),
+            sel_set_price,
+            POLICY_PRODUCT_MANAGEMENT,
+        ),
     ];
     let mut fn_auths_blob = Vec::new();
     fn_auths_blob.extend_from_slice(&(fn_rules.len() as u16).to_be_bytes());
@@ -3492,8 +3545,11 @@ async fn initialize_with_governance_roles_function_auth_and_ratification_e2e_on_
         read_b32(
             &client,
             constitution,
-            "getFunctionAuth(bytes4)",
-            &[AbiValue::Bytes4(sel_set_price)]
+            "getFunctionAuth(address,bytes4)",
+            &[
+                AbiValue::Address(product_ledger),
+                AbiValue::Bytes4(sel_set_price),
+            ]
         )
         .await,
         POLICY_PRODUCT_MANAGEMENT
@@ -3515,7 +3571,7 @@ async fn initialize_with_governance_roles_function_auth_and_ratification_e2e_on_
             &deployer,
             dir_1,
             &encode_values(
-                "initConstitutionAuth(address,address,address,address,bytes32,bytes32)",
+                "initCharterAuth(address,address,address,address,bytes32,bytes32)",
                 &[
                     AbiValue::Address(auth_pre_act_board),
                     AbiValue::Address(registry),
@@ -3531,18 +3587,18 @@ async fn initialize_with_governance_roles_function_auth_and_ratification_e2e_on_
         .unwrap();
     assert!(
         !pre_act_board_rcpt.status,
-        "Non-ratification Authorization MUST revert while Constitution is PENDING_RATIFICATION"
+        "Non-ratification Authorization MUST revert while CorporateCharter is PENDING_RATIFICATION"
     );
 
-    // 4. Pass the First Shareholder Resolution (`activateConstitution`) via dynamic `ROLE_SHAREHOLDER` voting power!
-    let hash_activate = read_b32(&client, constitution, "hashActivateConstitution()", &[]).await;
+    // 4. Pass the First Shareholder Resolution (`activateCharter`) via dynamic `ROLE_SHAREHOLDER` voting power!
+    let hash_activate = read_b32(&client, constitution, "hashActivateCharter()", &[]).await;
     assert!(
         client
             .send_call_with_targets(
                 &deployer,
                 sh_a,
                 &encode_values(
-                    "initConstitutionAuth(address,address,address,address,bytes32,bytes32)",
+                    "initCharterAuth(address,address,address,address,bytes32,bytes32)",
                     &[
                         AbiValue::Address(auth_activate),
                         AbiValue::Address(registry),
@@ -3595,7 +3651,7 @@ async fn initialize_with_governance_roles_function_auth_and_ratification_e2e_on_
             .status,
         "Finalizing First Shareholder Resolution below 75% threshold MUST revert"
     );
-    // `sh_b` casts remaining 40,000 / 100,000 = 4,000 bps (total = 10,000 bps >= 7,500 bps) & finalizes!
+    // `sh_b` casts remaining 40,000 / 100,000 votes & finalizes!
     assert!(
         client
             .send_call_with_targets(
@@ -3611,14 +3667,14 @@ async fn initialize_with_governance_roles_function_auth_and_ratification_e2e_on_
             .unwrap()
             .status
     );
-    // Activate the Constitution!
+    // Activate the CorporateCharter!
     assert!(
         client
             .send_call_with_targets(
                 &deployer,
                 sh_a,
                 &encode_values(
-                    "activateConstitution(address,address)",
+                    "activateCharter(address,address)",
                     &[
                         AbiValue::Address(constitution),
                         AbiValue::Address(auth_activate),
@@ -3629,7 +3685,7 @@ async fn initialize_with_governance_roles_function_auth_and_ratification_e2e_on_
             .await
             .unwrap()
             .status,
-        "activateConstitution must succeed once First Shareholder Resolution is finalized"
+        "activateCharter must succeed once First Shareholder Resolution is finalized"
     );
     assert_eq!(
         read_u64(&client, constitution, "state()", &[]).await,
@@ -3646,7 +3702,7 @@ async fn initialize_with_governance_roles_function_auth_and_ratification_e2e_on_
                 &deployer,
                 sh_a,
                 &encode_values(
-                    "activateConstitution(address,address)",
+                    "activateCharter(address,address)",
                     &[
                         AbiValue::Address(constitution),
                         AbiValue::Address(auth_activate_dup),
@@ -3657,7 +3713,7 @@ async fn initialize_with_governance_roles_function_auth_and_ratification_e2e_on_
             .await
             .unwrap()
             .status,
-        "Duplicate activateConstitution MUST revert"
+        "Duplicate activateCharter MUST revert"
     );
 
     // 5. Before any identity is assigned ROLE_PRODUCT_MANAGER, nobody (not even a Director) can
@@ -3666,10 +3722,9 @@ async fn initialize_with_governance_roles_function_auth_and_ratification_e2e_on_
     let label_quantum = b"SLX-QKD-MODEM".to_vec();
     let hash_upsert_qkd = read_b32(
         &client,
-        constitution,
-        "hashConUpsertProduct(address,bytes32,uint64,uint64,bytes)",
+        product_ledger,
+        "hashUpsertProduct(bytes32,uint64,uint64,bytes)",
         &[
-            AbiValue::Address(product_ledger),
             AbiValue::Bytes32(sku_quantum),
             AbiValue::Uint(U256::from(20u64)),
             AbiValue::Uint(U256::from(4_000u64)),
@@ -3683,17 +3738,17 @@ async fn initialize_with_governance_roles_function_auth_and_ratification_e2e_on_
                 &deployer,
                 dir_1,
                 &encode_values(
-                    "initConstitutionAuth(address,address,address,address,bytes32,bytes32)",
+                    "initCharterAuth(address,address,address,address,bytes32,bytes32)",
                     &[
                         AbiValue::Address(auth_unassigned_pm),
                         AbiValue::Address(registry),
                         AbiValue::Address(constitution),
-                        AbiValue::Address(constitution),
+                        AbiValue::Address(product_ledger),
                         AbiValue::Bytes32(POLICY_PRODUCT_MANAGEMENT),
                         AbiValue::Bytes32(hash_upsert_qkd),
                     ],
                 ),
-                &[auth_unassigned_pm, registry, constitution],
+                &[auth_unassigned_pm, registry, constitution, product_ledger],
             )
             .await
             .unwrap()
@@ -3739,7 +3794,7 @@ async fn initialize_with_governance_roles_function_auth_and_ratification_e2e_on_
                     (
                         dir_1,
                         encode_values(
-                            "initConstitutionAuth(address,address,address,address,bytes32,bytes32)",
+                            "initCharterAuth(address,address,address,address,bytes32,bytes32)",
                             &[
                                 AbiValue::Address(auth_obj),
                                 AbiValue::Address(registry),
@@ -3786,7 +3841,7 @@ async fn initialize_with_governance_roles_function_auth_and_ratification_e2e_on_
         }
     }
 
-    // `pm_candidate` now approves & finalizes `auth_upsert_pm` (`POLICY_PRODUCT_MANAGEMENT`) and lists the SKU via `Constitution.upsertProduct`!
+    // `pm_candidate` now approves & finalizes `auth_upsert_pm` (`POLICY_PRODUCT_MANAGEMENT`) and lists the SKU directly on `ProductLedger`!
     let upsert_rcpts = client
         .send_call_batch(
             &deployer,
@@ -3794,17 +3849,17 @@ async fn initialize_with_governance_roles_function_auth_and_ratification_e2e_on_
                 (
                     pm_candidate,
                     encode_values(
-                        "initConstitutionAuth(address,address,address,address,bytes32,bytes32)",
+                        "initCharterAuth(address,address,address,address,bytes32,bytes32)",
                         &[
                             AbiValue::Address(auth_upsert_pm),
                             AbiValue::Address(registry),
                             AbiValue::Address(constitution),
-                            AbiValue::Address(constitution),
+                            AbiValue::Address(product_ledger),
                             AbiValue::Bytes32(POLICY_PRODUCT_MANAGEMENT),
                             AbiValue::Bytes32(hash_upsert_qkd),
                         ],
                     ),
-                    vec![auth_upsert_pm, registry, constitution],
+                    vec![auth_upsert_pm, registry, constitution, product_ledger],
                 ),
                 (
                     pm_candidate,
@@ -3817,46 +3872,35 @@ async fn initialize_with_governance_roles_function_auth_and_ratification_e2e_on_
                 (
                     pm_candidate,
                     encode_values(
-                        "execute(address,bytes)",
+                        "upsertProduct(address,bytes32,uint64,uint64,bytes,address)",
                         &[
-                            AbiValue::Address(constitution),
-                            AbiValue::Bytes(encode_values(
-                                "upsertProduct(address,bytes32,uint64,uint64,bytes,address)",
-                                &[
-                                    AbiValue::Address(product_ledger),
-                                    AbiValue::Bytes32(sku_quantum),
-                                    AbiValue::Uint(U256::from(20u64)),
-                                    AbiValue::Uint(U256::from(4_000u64)),
-                                    AbiValue::Bytes(label_quantum),
-                                    AbiValue::Address(auth_upsert_pm),
-                                ],
-                            )),
+                            AbiValue::Address(product_ledger),
+                            AbiValue::Bytes32(sku_quantum),
+                            AbiValue::Uint(U256::from(20u64)),
+                            AbiValue::Uint(U256::from(4_000u64)),
+                            AbiValue::Bytes(label_quantum),
+                            AbiValue::Address(auth_upsert_pm),
                         ],
                     ),
-                    vec![
-                        constitution,
-                        registry,
-                        auth_upsert_pm,
-                        product_ledger,
-                        accounting_ledger,
-                    ],
+                    vec![constitution, registry, auth_upsert_pm, product_ledger],
                 ),
             ],
         )
         .await
         .unwrap();
     for r in &upsert_rcpts {
-        assert!(r.status, "Constitution.upsertProduct via POLICY_PRODUCT_MANAGEMENT failed");
+        assert!(r.status, "ProductLedger.upsertProduct via POLICY_PRODUCT_MANAGEMENT failed");
     }
     assert_eq!(read_u64(&client, product_ledger, "productCount()", &[]).await, 1);
 
-    // 7. Dynamically rotate `setProductPrice`'s required authorization process via `setFunctionAuth`
-    //    (which itself consumes a `POLICY_SUPER_GOVERNANCE` Shareholder authorization!)
+    // 7. Dynamically rotate `(product_ledger, setProductPrice)`'s required authorization process via
+    //    `CorporateCharter.setFunctionAuth` (consuming a `POLICY_SUPER_GOVERNANCE` Shareholder authorization!)
     let hash_set_fn = read_b32(
         &client,
         constitution,
-        "hashSetFunctionAuth(bytes4,bytes32)",
+        "hashSetFunctionAuth(address,bytes4,bytes32)",
         &[
+            AbiValue::Address(product_ledger),
             AbiValue::Bytes4(sel_set_price),
             AbiValue::Bytes32(pol_dual_pm_cfo),
         ],
@@ -3869,7 +3913,7 @@ async fn initialize_with_governance_roles_function_auth_and_ratification_e2e_on_
                 (
                     sh_a,
                     encode_values(
-                        "initConstitutionAuth(address,address,address,address,bytes32,bytes32)",
+                        "initCharterAuth(address,address,address,address,bytes32,bytes32)",
                         &[
                             AbiValue::Address(auth_rotate_fn),
                             AbiValue::Address(registry),
@@ -3897,9 +3941,10 @@ async fn initialize_with_governance_roles_function_auth_and_ratification_e2e_on_
                 (
                     sh_a,
                     encode_values(
-                        "setFunctionAuth(address,bytes4,bytes32,address)",
+                        "setFunctionAuth(address,address,bytes4,bytes32,address)",
                         &[
                             AbiValue::Address(constitution),
+                            AbiValue::Address(product_ledger),
                             AbiValue::Bytes4(sel_set_price),
                             AbiValue::Bytes32(pol_dual_pm_cfo),
                             AbiValue::Address(auth_rotate_fn),
@@ -3918,21 +3963,47 @@ async fn initialize_with_governance_roles_function_auth_and_ratification_e2e_on_
         read_b32(
             &client,
             constitution,
-            "getFunctionAuth(bytes4)",
-            &[AbiValue::Bytes4(sel_set_price)]
+            "getFunctionAuth(address,bytes4)",
+            &[
+                AbiValue::Address(product_ledger),
+                AbiValue::Bytes4(sel_set_price),
+            ]
         )
         .await,
         pol_dual_pm_cfo
     );
 
+    // Negative check: attempting direct role-only `setProductPrice` with `authObj == 0x0` MUST now
+    // revert because `(product_ledger, setProductPrice)` requires the 2-stage `pol_dual_pm_cfo` policy!
+    assert!(
+        !client
+            .send_call_with_targets(
+                &deployer,
+                pm_candidate,
+                &encode_values(
+                    "setProductPrice(address,bytes32,uint64,address)",
+                    &[
+                        AbiValue::Address(product_ledger),
+                        AbiValue::Bytes32(sku_quantum),
+                        AbiValue::Uint(U256::from(4_500u64)),
+                        AbiValue::Address(H160::zero()),
+                    ],
+                ),
+                &[product_ledger, constitution, registry],
+            )
+            .await
+            .unwrap()
+            .status,
+        "Bypassing rotated 2-stage setProductPrice policy with authObj == 0x0 MUST revert"
+    );
+
     // 8. Execute the 2-stage sequential role-backed `pol_dual_pm_cfo` (`pm_candidate` -> `cfo_candidate`)
-    //    and update the SKU price via `Constitution.setProductPrice`!
+    //    and update the SKU price directly on `ProductLedger.setProductPrice`!
     let hash_price_update = read_b32(
         &client,
-        constitution,
-        "hashConSetProductPrice(address,bytes32,uint64)",
+        product_ledger,
+        "hashSetProductPrice(bytes32,uint64)",
         &[
-            AbiValue::Address(product_ledger),
             AbiValue::Bytes32(sku_quantum),
             AbiValue::Uint(U256::from(4_500u64)),
         ],
@@ -3945,17 +4016,17 @@ async fn initialize_with_governance_roles_function_auth_and_ratification_e2e_on_
                 (
                     pm_candidate,
                     encode_values(
-                        "initConstitutionAuth(address,address,address,address,bytes32,bytes32)",
+                        "initCharterAuth(address,address,address,address,bytes32,bytes32)",
                         &[
                             AbiValue::Address(auth_dual_price),
                             AbiValue::Address(registry),
                             AbiValue::Address(constitution),
-                            AbiValue::Address(constitution),
+                            AbiValue::Address(product_ledger),
                             AbiValue::Bytes32(pol_dual_pm_cfo),
                             AbiValue::Bytes32(hash_price_update),
                         ],
                     ),
-                    vec![auth_dual_price, registry, constitution],
+                    vec![auth_dual_price, registry, constitution, product_ledger],
                 ),
                 // Stage 0: ROLE_PRODUCT_MANAGER (`pm_candidate`)
                 (
@@ -3975,34 +4046,22 @@ async fn initialize_with_governance_roles_function_auth_and_ratification_e2e_on_
                 (
                     pm_candidate,
                     encode_values(
-                        "execute(address,bytes)",
+                        "setProductPrice(address,bytes32,uint64,address)",
                         &[
-                            AbiValue::Address(constitution),
-                            AbiValue::Bytes(encode_values(
-                                "setProductPrice(address,bytes32,uint64,address)",
-                                &[
-                                    AbiValue::Address(product_ledger),
-                                    AbiValue::Bytes32(sku_quantum),
-                                    AbiValue::Uint(U256::from(4_500u64)),
-                                    AbiValue::Address(auth_dual_price),
-                                ],
-                            )),
+                            AbiValue::Address(product_ledger),
+                            AbiValue::Bytes32(sku_quantum),
+                            AbiValue::Uint(U256::from(4_500u64)),
+                            AbiValue::Address(auth_dual_price),
                         ],
                     ),
-                    vec![
-                        constitution,
-                        registry,
-                        auth_dual_price,
-                        product_ledger,
-                        accounting_ledger,
-                    ],
+                    vec![constitution, registry, auth_dual_price, product_ledger],
                 ),
             ],
         )
         .await
         .unwrap();
     for r in &dual_price_rcpts {
-        assert!(r.status, "2-stage PM + CFO setProductPrice failed");
+        assert!(r.status, "2-stage PM + CFO ProductLedger.setProductPrice failed");
     }
 
     assert_eq!(

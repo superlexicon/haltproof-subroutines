@@ -18,8 +18,9 @@
 
 use hps_sdk::abi::CalldataReader;
 use hps_sdk::governance::{
-    require_valid_identity, verify_and_consume_auth, ActionHasher, ERR_CONSTITUTION_MISMATCH,
-    ERR_INVALID_PRODUCT_PARAMS, ERR_UNAUTHORIZED_SALES_RECORDER, POLICY_BOARD_RESOLUTION,
+    require_active_charter, require_valid_identity, verify_and_consume_auth, ActionHasher,
+    ERR_CONSTITUTION_MISMATCH, ERR_INVALID_PRODUCT_PARAMS, ERR_UNAUTHORIZED_SALES_RECORDER,
+    POLICY_BOARD_RESOLUTION,
 };
 use hps_sdk::keccak::keccak256;
 use hps_sdk::storage::KeyBuilder;
@@ -58,6 +59,7 @@ hps_entry! {
     "getSale(uint64)"                                                   => handle_get_sale,
     "productSalesOf(bytes32)"                                           => handle_product_sales_of,
     "buyerPurchasesOf(address)"                                         => handle_buyer_purchases_of,
+    "associatedCharter()"                                               => handle_associated_constitution,
     "associatedConstitution()"                                          => handle_associated_constitution,
     "identityRegistry()"                                                => handle_identity_registry,
     "hashAuthorizeProductLedger(address)"                               => handle_hash_authorize_product_ledger,
@@ -164,6 +166,7 @@ fn handle_authorize_product_ledger(args: &CalldataReader) -> Result<(), i32> {
     }
     let registry = storage::get_address(KEY_REGISTRY).ok_or(-10)?;
     let constitution = storage::get_address(KEY_CONSTITUTION).ok_or(-10)?;
+    require_active_charter(&constitution)?;
     let product_ledger = args.address(0).ok_or(-3)?;
     let board_auth = args.address(1).ok_or(-3)?;
     if product_ledger == [0u8; 20] {

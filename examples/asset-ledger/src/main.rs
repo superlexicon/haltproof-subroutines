@@ -23,11 +23,12 @@
 use hps_sdk::abi::CalldataReader;
 use hps_sdk::call::{self, CallEncoder};
 use hps_sdk::governance::{
-    oracle_policy_id, require_valid_identity, verify_and_consume_auction_auth,
-    verify_and_consume_auth, ActionHasher, AuctionOrder, ACTION_APPROVE, ACTION_CANCEL,
-    ACTION_ISSUE, ACTION_SET_ATTACHED_DEX, ACTION_SUPER, ACTION_TRANSFER,
-    ERR_CONSTITUTION_MISMATCH, ERR_DEX_NOT_ATTACHED, ERR_NO_CROSSING_ORDERS, MAX_AUCTION_ORDERS,
-    POLICY_HOLDER_SELF, POLICY_SHARE_TRANSFER_AUCTION,
+    is_authorized_charter_module, oracle_policy_id, require_valid_identity,
+    verify_and_consume_auction_auth, verify_and_consume_auth, ActionHasher, AuctionOrder,
+    ACTION_APPROVE, ACTION_CANCEL, ACTION_ISSUE, ACTION_SET_ATTACHED_DEX, ACTION_SUPER,
+    ACTION_TRANSFER, CAP_EQUITY_SETTLEMENT, CAP_MERCHANT_PAYMENT, ERR_CONSTITUTION_MISMATCH,
+    ERR_DEX_NOT_ATTACHED, ERR_NO_CROSSING_ORDERS, MAX_AUCTION_ORDERS, POLICY_HOLDER_SELF,
+    POLICY_SHARE_TRANSFER_AUCTION,
 };
 use hps_sdk::storage::KeyBuilder;
 use hps_sdk::{context, event_topic, events, hps_entry, ret, selector, storage};
@@ -69,6 +70,9 @@ hps_entry! {
     "cancel(address,uint64,address)"                        => handle_cancel,
     "transfer(address,address,uint64,address)"              => handle_transfer,
     "transferDirect(address,uint64)"                        => handle_transfer_direct,
+    "charterModuleClearTransfer(address,address,uint64)"    => handle_constitution_clear_transfer,
+    "charterModuleIssue(address,uint64)"                    => handle_constitution_issue,
+    "charterModuleCancel(address,uint64)"                   => handle_constitution_cancel,
     "constitutionClearTransfer(address,address,uint64)"     => handle_constitution_clear_transfer,
     "constitutionIssue(address,uint64)"                     => handle_constitution_issue,
     "constitutionCancel(address,uint64)"                    => handle_constitution_cancel,
@@ -86,6 +90,7 @@ hps_entry! {
     "decimals()"                                            => handle_decimals,
     "symbol()"                                              => handle_symbol,
     "identityRegistry()"                                    => handle_identity_registry,
+    "associatedCharter()"                                   => handle_associated_constitution,
     "associatedConstitution()"                              => handle_associated_constitution,
     "attachedDex()"                                         => handle_attached_dex,
     "getPermission(bytes32)"                                => handle_get_permission,
@@ -281,7 +286,10 @@ fn ensure_initialized_and_valid_caller() -> Result<([u8; 20], [u8; 20]), i32> {
     let registry = storage::get_address(KEY_REGISTRY).ok_or(-10)?;
     let caller = context::msg_sender();
     let pinned_con = storage::get_address(KEY_CONSTITUTION).unwrap_or([0u8; 20]);
-    if !(pinned_con != [0u8; 20] && caller == pinned_con) {
+    let is_trusted_module = pinned_con != [0u8; 20]
+        && (caller == pinned_con
+            || is_authorized_charter_module(&pinned_con, &caller, &CAP_EQUITY_SETTLEMENT));
+    if !is_trusted_module {
         require_valid_identity(&registry, &caller)?;
     }
     Ok((registry, caller))
@@ -604,15 +612,20 @@ fn handle_transfer_direct(args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
-/// Clearing & escrow transfer invoked exclusively by this ledger's single `associatedConstitution()`
-/// to move bank-account sub-account balances between buyers, sellers, and the Constitution's
-/// special clearing account during a 3-step share transfer auction.
+/// Clearing & escrow transfer invoked exclusively by this ledger's pinned `CorporateCharter` or
+/// a sibling module authorized by that Charter (`CAP_EQUITY_SETTLEMENT` for `ShareCapital`,
+/// `CAP_MERCHANT_PAYMENT` for `ProductLedger`).
 fn handle_constitution_clear_transfer(args: &CalldataReader) -> Result<(), i32> {
     if storage::get_u64(KEY_INIT) != 1 {
         return Err(-10);
     }
     let pinned_con = storage::get_address(KEY_CONSTITUTION).unwrap_or([0u8; 20]);
-    if pinned_con == [0u8; 20] || context::msg_sender() != pinned_con {
+    let sender = context::msg_sender();
+    let authorized = pinned_con != [0u8; 20]
+        && (sender == pinned_con
+            || is_authorized_charter_module(&pinned_con, &sender, &CAP_EQUITY_SETTLEMENT)
+            || is_authorized_charter_module(&pinned_con, &sender, &CAP_MERCHANT_PAYMENT));
+    if !authorized {
         return Err(ERR_CONSTITUTION_MISMATCH);
     }
     let registry = storage::get_address(KEY_REGISTRY).ok_or(-10)?;
@@ -641,14 +654,18 @@ fn handle_constitution_clear_transfer(args: &CalldataReader) -> Result<(), i32> 
     Ok(())
 }
 
-/// Mint `amount` units to `toIdentity`, invoked exclusively by this ledger's pinned
-/// `associatedConstitution()` (e.g., when a shareholder underwrites futures contracts).
+/// Mint `amount` units to `toIdentity`, invoked exclusively by an authorized `CAP_EQUITY_SETTLEMENT`
+/// module (`ShareCapital`) or the pinned `CorporateCharter`.
 fn handle_constitution_issue(args: &CalldataReader) -> Result<(), i32> {
     if storage::get_u64(KEY_INIT) != 1 {
         return Err(-10);
     }
     let pinned_con = storage::get_address(KEY_CONSTITUTION).unwrap_or([0u8; 20]);
-    if pinned_con == [0u8; 20] || context::msg_sender() != pinned_con {
+    let sender = context::msg_sender();
+    if pinned_con == [0u8; 20]
+        || (sender != pinned_con
+            && !is_authorized_charter_module(&pinned_con, &sender, &CAP_EQUITY_SETTLEMENT))
+    {
         return Err(ERR_CONSTITUTION_MISMATCH);
     }
     let registry = storage::get_address(KEY_REGISTRY).ok_or(-10)?;
@@ -682,14 +699,18 @@ fn handle_constitution_issue(args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
-/// Burn `amount` units from `fromIdentity`, invoked exclusively by this ledger's pinned
-/// `associatedConstitution()` (e.g., when a shareholder closes underwritten futures contracts).
+/// Burn `amount` units from `fromIdentity`, invoked exclusively by an authorized
+/// `CAP_EQUITY_SETTLEMENT` module (`ShareCapital`) or the pinned `CorporateCharter`.
 fn handle_constitution_cancel(args: &CalldataReader) -> Result<(), i32> {
     if storage::get_u64(KEY_INIT) != 1 {
         return Err(-10);
     }
     let pinned_con = storage::get_address(KEY_CONSTITUTION).unwrap_or([0u8; 20]);
-    if pinned_con == [0u8; 20] || context::msg_sender() != pinned_con {
+    let sender = context::msg_sender();
+    if pinned_con == [0u8; 20]
+        || (sender != pinned_con
+            && !is_authorized_charter_module(&pinned_con, &sender, &CAP_EQUITY_SETTLEMENT))
+    {
         return Err(ERR_CONSTITUTION_MISMATCH);
     }
     let registry = storage::get_address(KEY_REGISTRY).ok_or(-10)?;
@@ -1281,24 +1302,32 @@ fn execute_transfer_auction_settlement(
         b += 1;
     }
 
-    // If the bound Constitution escrowed buyer funds in its bank balance ledger (`hasEscrowedAuction(authObj)`),
-    // automatically disburse `clearing_price * fill` to filled sellers and refund any unspent escrow
-    // (`order.price * order.quantity - clearing_price * fill`) back to buyers!
+    // If `ShareCapital` (`caller`, authorized with `CAP_EQUITY_SETTLEMENT`) or the pinned Charter
+    // escrowed buyer funds (`hasEscrowedAuction(authObj)`), disburse `clearing_price * fill` to
+    // filled sellers and refund unspent escrow back to buyers!
     if rule.constitution != [0u8; 20] {
+        let escrow_hps =
+            if is_authorized_charter_module(&rule.constitution, caller, &CAP_EQUITY_SETTLEMENT) {
+                *caller
+            } else {
+                rule.constitution
+            };
         let q_cd = CallEncoder::<64>::new(const { selector("hasEscrowedAuction(address)") })
             .push_address(auth_obj);
-        if let Ok(true) = call::call_bool(&rule.constitution, q_cd.as_slice()) {
+        if let Ok(true) = call::call_bool(&escrow_hps, q_cd.as_slice()) {
             sl = 0;
             while sl < sell_count {
                 let fill = sell_fills[sl];
                 if fill > 0 {
                     let proceeds = clearing_price.checked_mul(fill).ok_or(-15)?;
-                    let pay_cd = CallEncoder::<160>::new(const { selector("disburseAuctionCash(address,address,uint64,bool)") })
+                    let pay_cd = CallEncoder::<160>::new(const {
+                        selector("disburseAuctionCash(address,address,uint64,bool)")
+                    })
                     .push_address(auth_obj)
                     .push_address(&sell_orders[sl].trader)
                     .push_u64(proceeds)
                     .push_bool(true);
-                    let ok = call::call_bool(&rule.constitution, pay_cd.as_slice())?;
+                    let ok = call::call_bool(&escrow_hps, pay_cd.as_slice())?;
                     if !ok {
                         return Err(-16);
                     }
@@ -1315,12 +1344,14 @@ fn execute_transfer_auction_settlement(
                 let spent = clearing_price.checked_mul(buy_fills[b]).ok_or(-15)?;
                 let refund = escrowed.saturating_sub(spent);
                 if refund > 0 {
-                    let ref_cd = CallEncoder::<160>::new(const { selector("disburseAuctionCash(address,address,uint64,bool)") })
+                    let ref_cd = CallEncoder::<160>::new(const {
+                        selector("disburseAuctionCash(address,address,uint64,bool)")
+                    })
                     .push_address(auth_obj)
                     .push_address(&buy_orders[b].trader)
                     .push_u64(refund)
                     .push_bool(false);
-                    let ok = call::call_bool(&rule.constitution, ref_cd.as_slice())?;
+                    let ok = call::call_bool(&escrow_hps, ref_cd.as_slice())?;
                     if !ok {
                         return Err(-16);
                     }

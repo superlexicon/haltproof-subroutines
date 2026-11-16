@@ -18,8 +18,9 @@
 use hps_sdk::abi::CalldataReader;
 use hps_sdk::call::{self, CallEncoder};
 use hps_sdk::governance::{
-    oracle_policy_id, require_valid_identity, AuctionBook, AuctionOrder, PolicySpec, StageSpec,
-    ACTION_TRANSFER, CONSTITUTION_STATE_ACTIVE, CONSTITUTION_STATE_PENDING_RATIFICATION,
+    is_authorized_charter_module, oracle_policy_id, require_valid_identity, AuctionBook,
+    AuctionOrder, PolicySpec, StageSpec, ACTION_TRANSFER, CAP_EQUITY_SETTLEMENT,
+    CONSTITUTION_STATE_ACTIVE, CONSTITUTION_STATE_PENDING_RATIFICATION,
     ERR_CONSTITUTION_NOT_ACTIVE, ERR_NOT_EXISTING_SHAREHOLDER, ERR_NOT_ORDER_OWNER,
     ERR_ORDER_ALREADY_CANCELLED, ERR_ORDER_NOT_FOUND, ERR_POLICY_INVALID,
     ERR_STEP2_SELLER_INELIGIBLE_STEP3, ERR_WRONG_AUCTION_STEP, MAX_ENCODED_AUCTION_BOOK_BYTES,
@@ -83,6 +84,7 @@ const KEY_STEP3_DL: &[u8] = b"au:step3_dl";
 const KEY_AUCTION_BOOK: &[u8] = b"au:auc_book";
 
 hps_entry! {
+    "initializeFromCharter(address,address,address,bytes32,bytes32)"      => handle_init_from_constitution,
     "initializeFromConstitution(address,address,address,bytes32,bytes32)" => handle_init_from_constitution,
     "initializeTransferAuction(address,address,address)"                  => handle_init_transfer_auction,
     "initializeOracle(address,address,address,bytes32,uint64)"            => handle_init_oracle,
@@ -108,6 +110,7 @@ hps_entry! {
     "getOrdersRaw()"                                                      => handle_get_orders_raw,
     "isReadyToConsume()"                                                  => handle_is_ready_to_consume,
     "targetHps()"                                                         => handle_target_hps,
+    "charter()"                                                           => handle_constitution,
     "constitution()"                                                      => handle_constitution,
     "policyId()"                                                          => handle_policy_id,
     "actionHash()"                                                        => handle_action_hash,
@@ -250,15 +253,16 @@ fn verify_constitution_active_or_ratifying(
         return Ok(());
     }
     if st == CONSTITUTION_STATE_PENDING_RATIFICATION && target_hps == constitution {
-        let h_cd = CallEncoder::<16>::new(const { selector("hashActivateConstitution()") });
+        let h_cd = CallEncoder::<16>::new(const { selector("hashActivateCharter()") });
         let Ok(raw_h) = call::call_raw(constitution, h_cd.as_slice()) else {
             return Err(ERR_CONSTITUTION_NOT_ACTIVE);
         };
         if raw_h.len() < 32 || &raw_h[..32] != action_hash {
             return Err(ERR_CONSTITUTION_NOT_ACTIVE);
         }
-        let f_cd = CallEncoder::<64>::new(const { selector("getFunctionAuth(bytes4)") })
-            .push_bytes4(&const { selector("activateConstitution(address)") });
+        let f_cd = CallEncoder::<96>::new(const { selector("getFunctionAuth(address,bytes4)") })
+            .push_address(constitution)
+            .push_bytes4(&const { selector("activateCharter(address)") });
         let Ok(raw_pol) = call::call_raw(constitution, f_cd.as_slice()) else {
             return Err(ERR_CONSTITUTION_NOT_ACTIVE);
         };
@@ -744,10 +748,16 @@ fn handle_place_buy_order(args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
-/// Constitution-proxied buy order placement (`msg.sender` must be the bound `Constitution` HPS).
+fn is_authorized_auction_broker(bound_charter: &[u8; 20], sender: &[u8; 20]) -> bool {
+    *bound_charter != [0u8; 20]
+        && (sender == bound_charter
+            || is_authorized_charter_module(bound_charter, sender, &CAP_EQUITY_SETTLEMENT))
+}
+
+/// ShareCapital / Charter-proxied buy order placement.
 fn handle_place_buy_order_for(args: &CalldataReader) -> Result<(), i32> {
     let bound_con = storage::get_address(KEY_CONSTITUTION).ok_or(-62)?;
-    if bound_con == [0u8; 20] || context::msg_sender() != bound_con {
+    if !is_authorized_auction_broker(&bound_con, &context::msg_sender()) {
         return Err(ERR_WRONG_TARGET);
     }
     let buyer = args.address(0).ok_or(-3)?;
@@ -836,10 +846,10 @@ fn handle_cancel_buy_order(args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
-/// Constitution-proxied buy order cancellation (`msg.sender` must be the bound `Constitution` HPS).
+/// ShareCapital / Charter-proxied buy order cancellation.
 fn handle_cancel_buy_order_for(args: &CalldataReader) -> Result<(), i32> {
     let bound_con = storage::get_address(KEY_CONSTITUTION).ok_or(-62)?;
-    if bound_con == [0u8; 20] || context::msg_sender() != bound_con {
+    if !is_authorized_auction_broker(&bound_con, &context::msg_sender()) {
         return Err(ERR_WRONG_TARGET);
     }
     let buyer = args.address(0).ok_or(-3)?;
@@ -926,10 +936,10 @@ fn handle_place_sell_order(args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
-/// Constitution-proxied sell order placement (`msg.sender` must be the bound `Constitution` HPS).
+/// ShareCapital / Charter-proxied sell order placement.
 fn handle_place_sell_order_for(args: &CalldataReader) -> Result<(), i32> {
     let bound_con = storage::get_address(KEY_CONSTITUTION).ok_or(-62)?;
-    if bound_con == [0u8; 20] || context::msg_sender() != bound_con {
+    if !is_authorized_auction_broker(&bound_con, &context::msg_sender()) {
         return Err(ERR_WRONG_TARGET);
     }
     let seller = args.address(0).ok_or(-3)?;
@@ -1000,7 +1010,7 @@ fn handle_consume(args: &CalldataReader) -> Result<(), i32> {
     }
 
     let registry = storage::get_address(KEY_REGISTRY).ok_or(-62)?;
-    if !(bound_con != [0u8; 20] && invoker_identity == bound_con) {
+    if !is_authorized_auction_broker(&bound_con, &invoker_identity) {
         require_valid_identity(&registry, &invoker_identity)?;
     }
 
@@ -1061,7 +1071,7 @@ fn handle_consume_auction(args: &CalldataReader) -> Result<(), i32> {
     }
 
     let registry = storage::get_address(KEY_REGISTRY).ok_or(-62)?;
-    if !(bound_con != [0u8; 20] && invoker_identity == bound_con) {
+    if !is_authorized_auction_broker(&bound_con, &invoker_identity) {
         require_valid_identity(&registry, &invoker_identity)?;
     }
 
@@ -1896,11 +1906,11 @@ mod tests {
                 ret::write_u64_word(storage::get_u64(b"st"));
                 return 0;
             }
-            if sel == const { selector("hashActivateConstitution()") } {
+            if sel == const { selector("hashActivateCharter()") } {
                 ret::write_word(&ACT_HASH_ACTIVATE);
                 return 0;
             }
-            if sel == const { selector("getFunctionAuth(bytes4)") } {
+            if sel == const { selector("getFunctionAuth(address,bytes4)") } {
                 ret::write_word(&POLICY_FIRST_SHAREHOLDER_RESOLUTION);
                 return 0;
             }

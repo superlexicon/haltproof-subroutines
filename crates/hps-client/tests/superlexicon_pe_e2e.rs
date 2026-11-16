@@ -349,7 +349,9 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
     let registry_wasm =
         std::fs::read(dist.join("identity_registry.wasm")).expect("dist/identity_registry.wasm");
     let constitution_wasm =
-        std::fs::read(dist.join("constitution.wasm")).expect("dist/constitution.wasm");
+        std::fs::read(dist.join("corporate_charter.wasm")).expect("dist/corporate_charter.wasm");
+    let share_capital_wasm =
+        std::fs::read(dist.join("share_capital.wasm")).expect("dist/share_capital.wasm");
     let auth_wasm =
         std::fs::read(dist.join("authorization.wasm")).expect("dist/authorization.wasm");
     let ledger_wasm =
@@ -750,8 +752,8 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
         "Superlexicon Constitution initialize must succeed"
     );
     assert!(
-        has_log_topic(&con_init_rcpt, "ConstitutionInitialized(address,uint64)"),
-        "ConstitutionInitialized event must be emitted"
+        has_log_topic(&con_init_rcpt, "CharterInitialized(address,uint64)"),
+        "CharterInitialized event must be emitted"
     );
     assert!(
         has_log_topic(
@@ -897,17 +899,17 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
         "Non-activation Authorization MUST revert before First Shareholder Resolution activates Constitution"
     );
 
-    // Pass First Shareholder Resolution (`activateConstitution`) with 75,000 / 100,000 super-majority votes
+    // Pass First Shareholder Resolution (`activateCharter`) with 75,000 / 100,000 super-majority votes
     // (Manogaran 50,000 + 4 lead minority shareholders 25,000 = 75,000 votes)
     let h_activate_con =
-        read_b32(&client, slx_constitution, "hashActivateConstitution()", &[]).await;
+        read_b32(&client, slx_constitution, "hashActivateCharter()", &[]).await;
     assert!(
         client
             .send_call_with_targets(
                 &deployer,
                 manogaran_id,
                 &encode_values(
-                    "initConstitutionAuth(address,address,address,address,bytes32,bytes32)",
+                    "initCharterAuth(address,address,address,address,bytes32,bytes32)",
                     &[
                         AbiValue::Address(auth_activate_con),
                         AbiValue::Address(registry),
@@ -951,7 +953,7 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
     act_vote_calls.push((
         manogaran_id,
         encode_values(
-            "activateConstitution(address,address)",
+            "activateCharter(address,address)",
             &[
                 AbiValue::Address(slx_constitution),
                 AbiValue::Address(auth_activate_con),
@@ -1985,6 +1987,10 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
     //     Constitution-Routed Share Transfer Auction with Bank Escrow, Same-Step
     //     Buy Order Cancellation, and DvP Cash Settlement
     // =========================================================================
+    let sc_code = client
+        .store_bytecode(&deployer, &share_capital_wasm)
+        .await
+        .unwrap();
     let step11_12_insts = client
         .instantiate_batch(
             &deployer,
@@ -1998,6 +2004,7 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
                 (auth_code, Vec::new()),
                 (ledger_code, Vec::new()),
                 (auth_code, Vec::new()),
+                (sc_code, Vec::new()),
             ],
         )
         .await
@@ -2011,6 +2018,7 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
     let auth_escrowed_auction = step11_12_insts[6];
     let series_a_ledger = step11_12_insts[7];
     let auth_multiclass_res = step11_12_insts[8];
+    let slx_share_capital = step11_12_insts[9];
 
     // Initialize `SLX-DBS-SGD` Bank Account AssetLedger pinned to `slx_constitution`:
     // - `ACTION_ISSUE` & `ACTION_CANCEL` -> `(slx_constitution, POLICY_BANK_ORACLE)`
@@ -2059,22 +2067,22 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
             .status
     );
 
-    // Board Resolution (`POLICY_BOARD_RESOLUTION` requiring both Directors Manogaran + Evelyn Tan)
-    // authorizes `dbs_bank_oracle_id` as the Bank Oracle for `dbs_bank_ledger` in `slx_constitution`,
-    // and sets `clearing_acct_id` as the Constitution's special clearing account!
+    // Board Resolution (`POLICY_BOARD_RESOLUTION` requiring all 3 active Directors) grants
+    // `ROLE_BANK_ORACLE` to `dbs_bank_oracle_id` in `slx_constitution` (`CorporateCharter`),
+    // and initializes + authorizes `slx_share_capital` (`CAP_EQUITY_SETTLEMENT`) with segregated
+    // shareholder escrow account `clearing_acct_id`!
     let h_set_ora = read_b32(
         &client,
         slx_constitution,
-        "hashSetBankOracle(address,address,uint64)",
+        "hashGrantRole(bytes32,address)",
         &[
-            AbiValue::Address(dbs_bank_ledger),
+            AbiValue::Bytes32(hps_sdk::governance::ROLE_BANK_ORACLE),
             AbiValue::Address(dbs_bank_oracle_id),
-            AbiValue::Uint(U256::from(50u64)),
         ],
     )
     .await;
     let init_ora_board_cd = encode_values(
-        "initConstitutionAuth(address,address,address,address,bytes32,bytes32)",
+        "initCharterAuth(address,address,address,address,bytes32,bytes32)",
         &[
             AbiValue::Address(auth_set_bank_oracle),
             AbiValue::Address(registry),
@@ -2100,12 +2108,12 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
         (
             manogaran_id,
             encode_values("approveAuth(address)", &[AbiValue::Address(auth_set_bank_oracle)]),
-            vec![auth_set_bank_oracle, registry],
+            vec![auth_set_bank_oracle, registry, slx_constitution],
         ),
         (
             evelyn_director_id,
             encode_values("approveAuth(address)", &[AbiValue::Address(auth_set_bank_oracle)]),
-            vec![auth_set_bank_oracle, registry],
+            vec![auth_set_bank_oracle, registry, slx_constitution],
         ),
         (
             third_director_id,
@@ -2113,17 +2121,16 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
                 "approveAndFinalizeAuth(address)",
                 &[AbiValue::Address(auth_set_bank_oracle)],
             ),
-            vec![auth_set_bank_oracle, registry],
+            vec![auth_set_bank_oracle, registry, slx_constitution],
         ),
         (
             manogaran_id,
             encode_values(
-                "setBankOracle(address,address,address,uint64,address)",
+                "grantRole(address,bytes32,address,address)",
                 &[
                     AbiValue::Address(slx_constitution),
-                    AbiValue::Address(dbs_bank_ledger),
+                    AbiValue::Bytes32(hps_sdk::governance::ROLE_BANK_ORACLE),
                     AbiValue::Address(dbs_bank_oracle_id),
-                    AbiValue::Uint(U256::from(50u64)),
                     AbiValue::Address(auth_set_bank_oracle),
                 ],
             ),
@@ -2132,19 +2139,45 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
         (
             manogaran_id,
             encode_values(
-                "setClearingAccount(address,address,address,address)",
+                "execute(address,bytes)",
+                &[
+                    AbiValue::Address(slx_share_capital),
+                    AbiValue::Bytes(encode_values(
+                        "initialize(address,address,address,address)",
+                        &[
+                            AbiValue::Address(registry),
+                            AbiValue::Address(slx_constitution),
+                            AbiValue::Address(dbs_bank_ledger),
+                            AbiValue::Address(clearing_acct_id),
+                        ],
+                    )),
+                ],
+            ),
+            vec![
+                slx_share_capital,
+                registry,
+                slx_constitution,
+                dbs_bank_ledger,
+                clearing_acct_id,
+            ],
+        ),
+        (
+            manogaran_id,
+            encode_values(
+                "authorizeModule(address,address,bytes32,bool,address)",
                 &[
                     AbiValue::Address(slx_constitution),
-                    AbiValue::Address(dbs_bank_ledger),
-                    AbiValue::Address(clearing_acct_id),
+                    AbiValue::Address(slx_share_capital),
+                    AbiValue::Bytes32(hps_sdk::governance::CAP_EQUITY_SETTLEMENT),
+                    AbiValue::Bool(true),
                     AbiValue::Address(H160::zero()),
                 ],
             ),
-            vec![slx_constitution, registry, clearing_acct_id],
+            vec![slx_constitution, registry, slx_share_capital],
         ),
     ];
     for r in client.send_call_batch(&deployer, &board_ora_batch).await.unwrap() {
-        assert!(r.status, "Board resolution setting bank oracle & clearing account must succeed");
+        assert!(r.status, "Board resolution granting ROLE_BANK_ORACLE & initializing ShareCapital must succeed");
     }
 
     // Bank Oracle (`dbs_bank_oracle_id`) credits incoming bank deposits (`issueAsset`) for:
@@ -2171,7 +2204,7 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
             (
                 dbs_bank_oracle_id,
                 encode_values(
-                    "initConstitutionAuth(address,address,address,address,bytes32,bytes32)",
+                    "initCharterAuth(address,address,address,address,bytes32,bytes32)",
                     &[
                         AbiValue::Address(auth_dep),
                         AbiValue::Address(registry),
@@ -2186,7 +2219,7 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
             (
                 dbs_bank_oracle_id,
                 encode_values("approveAndFinalizeAuth(address)", &[AbiValue::Address(auth_dep)]),
-                vec![auth_dep, registry],
+                vec![auth_dep, registry, slx_constitution],
             ),
             (
                 dbs_bank_oracle_id,
@@ -2221,7 +2254,7 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
         (
             dbs_bank_oracle_id,
             encode_values(
-                "initConstitutionAuth(address,address,address,address,bytes32,bytes32)",
+                "initCharterAuth(address,address,address,address,bytes32,bytes32)",
                 &[
                     AbiValue::Address(auth_oracle_withdraw),
                     AbiValue::Address(registry),
@@ -2239,7 +2272,7 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
                 "approveAndFinalizeAuth(address)",
                 &[AbiValue::Address(auth_oracle_withdraw)],
             ),
-            vec![auth_oracle_withdraw, registry],
+            vec![auth_oracle_withdraw, registry, slx_constitution],
         ),
         (
             dbs_bank_oracle_id,
@@ -2337,9 +2370,9 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
 
     let buy_via_con_cd = |price: u64, qty: u64| -> Vec<u8> {
         encode_values(
-            "placeBuyOrderViaConstitution(address,address,uint64,uint64)",
+            "placeBuyOrderViaShareCapital(address,address,uint64,uint64)",
             &[
-                AbiValue::Address(slx_constitution),
+                AbiValue::Address(slx_share_capital),
                 AbiValue::Address(auth_escrowed_auction),
                 AbiValue::Uint(U256::from(price)),
                 AbiValue::Uint(U256::from(qty)),
@@ -2348,9 +2381,9 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
     };
     let cancel_via_con_cd = |order_idx: u64| -> Vec<u8> {
         encode_values(
-            "cancelBuyOrderViaConstitution(address,address,uint64)",
+            "cancelBuyOrderViaShareCapital(address,address,uint64)",
             &[
-                AbiValue::Address(slx_constitution),
+                AbiValue::Address(slx_share_capital),
                 AbiValue::Address(auth_escrowed_auction),
                 AbiValue::Uint(U256::from(order_idx)),
             ],
@@ -2358,9 +2391,9 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
     };
     let sell_via_con_cd = |price: u64, qty: u64| -> Vec<u8> {
         encode_values(
-            "placeSellOrderViaConstitution(address,address,uint64,uint64)",
+            "placeSellOrderViaShareCapital(address,address,uint64,uint64)",
             &[
-                AbiValue::Address(slx_constitution),
+                AbiValue::Address(slx_share_capital),
                 AbiValue::Address(auth_escrowed_auction),
                 AbiValue::Uint(U256::from(price)),
                 AbiValue::Uint(U256::from(qty)),
@@ -2368,6 +2401,7 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
         )
     };
     let con_buy_targets = vec![
+        slx_share_capital,
         slx_constitution,
         dbs_bank_ledger,
         clearing_acct_id,
@@ -2482,7 +2516,13 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
                 &deployer,
                 manogaran_id,
                 &sell_via_con_cd(100, 1_500),
-                &[slx_constitution, auth_escrowed_auction, registry, slx_ledger],
+                &[
+                    slx_share_capital,
+                    slx_constitution,
+                    auth_escrowed_auction,
+                    registry,
+                    slx_ledger,
+                ],
             )
             .await
             .unwrap();
@@ -2490,7 +2530,7 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
     }
 
     // Negative Test N17: Attempting to cancel Step 1 Order 0 (`evelyn_director_id`) during Step 2 MUST revert!
-    // And `manogaran_id` places a valid Step 2 sell order for 1,500 shares @ 100 via `Constitution`!
+    // And `manogaran_id` places a valid Step 2 sell order for 1,500 shares @ 100 via `ShareCapital`!
     let step2_con_batch = vec![
         (
             evelyn_director_id,
@@ -2500,7 +2540,13 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
         (
             manogaran_id,
             sell_via_con_cd(100, 1_500),
-            vec![slx_constitution, auth_escrowed_auction, registry, slx_ledger],
+            vec![
+                slx_share_capital,
+                slx_constitution,
+                auth_escrowed_auction,
+                registry,
+                slx_ledger,
+            ],
         ),
     ];
     let step2_con_rcpts = client
@@ -2548,14 +2594,15 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
     //   * Seller `manogaran_id` sells 1,500 shares (147,500 -> 146,000 shares) and receives 150,000 SGD proceeds (bank balance: 50,000 + 150,000 = 200,000 SGD)!
     //   * `clearing_acct_id` bank balance returns to 0!
     let settle_con_cd = encode_values(
-        "settleAuctionViaConstitution(address,address,address)",
+        "settleAuctionViaShareCapital(address,address,address)",
         &[
-            AbiValue::Address(slx_constitution),
+            AbiValue::Address(slx_share_capital),
             AbiValue::Address(slx_ledger),
             AbiValue::Address(auth_escrowed_auction),
         ],
     );
     let settle_con_targets = vec![
+        slx_share_capital,
         slx_constitution,
         slx_ledger,
         dbs_bank_ledger,
