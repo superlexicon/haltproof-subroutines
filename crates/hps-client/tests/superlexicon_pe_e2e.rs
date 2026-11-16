@@ -831,8 +831,9 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
 
     // =========================================================================
     // STEP 4: Batch-Instantiate Authorization HPSes + Malicious Clone for Testing
+    //         and Pass First Shareholder Resolution (`activateConstitution`)
     // =========================================================================
-    let auth_specs: Vec<_> = (0..5).map(|_| (auth_code, Vec::new())).collect();
+    let auth_specs: Vec<_> = (0..6).map(|_| (auth_code, Vec::new())).collect();
     let auths = client.instantiate_batch(&deployer, &auth_specs).await.unwrap();
     let (
         auth_issue_mano,
@@ -840,7 +841,8 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
         auth_board_transfer,
         auth_add_director,
         auth_transfer_auction,
-    ) = (auths[0], auths[1], auths[2], auths[3], auths[4]);
+        auth_activate_con,
+    ) = (auths[0], auths[1], auths[2], auths[3], auths[4], auths[5]);
 
     // Also deploy a maliciously cloned Authorization WASM (`messaging.wasm` masquerading as an Authorization HPS)
     let clone_deploy = client
@@ -848,6 +850,11 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
         .await
         .unwrap();
     let malicious_auth_clone = hps_client::parse_address(&clone_deploy.hps_address).unwrap();
+
+    // Verify newly constructed Superlexicon Constitution starts in PENDING_RATIFICATION (state == 1, isActive == 0)
+    assert_eq!(read_u64(&client, slx_constitution, "state()", &[]).await, 1);
+    assert_eq!(read_u64(&client, slx_constitution, "isActive()", &[]).await, 0);
+    assert_eq!(read_u64(&client, slx_constitution, "isValid()", &[]).await, 0);
 
     // Compute actionHash for issuing 100,000 new shares to Manogaran Thanabalan:
     // Post-issuance: Manogaran holds 150,000 / 200,000 shares = 75.00% super-majority!
@@ -863,7 +870,8 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
     )
     .await;
 
-    // Initialize `auth_issue_mano` via `manogaran_id`
+    // Negative check: attempting to initialize `auth_issue_mano` BEFORE passing the First Shareholder Resolution
+    // to activate `slx_constitution` MUST revert (`ERR_CONSTITUTION_NOT_ACTIVE`)!
     let init_auth_issue_cd = encode_values(
         "initConstitutionAuth(address,address,address,address,bytes32,bytes32)",
         &[
@@ -875,6 +883,94 @@ async fn superlexicon_singapore_pte_ltd_private_equity_e2e_on_localtestnet() {
             AbiValue::Bytes32(h_issue_mano),
         ],
     );
+    let pre_ratify_rcpt = client
+        .send_call_with_targets(
+            &deployer,
+            manogaran_id,
+            &init_auth_issue_cd,
+            &[auth_issue_mano, registry, slx_constitution, slx_ledger],
+        )
+        .await
+        .unwrap();
+    assert!(
+        !pre_ratify_rcpt.status,
+        "Non-activation Authorization MUST revert before First Shareholder Resolution activates Constitution"
+    );
+
+    // Pass First Shareholder Resolution (`activateConstitution`) with 75,000 / 100,000 super-majority votes
+    // (Manogaran 50,000 + 4 lead minority shareholders 25,000 = 75,000 votes)
+    let h_activate_con =
+        read_b32(&client, slx_constitution, "hashActivateConstitution()", &[]).await;
+    assert!(
+        client
+            .send_call_with_targets(
+                &deployer,
+                manogaran_id,
+                &encode_values(
+                    "initConstitutionAuth(address,address,address,address,bytes32,bytes32)",
+                    &[
+                        AbiValue::Address(auth_activate_con),
+                        AbiValue::Address(registry),
+                        AbiValue::Address(slx_constitution),
+                        AbiValue::Address(slx_constitution),
+                        AbiValue::Bytes32(POLICY_SHAREHOLDER_SUPERMAJORITY),
+                        AbiValue::Bytes32(h_activate_con),
+                    ],
+                ),
+                &[auth_activate_con, registry, slx_constitution],
+            )
+            .await
+            .unwrap()
+            .status,
+        "auth_activate_con initialize must succeed"
+    );
+    let approve_act_cd = encode_values(
+        "approveAuth(address)",
+        &[AbiValue::Address(auth_activate_con)],
+    );
+    let mut act_vote_calls = vec![(
+        manogaran_id,
+        approve_act_cd.clone(),
+        vec![auth_activate_con, registry, slx_constitution],
+    )];
+    for (sh_id, _) in cap_table.iter().skip(1).take(4) {
+        act_vote_calls.push((
+            *sh_id,
+            approve_act_cd.clone(),
+            vec![auth_activate_con, registry, slx_constitution],
+        ));
+    }
+    act_vote_calls.push((
+        manogaran_id,
+        encode_values(
+            "finalizeAuth(address)",
+            &[AbiValue::Address(auth_activate_con)],
+        ),
+        vec![auth_activate_con, registry, slx_constitution],
+    ));
+    act_vote_calls.push((
+        manogaran_id,
+        encode_values(
+            "activateConstitution(address,address)",
+            &[
+                AbiValue::Address(slx_constitution),
+                AbiValue::Address(auth_activate_con),
+            ],
+        ),
+        vec![slx_constitution, registry, auth_activate_con],
+    ));
+    let act_rcpts = client
+        .send_call_batch(&deployer, &act_vote_calls)
+        .await
+        .unwrap();
+    for (idx, r) in act_rcpts.iter().enumerate() {
+        assert!(r.status, "First Shareholder Resolution tx {idx} failed");
+    }
+    assert_eq!(read_u64(&client, slx_constitution, "state()", &[]).await, 2);
+    assert_eq!(read_u64(&client, slx_constitution, "isActive()", &[]).await, 1);
+    assert_eq!(read_u64(&client, slx_constitution, "isValid()", &[]).await, 1);
+
+    // Initialize `auth_issue_mano` via `manogaran_id` (now that `slx_constitution` is ACTIVE!)
     let init_auth_rcpt = client
         .send_call_with_targets(
             &deployer,

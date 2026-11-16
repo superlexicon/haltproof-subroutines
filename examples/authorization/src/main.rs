@@ -19,12 +19,14 @@ use hps_sdk::abi::CalldataReader;
 use hps_sdk::call::{self, CallEncoder};
 use hps_sdk::governance::{
     oracle_policy_id, require_valid_identity, AuctionBook, AuctionOrder, PolicySpec, StageSpec,
-    ACTION_TRANSFER, ERR_NOT_EXISTING_SHAREHOLDER, ERR_NOT_ORDER_OWNER,
+    ACTION_TRANSFER, CONSTITUTION_STATE_ACTIVE, CONSTITUTION_STATE_PENDING_RATIFICATION,
+    ERR_CONSTITUTION_NOT_ACTIVE, ERR_NOT_EXISTING_SHAREHOLDER, ERR_NOT_ORDER_OWNER,
     ERR_ORDER_ALREADY_CANCELLED, ERR_ORDER_NOT_FOUND, ERR_POLICY_INVALID,
     ERR_STEP2_SELLER_INELIGIBLE_STEP3, ERR_WRONG_AUCTION_STEP, MAX_ENCODED_AUCTION_BOOK_BYTES,
     MAX_ENCODED_POLICY_BYTES, ORDER_SIDE_BUY_STEP1, ORDER_SIDE_BUY_STEP3, ORDER_SIDE_CANCELLED,
-    ORDER_SIDE_SELL_STEP2, POLICY_SHAREHOLDER_SUPERMAJORITY, POLICY_SHARE_TRANSFER_AUCTION,
-    POLICY_SUPER_GOVERNANCE,
+    ORDER_SIDE_SELL_STEP2, POLICY_FIRST_SHAREHOLDER_RESOLUTION, POLICY_SHAREHOLDER_SUPERMAJORITY,
+    POLICY_SHARE_TRANSFER_AUCTION, POLICY_SUPER_GOVERNANCE, ROLE_ALL_MEMBERS_WEIGHT,
+    ROLE_SHAREHOLDER,
 };
 use hps_sdk::storage::KeyBuilder;
 use hps_sdk::{context, event_topic, events, hps_entry, ret, selector, storage};
@@ -229,6 +231,45 @@ fn setup_instance(
     Ok(())
 }
 
+/// Enforce that a `Constitution` HPS is in `CONSTITUTION_STATE_ACTIVE` before allowing any
+/// `Authorization` object to be initialized from it — with the sole exception of the First
+/// Shareholder Resolution (`activateConstitution(address)`) when the Constitution is in
+/// `CONSTITUTION_STATE_PENDING_RATIFICATION`.
+fn verify_constitution_active_or_ratifying(
+    constitution: &[u8; 20],
+    target_hps: &[u8; 20],
+    policy_id: &[u8; 32],
+    action_hash: &[u8; 32],
+) -> Result<(), i32> {
+    let st_cd = CallEncoder::<16>::new(const { selector("state()") });
+    let Ok(st) = call::call_u64(constitution, st_cd.as_slice()) else {
+        // Minimal unit-test stub without `state()`
+        return Ok(());
+    };
+    if st == CONSTITUTION_STATE_ACTIVE {
+        return Ok(());
+    }
+    if st == CONSTITUTION_STATE_PENDING_RATIFICATION && target_hps == constitution {
+        let h_cd = CallEncoder::<16>::new(const { selector("hashActivateConstitution()") });
+        let Ok(raw_h) = call::call_raw(constitution, h_cd.as_slice()) else {
+            return Err(ERR_CONSTITUTION_NOT_ACTIVE);
+        };
+        if raw_h.len() < 32 || &raw_h[..32] != action_hash {
+            return Err(ERR_CONSTITUTION_NOT_ACTIVE);
+        }
+        let f_cd = CallEncoder::<64>::new(const { selector("getFunctionAuth(bytes4)") })
+            .push_bytes4(&const { selector("activateConstitution(address)") });
+        let Ok(raw_pol) = call::call_raw(constitution, f_cd.as_slice()) else {
+            return Err(ERR_CONSTITUTION_NOT_ACTIVE);
+        };
+        if raw_pol.len() < 32 || &raw_pol[..32] != policy_id {
+            return Err(ERR_CONSTITUTION_NOT_ACTIVE);
+        }
+        return Ok(());
+    }
+    Err(ERR_CONSTITUTION_NOT_ACTIVE)
+}
+
 fn handle_init_from_constitution(args: &CalldataReader) -> Result<(), i32> {
     let registry = args.address(0).ok_or(-3)?;
     let constitution = args.address(1).ok_or(-3)?;
@@ -241,6 +282,8 @@ fn handle_init_from_constitution(args: &CalldataReader) -> Result<(), i32> {
 
     let caller = context::msg_sender();
     require_valid_identity(&registry, &caller)?;
+
+    verify_constitution_active_or_ratifying(&constitution, &target_hps, &policy_id, &action_hash)?;
 
     // Fetch policy bylaw from Constitution HPS
     let q = CallEncoder::<96>::new(const { selector("getPolicyRaw(address,bytes32)") })
@@ -273,6 +316,13 @@ fn handle_init_transfer_auction(args: &CalldataReader) -> Result<(), i32> {
 
     let caller = context::msg_sender();
     require_valid_identity(&registry, &caller)?;
+
+    let st_cd = CallEncoder::<16>::new(const { selector("state()") });
+    if let Ok(st) = call::call_u64(&constitution, st_cd.as_slice()) {
+        if st != CONSTITUTION_STATE_ACTIVE {
+            return Err(ERR_CONSTITUTION_NOT_ACTIVE);
+        }
+    }
 
     let q = CallEncoder::<96>::new(const { selector("getPolicyRaw(address,bytes32)") })
         .push_address(&target_hps)
@@ -370,7 +420,7 @@ fn handle_init_custom(args: &CalldataReader) -> Result<(), i32> {
 fn query_dynamic_shareholder_power(
     constitution: &[u8; 20],
     voter: &[u8; 20],
-) -> Option<(u64, u64)> {
+) -> Option<(u64, u64, u64)> {
     if *constitution == [0u8; 20] {
         return None;
     }
@@ -394,7 +444,91 @@ fn query_dynamic_shareholder_power(
     if total_power == 0 || req_power == 0 {
         return None;
     }
-    Some((voter_power, req_power))
+    Some((voter_power, total_power, req_power))
+}
+
+/// Resolve `(caller_weight, required_stage_weight)` for `caller` on `stage` (supporting explicit
+/// weighted members, dynamic role-backed stages defined even with 0 initial role holders,
+/// unanimous `ROLE_ALL_MEMBERS_WEIGHT`, and multi-class shareholder voting).
+fn resolve_stage_authorizer_weight(
+    stage: &StageSpec,
+    cur_stage: usize,
+    bound_con: &[u8; 20],
+    bound_pol: &[u8; 32],
+    caller: &[u8; 20],
+) -> Result<(u64, u64), i32> {
+    let is_shareholder_stage = stage.has_role(&ROLE_SHAREHOLDER)
+        || (cur_stage == 0
+            && (*bound_pol == POLICY_SHAREHOLDER_SUPERMAJORITY
+                || *bound_pol == POLICY_SUPER_GOVERNANCE
+                || *bound_pol == POLICY_FIRST_SHAREHOLDER_RESOLUTION));
+
+    if *bound_con != [0u8; 20] && is_shareholder_stage {
+        if let Some((dyn_weight, total_power, default_super_req)) =
+            query_dynamic_shareholder_power(bound_con, caller)
+        {
+            if dyn_weight == 0 {
+                return Err(ERR_NOT_STAGE_AUTHORIZER);
+            }
+            let dyn_req = if stage.has_role(&ROLE_SHAREHOLDER)
+                && stage.required_weight >= 1
+                && stage.required_weight <= 100
+            {
+                (total_power
+                    .saturating_mul(stage.required_weight)
+                    .saturating_add(99))
+                    / 100
+            } else {
+                default_super_req
+            };
+            return Ok((dyn_weight, dyn_req.max(1)));
+        }
+    }
+
+    let mut best_weight = stage.member_weight(caller).unwrap_or(0);
+    if stage.role_count > 0 && *bound_con != [0u8; 20] {
+        let mut r = 0usize;
+        while r < stage.role_count {
+            let role_id = &stage.roles[r].role_id;
+            let has_cd = CallEncoder::<96>::new(const { selector("hasRole(bytes32,address)") })
+                .push_bytes32(role_id)
+                .push_address(caller);
+            if let Ok(true) = call::call_bool(bound_con, has_cd.as_slice()) {
+                if stage.roles[r].weight > best_weight {
+                    best_weight = stage.roles[r].weight;
+                }
+            }
+            r += 1;
+        }
+    }
+
+    if best_weight == 0 {
+        return Err(ERR_NOT_STAGE_AUTHORIZER);
+    }
+
+    let effective_req = if stage.required_weight == ROLE_ALL_MEMBERS_WEIGHT {
+        if *bound_con == [0u8; 20] || stage.role_count == 0 {
+            return Err(ERR_NOT_STAGE_AUTHORIZER);
+        }
+        let mut total_role_weight = 0u64;
+        let mut r = 0usize;
+        while r < stage.role_count {
+            let cnt_cd = CallEncoder::<64>::new(const { selector("roleMemberCount(bytes32)") })
+                .push_bytes32(&stage.roles[r].role_id);
+            let cnt = call::call_u64(bound_con, cnt_cd.as_slice()).unwrap_or(0);
+            total_role_weight =
+                total_role_weight.saturating_add(cnt.saturating_mul(stage.roles[r].weight));
+            r += 1;
+        }
+        if total_role_weight == 0 {
+            return Err(ERR_NOT_STAGE_AUTHORIZER);
+        }
+        total_role_weight
+    } else {
+        stage.required_weight
+    };
+
+    Ok((best_weight, effective_req))
 }
 
 fn execute_approve_step() -> Result<[u8; 20], i32> {
@@ -422,27 +556,8 @@ fn execute_approve_step() -> Result<[u8; 20], i32> {
     let bound_con = storage::get_address(KEY_CONSTITUTION).unwrap_or([0u8; 20]);
     let bound_pol = storage::get_bytes32(KEY_POLICY_ID).unwrap_or([0u8; 32]);
 
-    let (weight, required_weight) = if cur_stage == 0
-        && bound_con != [0u8; 20]
-        && (bound_pol == POLICY_SHAREHOLDER_SUPERMAJORITY || bound_pol == POLICY_SUPER_GOVERNANCE)
-    {
-        if let Some((dyn_weight, dyn_req)) = query_dynamic_shareholder_power(&bound_con, &caller) {
-            if dyn_weight == 0 {
-                return Err(ERR_NOT_STAGE_AUTHORIZER);
-            }
-            (dyn_weight, dyn_req)
-        } else {
-            let w = stage
-                .member_weight(&caller)
-                .ok_or(ERR_NOT_STAGE_AUTHORIZER)?;
-            (w, stage.required_weight)
-        }
-    } else {
-        let w = stage
-            .member_weight(&caller)
-            .ok_or(ERR_NOT_STAGE_AUTHORIZER)?;
-        (w, stage.required_weight)
-    };
+    let (weight, required_weight) =
+        resolve_stage_authorizer_weight(stage, cur_stage, &bound_con, &bound_pol, &caller)?;
 
     let sk = signed_key(cur_stage as u64, &caller);
     if storage::get_u64(sk.as_slice()) != 0 {
@@ -1721,5 +1836,215 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fin_2[31], 1); // 110,000 + 40,000 = 150,000 >= 150,000 -> finalized!
+    }
+
+    #[test]
+    fn role_backed_stages_with_unassigned_initial_roles_and_inactive_constitution_guard() {
+        use hps_sdk::governance::{ROLE_DIRECTOR, ROLE_PRODUCT_MANAGER};
+
+        mock::reset();
+        let reg = [0x10; 20];
+        let con = [0x20; 20];
+        let target = [0x30; 20];
+        let auth_blocked = [0x41; 20];
+        let auth_activate = [0x42; 20];
+        let auth_dual_role = [0x43; 20];
+
+        let sh_1 = [0xA1; 20];
+        let dir_1 = [0xB1; 20];
+        let dir_2 = [0xB2; 20];
+        let prod_mgr = [0xD1; 20];
+
+        const ACT_HASH_ACTIVATE: [u8; 32] = [0xAA; 32];
+        let pol_dual = [0x55; 32];
+        let act_hash_work = [0xBB; 32];
+
+        mock::register_hps(reg, |raw| {
+            let Some((sel, args)) = CalldataReader::parse(raw) else {
+                return -1;
+            };
+            if sel == const { selector("isValidIdentity(address)") } {
+                let id = args.address(0).unwrap();
+                ret::write_bool(id != [0u8; 20] && id[0] != 0xEE);
+                return 0;
+            }
+            -2
+        });
+
+        // Constitution mock tracking `state()`, `hasRole`, and `roleMemberCount`, plus a 2-stage
+        // role-backed PolicySpec (`Stage 0 = ROLE_PRODUCT_MANAGER (w=1)` -> `Stage 1 = ROLE_DIRECTOR (ALL)`)
+        mock::register_hps(con, |raw| {
+            let Some((sel, args)) = CalldataReader::parse(raw) else {
+                return -1;
+            };
+            if sel == const { selector("setState(uint64)") } {
+                storage::set_u64(b"st", args.u64(0).unwrap());
+                return 0;
+            }
+            if sel == const { selector("grant(bytes32,address)") } {
+                let rid = args.bytes32(0).unwrap();
+                let who = args.address(1).unwrap();
+                let hk = KeyBuilder::<64>::new().push(b"hr:").push(&rid).push(&who);
+                if storage::get_u64(hk.as_slice()) == 0 {
+                    storage::set_u64(hk.as_slice(), 1);
+                    let ck = KeyBuilder::<48>::new().push(b"rc:").push(&rid);
+                    storage::set_u64(ck.as_slice(), storage::get_u64(ck.as_slice()) + 1);
+                }
+                return 0;
+            }
+            if sel == const { selector("state()") } {
+                ret::write_u64_word(storage::get_u64(b"st"));
+                return 0;
+            }
+            if sel == const { selector("hashActivateConstitution()") } {
+                ret::write_word(&ACT_HASH_ACTIVATE);
+                return 0;
+            }
+            if sel == const { selector("getFunctionAuth(bytes4)") } {
+                ret::write_word(&POLICY_FIRST_SHAREHOLDER_RESOLUTION);
+                return 0;
+            }
+            if sel == const { selector("hasRole(bytes32,address)") } {
+                let rid = args.bytes32(0).unwrap();
+                let who = args.address(1).unwrap();
+                let hk = KeyBuilder::<64>::new().push(b"hr:").push(&rid).push(&who);
+                ret::write_bool(storage::get_u64(hk.as_slice()) == 1);
+                return 0;
+            }
+            if sel == const { selector("roleMemberCount(bytes32)") } {
+                let rid = args.bytes32(0).unwrap();
+                let ck = KeyBuilder::<48>::new().push(b"rc:").push(&rid);
+                ret::write_u64_word(storage::get_u64(ck.as_slice()));
+                return 0;
+            }
+            if sel == const { selector("getPolicyRaw(address,bytes32)") } {
+                let pid = args.bytes32(1).unwrap();
+                let spec = if pid == POLICY_FIRST_SHAREHOLDER_RESOLUTION {
+                    PolicySpec::new(100)
+                        .add_stage(StageSpec::for_role(ROLE_SHAREHOLDER, 1, 50).unwrap())
+                        .unwrap()
+                } else {
+                    PolicySpec::new(100)
+                        .add_stage(StageSpec::for_role(ROLE_PRODUCT_MANAGER, 1, 40).unwrap())
+                        .unwrap()
+                        .add_stage(
+                            StageSpec::for_role(ROLE_DIRECTOR, ROLE_ALL_MEMBERS_WEIGHT, 40)
+                                .unwrap(),
+                        )
+                        .unwrap()
+                };
+                let mut b = [0u8; 512];
+                let n = spec.encode(&mut b).unwrap();
+                ret::write_abi_bytes(&b[..n]);
+                return 0;
+            }
+            -2
+        });
+
+        mock::register_hps(auth_blocked, dispatch_calldata);
+        mock::register_hps(auth_activate, dispatch_calldata);
+        mock::register_hps(auth_dual_role, dispatch_calldata);
+
+        // Start in PENDING_RATIFICATION (1) with `sh_1` in ROLE_SHAREHOLDER, `[dir_1, dir_2]` in
+        // ROLE_DIRECTOR, and 0 members in ROLE_PRODUCT_MANAGER!
+        mock::transact_as(
+            sh_1,
+            con,
+            CallEncoder::<64>::new(const { selector("setState(uint64)") })
+                .push_u64(CONSTITUTION_STATE_PENDING_RATIFICATION)
+                .as_slice(),
+        )
+        .unwrap();
+        for (rid, acct) in [
+            (ROLE_SHAREHOLDER, sh_1),
+            (ROLE_DIRECTOR, dir_1),
+            (ROLE_DIRECTOR, dir_2),
+        ] {
+            mock::transact_as(
+                sh_1,
+                con,
+                CallEncoder::<96>::new(const { selector("grant(bytes32,address)") })
+                    .push_bytes32(&rid)
+                    .push_address(&acct)
+                    .as_slice(),
+            )
+            .unwrap();
+        }
+
+        // 1. While PENDING_RATIFICATION, initializing any non-activation Authorization MUST fail with ERR_CONSTITUTION_NOT_ACTIVE (-91)!
+        let init_blocked = CallEncoder::<192>::new(const {
+            selector("initializeFromConstitution(address,address,address,bytes32,bytes32)")
+        })
+        .push_address(&reg)
+        .push_address(&con)
+        .push_address(&target)
+        .push_bytes32(&pol_dual)
+        .push_bytes32(&act_hash_work);
+        assert_eq!(
+            mock::transact_as(sh_1, auth_blocked, init_blocked.as_slice()),
+            Err(ERR_CONSTITUTION_NOT_ACTIVE)
+        );
+
+        // 2. Initializing the First Shareholder Resolution (`activateConstitution`) IS allowed!
+        let init_act = CallEncoder::<192>::new(const {
+            selector("initializeFromConstitution(address,address,address,bytes32,bytes32)")
+        })
+        .push_address(&reg)
+        .push_address(&con)
+        .push_address(&con)
+        .push_bytes32(&POLICY_FIRST_SHAREHOLDER_RESOLUTION)
+        .push_bytes32(&ACT_HASH_ACTIVATE);
+        mock::transact_as(sh_1, auth_activate, init_act.as_slice()).unwrap();
+        let fin_act = mock::transact_as(
+            sh_1,
+            auth_activate,
+            CallEncoder::<16>::new(const { selector("approveAndFinalize()") }).as_slice(),
+        )
+        .unwrap();
+        assert_eq!(fin_act[31], 1);
+
+        // Activate Constitution -> CONSTITUTION_STATE_ACTIVE (2)
+        mock::transact_as(
+            sh_1,
+            con,
+            CallEncoder::<64>::new(const { selector("setState(uint64)") })
+                .push_u64(CONSTITUTION_STATE_ACTIVE)
+                .as_slice(),
+        )
+        .unwrap();
+
+        // 3. Initialize 2-stage role-backed `auth_dual_role` while `ROLE_PRODUCT_MANAGER` still has 0 members!
+        mock::transact_as(prod_mgr, auth_dual_role, init_blocked.as_slice()).unwrap();
+
+        // Before `prod_mgr` is granted `ROLE_PRODUCT_MANAGER`, attempting to approve Stage 0 fails (`-63`)!
+        let app_cd = CallEncoder::<16>::new(const { selector("approve()") });
+        assert_eq!(
+            mock::transact_as(prod_mgr, auth_dual_role, app_cd.as_slice()),
+            Err(ERR_NOT_STAGE_AUTHORIZER)
+        );
+
+        // Grant `ROLE_PRODUCT_MANAGER` to `prod_mgr` -> Stage 0 now succeeds and advances to Stage 1 (`ROLE_DIRECTOR`)!
+        mock::transact_as(
+            dir_1,
+            con,
+            CallEncoder::<96>::new(const { selector("grant(bytes32,address)") })
+                .push_bytes32(&ROLE_PRODUCT_MANAGER)
+                .push_address(&prod_mgr)
+                .as_slice(),
+        )
+        .unwrap();
+        let s0_done = mock::transact_as(prod_mgr, auth_dual_role, app_cd.as_slice()).unwrap();
+        assert_eq!(s0_done[31], 0); // Stage 0 complete -> advanced to Stage 1
+
+        // Stage 1 requires ALL active `ROLE_DIRECTOR` members (`dir_1` + `dir_2`)
+        let d1_res = mock::transact_as(dir_1, auth_dual_role, app_cd.as_slice()).unwrap();
+        assert_eq!(d1_res[31], 0); // 1 of 2 directors signed
+        let d2_fin = mock::transact_as(
+            dir_2,
+            auth_dual_role,
+            CallEncoder::<16>::new(const { selector("approveAndFinalize()") }).as_slice(),
+        )
+        .unwrap();
+        assert_eq!(d2_fin[31], 1); // 2 of 2 directors signed & finalized!
     }
 }

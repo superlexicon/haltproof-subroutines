@@ -23,9 +23,10 @@ use hps_sdk::abi::CalldataReader;
 use hps_sdk::call::{self, CallEncoder};
 use hps_sdk::governance::{
     require_valid_identity, verify_and_consume_auth, ActionHasher, ACTION_RESTOCK_PRODUCT,
-    ACTION_SET_PRODUCT_PRICE, ACTION_UPSERT_PRODUCT, ERR_CONSTITUTION_MISMATCH,
-    ERR_INSUFFICIENT_PRODUCT_UNITS, ERR_INVALID_PRODUCT_PARAMS, ERR_MISSING_ROLE,
-    ERR_PRODUCT_NOT_FOUND, POLICY_PRODUCT_ORACLE, ROLE_PRODUCT_MANAGER,
+    ACTION_SET_PRODUCT_PRICE, ACTION_UPSERT_PRODUCT, CONSTITUTION_STATE_ACTIVE,
+    ERR_CONSTITUTION_MISMATCH, ERR_CONSTITUTION_NOT_ACTIVE, ERR_INSUFFICIENT_PRODUCT_UNITS,
+    ERR_INVALID_PRODUCT_PARAMS, ERR_MISSING_ROLE, ERR_PRODUCT_NOT_FOUND,
+    POLICY_PRODUCT_MANAGEMENT, POLICY_PRODUCT_ORACLE, ROLE_PRODUCT_MANAGER,
 };
 use hps_sdk::storage::KeyBuilder;
 use hps_sdk::{context, event_topic, events, hps_entry, ret, selector, storage};
@@ -221,6 +222,13 @@ fn require_product_oracle_auth(
     auth_obj: &[u8; 20],
     caller: &[u8; 20],
 ) -> Result<(), i32> {
+    let st_cd = CallEncoder::<16>::new(const { selector("state()") });
+    if let Ok(st) = call::call_u64(constitution, st_cd.as_slice()) {
+        if st != CONSTITUTION_STATE_ACTIVE {
+            return Err(ERR_CONSTITUTION_NOT_ACTIVE);
+        }
+    }
+
     if *caller == *constitution {
         return Ok(());
     }
@@ -230,6 +238,8 @@ fn require_product_oracle_auth(
         let policy_id = if let Ok(raw_pid) = call::call_raw(auth_obj, pid_cd.as_slice()) {
             if raw_pid.len() >= 32 && raw_pid[..32] == ROLE_PRODUCT_MANAGER {
                 ROLE_PRODUCT_MANAGER
+            } else if raw_pid.len() >= 32 && raw_pid[..32] == POLICY_PRODUCT_MANAGEMENT {
+                POLICY_PRODUCT_MANAGEMENT
             } else {
                 POLICY_PRODUCT_ORACLE
             }

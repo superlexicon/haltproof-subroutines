@@ -30,6 +30,7 @@ pub enum AbiValue {
     Uint(U256),
     Bool(bool),
     Address(H160),
+    Bytes4([u8; 4]),
     Bytes32([u8; 32]),
     Bytes(Vec<u8>),
 }
@@ -87,6 +88,20 @@ pub fn parse_typed_arg(ty: &str, raw: &str) -> Result<AbiValue> {
                 bail!("address must be 20 bytes (got {})", bytes.len());
             }
             Ok(AbiValue::Address(H160::from_slice(&bytes)))
+        }
+        "bytes4" => {
+            if let Some(sig) = raw.trim().strip_prefix("sig:") {
+                let (canonical, _) = parse_signature(sig)?;
+                Ok(AbiValue::Bytes4(function_selector(&canonical)))
+            } else {
+                let clean = raw.trim().strip_prefix("0x").unwrap_or(raw.trim());
+                let bytes =
+                    hex::decode(clean).with_context(|| format!("invalid bytes4 hex '{raw}'"))?;
+                if bytes.len() != 4 {
+                    bail!("bytes4 must be 4 bytes (got {})", bytes.len());
+                }
+                Ok(AbiValue::Bytes4([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            }
         }
         "bytes32" => {
             if let Some(hex_str) = raw.trim().strip_prefix("0x") {
@@ -169,6 +184,11 @@ pub fn encode_values(canonical_sig: &str, values: &[AbiValue]) -> Vec<u8> {
             AbiValue::Address(a) => {
                 let mut w = [0u8; 32];
                 w[12..32].copy_from_slice(a.as_bytes());
+                head.extend_from_slice(&w);
+            }
+            AbiValue::Bytes4(b) => {
+                let mut w = [0u8; 32];
+                w[0..4].copy_from_slice(b);
                 head.extend_from_slice(&w);
             }
             AbiValue::Bytes32(b) => {

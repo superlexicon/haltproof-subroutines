@@ -550,6 +550,12 @@ pub mod call {
             self.push_word(b)
         }
 
+        pub fn push_bytes4(self, sel: &[u8; 4]) -> Self {
+            let mut w = [0u8; 32];
+            w[0..4].copy_from_slice(sel);
+            self.push_word(&w)
+        }
+
         pub fn push_dynamic_bytes_tail(mut self, data: &[u8]) -> Self {
             let mut len_word = [0u8; 32];
             len_word[24..32].copy_from_slice(&(data.len() as u64).to_be_bytes());
@@ -709,6 +715,13 @@ pub mod ret {
         write(word);
     }
 
+    /// Return an ABI-encoded 4-byte `bytes4` selector word (right-padded with 28 zero bytes).
+    pub fn write_bytes4(sel: &[u8; 4]) {
+        let mut word = [0u8; 32];
+        word[0..4].copy_from_slice(sel);
+        write(&word);
+    }
+
     /// Return ABI-encoded dynamic `bytes` / `string` (`[offset=0x20][len][padded_data]`).
     pub fn write_abi_bytes(data: &[u8]) {
         #[cfg(target_arch = "wasm32")]
@@ -819,6 +832,15 @@ pub mod abi {
         /// Read `bytes32` at argument position `index`.
         pub fn bytes32(&self, index: usize) -> Option<[u8; 32]> {
             self.word(index)
+        }
+
+        /// Read 4-byte `bytes4` selector at argument position `index` (validates trailing 28 zero bytes).
+        pub fn bytes4(&self, index: usize) -> Option<[u8; 4]> {
+            let w = self.word(index)?;
+            if w[4..32] != [0u8; 28] {
+                return None;
+            }
+            Some([w[0], w[1], w[2], w[3]])
         }
 
         /// Read 20-byte `address` at argument position `index` (validates upper 12 zero bytes).

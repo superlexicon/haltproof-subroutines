@@ -69,6 +69,9 @@ hps_entry! {
     "removeDirector(address,address,address)"                                         => handle_remove_director,
     "grantRole(address,bytes32,address,address)"                                      => handle_grant_role,
     "revokeRole(address,bytes32,address,address)"                                     => handle_revoke_role,
+    "defineRole(address,bytes32,address)"                                             => handle_define_role,
+    "setFunctionAuth(address,bytes4,bytes32,address)"                                 => handle_set_function_auth,
+    "activateConstitution(address,address)"                                           => handle_activate_constitution,
     "owner()"                                                                         => handle_owner,
     "isAuthorized(address)"                                                           => handle_is_authorized,
     "hasApprovedAuth(address)"                                                        => handle_has_approved_auth,
@@ -827,6 +830,57 @@ fn handle_revoke_role(args: &CalldataReader) -> Result<(), i32> {
         .push_address(&board_auth);
     let new_count = call::call_u64(&constitution, sub_cd.as_slice())?;
     ret::write_u64_word(new_count);
+    Ok(())
+}
+
+fn handle_define_role(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let constitution = args.address(0).ok_or(-3)?;
+    let role_id = args.bytes32(1).ok_or(-3)?;
+    let auth_obj = args.address(2).ok_or(-3)?;
+
+    let sub_cd = CallEncoder::<96>::new(const { selector("defineRole(bytes32,address)") })
+        .push_bytes32(&role_id)
+        .push_address(&auth_obj);
+    let total_roles = call::call_u64(&constitution, sub_cd.as_slice())?;
+    ret::write_u64_word(total_roles);
+    Ok(())
+}
+
+fn handle_set_function_auth(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let constitution = args.address(0).ok_or(-3)?;
+    let fn_selector = args.bytes4(1).ok_or(-3)?;
+    let policy_id = args.bytes32(2).ok_or(-3)?;
+    let auth_obj = args.address(3).ok_or(-3)?;
+
+    let sub_cd = CallEncoder::<128>::new(const {
+        selector("setFunctionAuth(bytes4,bytes32,address)")
+    })
+    .push_bytes4(&fn_selector)
+    .push_bytes32(&policy_id)
+    .push_address(&auth_obj);
+    let ok = call::call_bool(&constitution, sub_cd.as_slice())?;
+    if !ok {
+        return Err(-24);
+    }
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_activate_constitution(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let constitution = args.address(0).ok_or(-3)?;
+    let shareholder_auth = args.address(1).ok_or(-3)?;
+
+    let sub_cd =
+        CallEncoder::<64>::new(const { selector("activateConstitution(address)") })
+            .push_address(&shareholder_auth);
+    let ok = call::call_bool(&constitution, sub_cd.as_slice())?;
+    if !ok {
+        return Err(-24);
+    }
+    ret::write_bool(true);
     Ok(())
 }
 

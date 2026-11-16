@@ -365,8 +365,8 @@ async fn full_institutional_governance_ledger_and_otc_on_localtestnet() {
     }
     println!("[2/10] Instantiated & initialized 9 Identity HPS contracts (Admin={admin_id:?}, Seller={seller_id:?}, Buyer={buyer_id:?})");
 
-    // Batch-instantiate 9 fresh one-time Authorization HPS instances up front for all test phases
-    let auth_specs: Vec<_> = (0..9).map(|_| (auth_code, Vec::new())).collect();
+    // Batch-instantiate 10 fresh one-time Authorization HPS instances up front for all test phases
+    let auth_specs: Vec<_> = (0..10).map(|_| (auth_code, Vec::new())).collect();
     let auths = client.instantiate_batch(&deployer, &auth_specs).await.unwrap();
     let (
         auth_reg_new_member,
@@ -378,8 +378,10 @@ async fn full_institutional_governance_ledger_and_otc_on_localtestnet() {
         auth_super_const,
         auth_approve_gold,
         auth_approve_usd,
+        auth_activate_const,
     ) = (
         auths[0], auths[1], auths[2], auths[3], auths[4], auths[5], auths[6], auths[7], auths[8],
+        auths[9],
     );
 
     // -------------------------------------------------------------------------
@@ -590,7 +592,81 @@ async fn full_institutional_governance_ledger_and_otc_on_localtestnet() {
         .await,
         1
     );
-    println!("[4/10] Constitution initialized with SUPER_GOVERNANCE, 2-stage weighted ACTION_ISSUE, and 2-stage ACTION_CANCEL");
+    // Newly constructed Constitution starts in PENDING_RATIFICATION (1) until First Shareholder Resolution passes
+    assert_eq!(read_u64(&client, constitution_hps, "state()", &[]).await, 1);
+    assert_eq!(read_u64(&client, constitution_hps, "isActive()", &[]).await, 0);
+
+    let act_con_hash = read_b32(&client, constitution_hps, "hashActivateConstitution()", &[]).await;
+    assert!(
+        client
+            .send_call(
+                &super1_eoa,
+                super1_id,
+                &encode_values(
+                    "initConstitutionAuth(address,address,address,address,bytes32,bytes32)",
+                    &[
+                        AbiValue::Address(auth_activate_const),
+                        AbiValue::Address(registry_hps),
+                        AbiValue::Address(constitution_hps),
+                        AbiValue::Address(constitution_hps),
+                        AbiValue::Bytes32(POLICY_SUPER_GOVERNANCE),
+                        AbiValue::Bytes32(act_con_hash),
+                    ],
+                ),
+            )
+            .await
+            .unwrap()
+            .status,
+        "initConstitutionAuth for activateConstitution failed"
+    );
+    assert!(
+        client
+            .send_call(
+                &super1_eoa,
+                super1_id,
+                &encode_values("approveAuth(address)", &[AbiValue::Address(auth_activate_const)]),
+            )
+            .await
+            .unwrap()
+            .status,
+        "super1 approveAuth for activateConstitution failed"
+    );
+    assert!(
+        client
+            .send_call(
+                &super2_eoa,
+                super2_id,
+                &encode_values(
+                    "approveAndFinalizeAuth(address)",
+                    &[AbiValue::Address(auth_activate_const)],
+                ),
+            )
+            .await
+            .unwrap()
+            .status,
+        "super2 approveAndFinalizeAuth for activateConstitution failed"
+    );
+    assert!(
+        client
+            .send_call(
+                &super1_eoa,
+                super1_id,
+                &encode_values(
+                    "activateConstitution(address,address)",
+                    &[
+                        AbiValue::Address(constitution_hps),
+                        AbiValue::Address(auth_activate_const),
+                    ],
+                ),
+            )
+            .await
+            .unwrap()
+            .status,
+        "activateConstitution failed"
+    );
+    assert_eq!(read_u64(&client, constitution_hps, "state()", &[]).await, 2);
+    assert_eq!(read_u64(&client, constitution_hps, "isActive()", &[]).await, 1);
+    println!("[4/10] Constitution initialized & ratified via First Shareholder Resolution with SUPER_GOVERNANCE, 2-stage weighted ACTION_ISSUE, and 2-stage ACTION_CANCEL");
 
     // -------------------------------------------------------------------------
     // STEP 5: Instantiate & initialize GOLD and USD AssetLedgers with genesis balances & permissions
@@ -1513,6 +1589,7 @@ async fn simplex_hps_gas_usage_profile_on_localtestnet() {
             AbiValue::Uint(U256::from(100u64)),
         ],
     );
+    let act_hash_profile = read_b32(&client, constitution, "hashActivateConstitution()", &[]).await;
     let cd_auth_init = encode_values(
         "initConstitutionAuth(address,address,address,address,bytes32,bytes32)",
         &[
@@ -1521,7 +1598,7 @@ async fn simplex_hps_gas_usage_profile_on_localtestnet() {
             AbiValue::Address(constitution),
             AbiValue::Address(constitution),
             AbiValue::Bytes32(POLICY_SUPER_GOVERNANCE),
-            AbiValue::Bytes32([0x55; 32]),
+            AbiValue::Bytes32(act_hash_profile),
         ],
     );
 
@@ -1557,6 +1634,19 @@ async fn simplex_hps_gas_usage_profile_on_localtestnet() {
         .await
         .unwrap();
 
+    // Batch 6: Activate Constitution via First Shareholder Resolution (`activateConstitution`)
+    let cd_con_activate = encode_values(
+        "activateConstitution(address,address)",
+        &[AbiValue::Address(constitution), AbiValue::Address(auth_hps)],
+    );
+    let b6 = client
+        .send_call_batch(
+            &deployer,
+            &[(alice_id, cd_con_activate.clone(), vec![constitution, registry, auth_hps])],
+        )
+        .await
+        .unwrap();
+
     let rows = vec![
         ("Identity", "owner() [view]", &cd_id_owner, &b2[0]),
         ("Identity", "isAuthorized(address) [view]", &cd_id_is_auth, &b2[1]),
@@ -1572,6 +1662,7 @@ async fn simplex_hps_gas_usage_profile_on_localtestnet() {
         ("Constitution", "hasPolicy(address,bytes32) [view]", &cd_con_haspol, &b4[1]),
         ("Constitution", "hashAddDirector(address) [pure action_commit_256]", &cd_con_hash_add, &b4[2]),
         ("Constitution", "initialize(registry, 1 policy) [via Identity]", &cd_con_init, &b3[4]),
+        ("Constitution", "activateConstitution(auth) [via Identity]", &cd_con_activate, &b6[0]),
         ("Authorization", "status() [view]", &cd_auth_state, &b5[0]),
         ("Authorization", "initConstitutionAuth(...) [via Identity]", &cd_auth_init, &b4[6]),
         ("Authorization", "approveAndFinalizeAuth(...) [1-stage via Identity]", &cd_auth_approve_fin, &b5[1]),
@@ -1636,7 +1727,7 @@ async fn product_ledger_and_accounting_ledger_e2e_on_localtestnet() {
     let dex_code = client.store_bytecode(&deployer, &dex_wasm).await.unwrap();
 
     // Instantiate: 6 Identities, 1 IdentityRegistry, 1 Constitution, 1 Bank AssetLedger,
-    // 1 AccountingLedger, 1 ProductLedger, 2 Authorization instances
+    // 1 AccountingLedger, 1 ProductLedger, 3 Authorization instances
     let insts = client
         .instantiate_batch(
             &deployer,
@@ -1652,6 +1743,7 @@ async fn product_ledger_and_accounting_ledger_e2e_on_localtestnet() {
                 (led_code, Vec::new()),
                 (acc_code, Vec::new()),
                 (prod_code, Vec::new()),
+                (auth_code, Vec::new()),
                 (auth_code, Vec::new()),
                 (auth_code, Vec::new()),
             ],
@@ -1672,6 +1764,7 @@ async fn product_ledger_and_accounting_ledger_e2e_on_localtestnet() {
     let product_ledger = insts[10];
     let board_auth = insts[11];
     let restock_auth = insts[12];
+    let activate_con_auth = insts[13];
 
     // Step 1: Initialize Identities + IdentityRegistry
     let mut id_bytes = Vec::new();
@@ -1874,19 +1967,6 @@ async fn product_ledger_and_accounting_ledger_e2e_on_localtestnet() {
                 (
                     mano_id,
                     encode_values(
-                        "setClearingAccount(address,address,address,address)",
-                        &[
-                            AbiValue::Address(constitution),
-                            AbiValue::Address(bank_ledger),
-                            AbiValue::Address(clearing_acct_id),
-                            AbiValue::Address(H160::zero()),
-                        ],
-                    ),
-                    vec![constitution, registry, bank_ledger, clearing_acct_id],
-                ),
-                (
-                    mano_id,
-                    encode_values(
                         "execute(address,bytes)",
                         &[AbiValue::Address(accounting_ledger), AbiValue::Bytes(init_acc_inner)],
                     ),
@@ -1904,6 +1984,93 @@ async fn product_ledger_and_accounting_ledger_e2e_on_localtestnet() {
         )
         .await
         .unwrap();
+
+    // Verify Constitution starts in PENDING_RATIFICATION (state == 1, isActive == 0)
+    // and calling setClearingAccount before passing the First Shareholder Resolution reverts!
+    assert_eq!(read_u64(&client, constitution, "state()", &[]).await, 1);
+    assert_eq!(read_u64(&client, constitution, "isActive()", &[]).await, 0);
+    let set_clearing_cd = encode_values(
+        "setClearingAccount(address,address,address,address)",
+        &[
+            AbiValue::Address(constitution),
+            AbiValue::Address(bank_ledger),
+            AbiValue::Address(clearing_acct_id),
+            AbiValue::Address(H160::zero()),
+        ],
+    );
+    let pre_activate_rcpt = client
+        .send_call_with_targets(
+            &deployer,
+            mano_id,
+            &set_clearing_cd,
+            &[constitution, registry, bank_ledger, clearing_acct_id],
+        )
+        .await
+        .unwrap();
+    assert!(
+        !pre_activate_rcpt.status,
+        "setClearingAccount before First Shareholder Resolution activation MUST revert"
+    );
+
+    // Pass First Shareholder Resolution (`activateConstitution`) and then configure clearing account
+    let hash_activate_con = read_b32(&client, constitution, "hashActivateConstitution()", &[]).await;
+    let act_rcpts = client
+        .send_call_batch(
+            &deployer,
+            &[
+                (
+                    mano_id,
+                    encode_values(
+                        "initConstitutionAuth(address,address,address,address,bytes32,bytes32)",
+                        &[
+                            AbiValue::Address(activate_con_auth),
+                            AbiValue::Address(registry),
+                            AbiValue::Address(constitution),
+                            AbiValue::Address(constitution),
+                            AbiValue::Bytes32(POLICY_SUPER_GOVERNANCE),
+                            AbiValue::Bytes32(hash_activate_con),
+                        ],
+                    ),
+                    vec![activate_con_auth, registry, constitution],
+                ),
+                (
+                    mano_id,
+                    encode_values("approveAuth(address)", &[AbiValue::Address(activate_con_auth)]),
+                    vec![activate_con_auth, registry, constitution],
+                ),
+                (
+                    evelyn_id,
+                    encode_values(
+                        "approveAndFinalizeAuth(address)",
+                        &[AbiValue::Address(activate_con_auth)],
+                    ),
+                    vec![activate_con_auth, registry, constitution],
+                ),
+                (
+                    mano_id,
+                    encode_values(
+                        "activateConstitution(address,address)",
+                        &[
+                            AbiValue::Address(constitution),
+                            AbiValue::Address(activate_con_auth),
+                        ],
+                    ),
+                    vec![constitution, registry, activate_con_auth],
+                ),
+                (
+                    mano_id,
+                    set_clearing_cd,
+                    vec![constitution, registry, bank_ledger, clearing_acct_id],
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+    for (idx, r) in act_rcpts.iter().enumerate() {
+        assert!(r.status, "First Shareholder Resolution activation batch tx {idx} failed");
+    }
+    assert_eq!(read_u64(&client, constitution, "state()", &[]).await, 2);
+    assert_eq!(read_u64(&client, constitution, "isActive()", &[]).await, 1);
 
     // Step 3: Negative check before role assignment — `catalog_oracle_id` does not yet hold
     // `ROLE_PRODUCT_MANAGER`, so attempting to restock a product MUST revert!
@@ -2912,4 +3079,944 @@ async fn product_ledger_and_accounting_ledger_e2e_on_localtestnet() {
     );
 
     println!("[ProductLedger, AccountingLedger, Futures Underwriting & DEX CLOB E2E] All checks passed! P* = 10 SGD, V* = 1,000 units (200 @ $12 + 400 @ $10 blk N1 + 100/300 pro-rata @ $10 blk N2).");
+}
+
+#[tokio::test]
+#[ignore = "requires local lexicon-node binary; run with --ignored"]
+async fn initialize_with_governance_roles_function_auth_and_ratification_e2e_on_localtestnet() {
+    use hps_client::abi::function_selector;
+    use hps_sdk::governance::{
+        FunctionAuthRule, ShareClassSpec, CONSTITUTION_STATE_ACTIVE,
+        CONSTITUTION_STATE_PENDING_RATIFICATION, POLICY_BOARD_RESOLUTION,
+        POLICY_FIRST_SHAREHOLDER_RESOLUTION, POLICY_PRODUCT_MANAGEMENT, ROLE_ALL_MEMBERS_WEIGHT,
+        ROLE_DIRECTOR, ROLE_PRODUCT_MANAGER, ROLE_SHAREHOLDER,
+    };
+
+    let _node = spawn_isolated_localtestnet();
+    let rpc_url = format!("http://127.0.0.1:{TEST_RPC_PORT}");
+    let client = HpsClient::new(&rpc_url);
+
+    for _ in 0..40 {
+        if client.block_number().await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    let dist = workspace_root().join("dist");
+    let identity_wasm = std::fs::read(dist.join("identity.wasm")).unwrap();
+    let registry_wasm = std::fs::read(dist.join("identity_registry.wasm")).unwrap();
+    let constitution_wasm = std::fs::read(dist.join("constitution.wasm")).unwrap();
+    let auth_wasm = std::fs::read(dist.join("authorization.wasm")).unwrap();
+    let ledger_wasm = std::fs::read(dist.join("asset_ledger.wasm")).unwrap();
+    let product_wasm = std::fs::read(dist.join("product_ledger.wasm")).unwrap();
+    let accounting_wasm = std::fs::read(dist.join("accounting_ledger.wasm")).unwrap();
+
+    let mut deployer = HpsSigner::from_hex(DEFAULT_DEV_PRIVATE_KEY, DEFAULT_CHAIN_ID).unwrap();
+    deployer.default_gas_limit = U256::from(5_000_000u64);
+
+    let id_code = client.store_bytecode(&deployer, &identity_wasm).await.unwrap();
+    let reg_code = client.store_bytecode(&deployer, &registry_wasm).await.unwrap();
+    let con_code = client.store_bytecode(&deployer, &constitution_wasm).await.unwrap();
+    let auth_code = client.store_bytecode(&deployer, &auth_wasm).await.unwrap();
+    let led_code = client.store_bytecode(&deployer, &ledger_wasm).await.unwrap();
+    let prod_code = client.store_bytecode(&deployer, &product_wasm).await.unwrap();
+    let acc_code = client.store_bytecode(&deployer, &accounting_wasm).await.unwrap();
+
+    // Instantiate 6 Identities (sh_a, sh_b, dir_1, dir_2, pm_candidate, cfo_candidate),
+    // Registry, Constitution, Share AssetLedger, AccountingLedger, ProductLedger, and 9 Auth objects
+    let mut specs = vec![
+        (id_code, Vec::new()),
+        (id_code, Vec::new()),
+        (id_code, Vec::new()),
+        (id_code, Vec::new()),
+        (id_code, Vec::new()),
+        (id_code, Vec::new()),
+        (reg_code, Vec::new()),
+        (con_code, Vec::new()),
+        (led_code, Vec::new()),
+        (acc_code, Vec::new()),
+        (prod_code, Vec::new()),
+    ];
+    for _ in 0..9 {
+        specs.push((auth_code, Vec::new()));
+    }
+    let insts = client.instantiate_batch(&deployer, &specs).await.unwrap();
+    let sh_a = insts[0];
+    let sh_b = insts[1];
+    let dir_1 = insts[2];
+    let dir_2 = insts[3];
+    let pm_candidate = insts[4];
+    let cfo_candidate = insts[5];
+    let registry = insts[6];
+    let constitution = insts[7];
+    let slx_common = insts[8];
+    let accounting_ledger = insts[9];
+    let product_ledger = insts[10];
+    let auth_pre_act_board = insts[11];
+    let auth_activate = insts[12];
+    let auth_activate_dup = insts[13];
+    let auth_unassigned_pm = insts[14];
+    let auth_grant_pm = insts[15];
+    let auth_grant_cfo = insts[16];
+    let auth_upsert_pm = insts[17];
+    let auth_rotate_fn = insts[18];
+    let auth_dual_price = insts[19];
+
+    // 1. Initialize Identities + IdentityRegistry + SLX-COMMON Share Ledger (sh_a = 60,000, sh_b = 40,000)
+    let all_ids = [sh_a, sh_b, dir_1, dir_2, pm_candidate, cfo_candidate];
+    let mut reg_ids_blob = Vec::new();
+    for id in all_ids {
+        reg_ids_blob.extend_from_slice(id.as_bytes());
+    }
+    let mut share_alloc = Vec::new();
+    for (id, qty) in [(sh_a, 60_000u64), (sh_b, 40_000u64)] {
+        share_alloc.extend_from_slice(id.as_bytes());
+        share_alloc.extend_from_slice(&qty.to_be_bytes());
+    }
+    let mut share_perms = Vec::new();
+    for act in [ACTION_SUPER, ACTION_ISSUE, ACTION_CANCEL, ACTION_APPROVE] {
+        share_perms.extend_from_slice(&pack_permission(act, constitution, POLICY_SUPER_GOVERNANCE));
+    }
+    share_perms.extend_from_slice(&pack_permission(ACTION_TRANSFER, H160::zero(), POLICY_HOLDER_SELF));
+
+    let init_batch_1 = client
+        .send_call_batch(
+            &deployer,
+            &[
+                (
+                    sh_a,
+                    encode_values(
+                        "initialize(address,string)",
+                        &[AbiValue::Address(deployer.address()), AbiValue::Bytes(b"id:sh-a".to_vec())],
+                    ),
+                    vec![],
+                ),
+                (
+                    sh_b,
+                    encode_values(
+                        "initialize(address,string)",
+                        &[AbiValue::Address(deployer.address()), AbiValue::Bytes(b"id:sh-b".to_vec())],
+                    ),
+                    vec![],
+                ),
+                (
+                    dir_1,
+                    encode_values(
+                        "initialize(address,string)",
+                        &[AbiValue::Address(deployer.address()), AbiValue::Bytes(b"id:dir-1".to_vec())],
+                    ),
+                    vec![],
+                ),
+                (
+                    dir_2,
+                    encode_values(
+                        "initialize(address,string)",
+                        &[AbiValue::Address(deployer.address()), AbiValue::Bytes(b"id:dir-2".to_vec())],
+                    ),
+                    vec![],
+                ),
+                (
+                    pm_candidate,
+                    encode_values(
+                        "initialize(address,string)",
+                        &[AbiValue::Address(deployer.address()), AbiValue::Bytes(b"id:pm".to_vec())],
+                    ),
+                    vec![],
+                ),
+                (
+                    cfo_candidate,
+                    encode_values(
+                        "initialize(address,string)",
+                        &[AbiValue::Address(deployer.address()), AbiValue::Bytes(b"id:cfo".to_vec())],
+                    ),
+                    vec![],
+                ),
+                (
+                    registry,
+                    encode_values(
+                        "initialize(address,bytes32,bytes32,bytes)",
+                        &[
+                            AbiValue::Address(sh_a),
+                            AbiValue::Bytes32(id_code.0),
+                            AbiValue::Bytes32(auth_code.0),
+                            AbiValue::Bytes(reg_ids_blob),
+                        ],
+                    ),
+                    all_ids.to_vec(),
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+    for r in &init_batch_1 {
+        assert!(r.status);
+    }
+
+    // 2. Construct Constitution via `initializeWithGovernance`:
+    //    - Pre-defines ROLE_SHAREHOLDER, ROLE_DIRECTOR ([dir_1, dir_2]), ROLE_PRODUCT_MANAGER (0 members!),
+    //      and ROLE_CFO (0 members!) at construction.
+    //    - Pre-defines role-backed PolicySpecs referencing unassigned roles.
+    //    - Explicitly configures per-function required authorization policies (`FunctionAuthRule`s).
+    let role_cfo = hps_client::abi::keccak256(b"ROLE_CFO");
+    let pol_dual_pm_cfo = hps_client::abi::keccak256(b"POLICY_DUAL_PRODUCT_CFO");
+
+    let mut roles_blob = Vec::new();
+    let role_defs: &[([u8; 32], &[H160])] = &[
+        (ROLE_SHAREHOLDER, &[]),
+        (ROLE_DIRECTOR, &[dir_1, dir_2]),
+        (ROLE_PRODUCT_MANAGER, &[]),
+        (role_cfo, &[]),
+    ];
+    roles_blob.extend_from_slice(&(role_defs.len() as u16).to_be_bytes());
+    for (rid, members) in role_defs {
+        roles_blob.extend_from_slice(rid);
+        roles_blob.extend_from_slice(&(members.len() as u16).to_be_bytes());
+        for m in *members {
+            roles_blob.extend_from_slice(m.as_bytes());
+        }
+    }
+
+    // Shareholder supermajority: >= 75% of dynamic voting power across registered share classes
+    let sh_spec = PolicySpec::new(100)
+        .add_stage(StageSpec::for_role(ROLE_SHAREHOLDER, 75, 50).unwrap())
+        .unwrap();
+    // Unanimous active Directors (`ROLE_ALL_MEMBERS_WEIGHT`)
+    let board_spec = PolicySpec::new(100)
+        .add_stage(StageSpec::for_role(ROLE_DIRECTOR, ROLE_ALL_MEMBERS_WEIGHT, 50).unwrap())
+        .unwrap();
+    // Single Product Manager role approval (defined at construction with 0 members assigned yet!)
+    let pm_spec = PolicySpec::new(100)
+        .add_stage(StageSpec::for_role(ROLE_PRODUCT_MANAGER, 1, 50).unwrap())
+        .unwrap();
+    // 2-stage sequential role-backed policy: Stage 0 = ROLE_PRODUCT_MANAGER -> Stage 1 = ROLE_CFO
+    let dual_pm_cfo_spec = PolicySpec::new(100)
+        .add_stage(StageSpec::for_role(ROLE_PRODUCT_MANAGER, 1, 50).unwrap())
+        .unwrap()
+        .add_stage(StageSpec::for_role(role_cfo, 1, 50).unwrap())
+        .unwrap();
+
+    let pol_defs = [
+        (POLICY_FIRST_SHAREHOLDER_RESOLUTION, &sh_spec),
+        (POLICY_SUPER_GOVERNANCE, &sh_spec),
+        (POLICY_BOARD_RESOLUTION, &board_spec),
+        (POLICY_PRODUCT_MANAGEMENT, &pm_spec),
+        (pol_dual_pm_cfo, &dual_pm_cfo_spec),
+    ];
+    let mut policies_blob = Vec::new();
+    policies_blob.extend_from_slice(&(pol_defs.len() as u16).to_be_bytes());
+    for (pid, spec) in pol_defs {
+        policies_blob.extend_from_slice(&encode_constitution_entry(H160::zero(), pid, spec));
+    }
+
+    let sel_activate = function_selector("activateConstitution(address)");
+    let sel_set_fn_auth = function_selector("setFunctionAuth(bytes4,bytes32,address)");
+    let sel_define_role = function_selector("defineRole(bytes32,address)");
+    let sel_grant_role = function_selector("grantRole(bytes32,address,address)");
+    let sel_upsert_prod =
+        function_selector("upsertProduct(address,bytes32,uint64,uint64,bytes,address)");
+    let sel_set_price = function_selector("setProductPrice(address,bytes32,uint64,address)");
+
+    let fn_rules = [
+        FunctionAuthRule {
+            fn_selector: sel_activate,
+            policy_id: POLICY_FIRST_SHAREHOLDER_RESOLUTION,
+        },
+        FunctionAuthRule {
+            fn_selector: sel_set_fn_auth,
+            policy_id: POLICY_SUPER_GOVERNANCE,
+        },
+        FunctionAuthRule {
+            fn_selector: sel_define_role,
+            policy_id: POLICY_BOARD_RESOLUTION,
+        },
+        FunctionAuthRule {
+            fn_selector: sel_grant_role,
+            policy_id: POLICY_BOARD_RESOLUTION,
+        },
+        FunctionAuthRule {
+            fn_selector: sel_upsert_prod,
+            policy_id: POLICY_PRODUCT_MANAGEMENT,
+        },
+        FunctionAuthRule {
+            fn_selector: sel_set_price,
+            policy_id: POLICY_PRODUCT_MANAGEMENT,
+        },
+    ];
+    let mut fn_auths_blob = Vec::new();
+    fn_auths_blob.extend_from_slice(&(fn_rules.len() as u16).to_be_bytes());
+    for rule in &fn_rules {
+        fn_auths_blob.extend_from_slice(&rule.encode());
+    }
+
+    let mut share_classes_blob = Vec::new();
+    share_classes_blob.extend_from_slice(&1u16.to_be_bytes());
+    share_classes_blob.extend_from_slice(
+        &ShareClassSpec {
+            ledger: h160_bytes(slx_common),
+            votes_per_share: 1,
+            conversion_numer: 1,
+            conversion_denom: 1,
+        }
+        .encode(),
+    );
+
+    let init_batch_2 = client
+        .send_call_batch(
+            &deployer,
+            &[
+                (
+                    sh_a,
+                    encode_values(
+                        "execute(address,bytes)",
+                        &[
+                            AbiValue::Address(slx_common),
+                            AbiValue::Bytes(encode_values(
+                                "initialize(address,string,uint64,bytes,bytes)",
+                                &[
+                                    AbiValue::Address(registry),
+                                    AbiValue::Bytes(b"SLX-COMMON".to_vec()),
+                                    AbiValue::Uint(U256::from(0u64)),
+                                    AbiValue::Bytes(share_alloc),
+                                    AbiValue::Bytes(share_perms),
+                                ],
+                            )),
+                        ],
+                    ),
+                    vec![slx_common, registry, constitution, sh_a, sh_b],
+                ),
+                (
+                    sh_a,
+                    encode_values(
+                        "execute(address,bytes)",
+                        &[
+                            AbiValue::Address(constitution),
+                            AbiValue::Bytes(encode_values(
+                                "initializeWithGovernance(address,bytes,bytes,bytes,bytes)",
+                                &[
+                                    AbiValue::Address(registry),
+                                    AbiValue::Bytes(roles_blob),
+                                    AbiValue::Bytes(policies_blob),
+                                    AbiValue::Bytes(fn_auths_blob),
+                                    AbiValue::Bytes(share_classes_blob),
+                                ],
+                            )),
+                        ],
+                    ),
+                    vec![constitution, registry, sh_a, dir_1, dir_2],
+                ),
+                (
+                    sh_a,
+                    encode_values(
+                        "execute(address,bytes)",
+                        &[
+                            AbiValue::Address(accounting_ledger),
+                            AbiValue::Bytes(encode_values(
+                                "initialize(address,address,address)",
+                                &[
+                                    AbiValue::Address(registry),
+                                    AbiValue::Address(constitution),
+                                    AbiValue::Address(product_ledger),
+                                ],
+                            )),
+                        ],
+                    ),
+                    vec![accounting_ledger, registry, constitution, product_ledger],
+                ),
+                (
+                    sh_a,
+                    encode_values(
+                        "execute(address,bytes)",
+                        &[
+                            AbiValue::Address(product_ledger),
+                            AbiValue::Bytes(encode_values(
+                                "initialize(address,address,address,bytes)",
+                                &[
+                                    AbiValue::Address(registry),
+                                    AbiValue::Address(constitution),
+                                    AbiValue::Address(accounting_ledger),
+                                    AbiValue::Bytes(Vec::new()),
+                                ],
+                            )),
+                        ],
+                    ),
+                    vec![product_ledger, registry, constitution, accounting_ledger],
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+    for (idx, r) in init_batch_2.iter().enumerate() {
+        assert!(r.status, "init_batch_2 tx {idx} failed");
+    }
+
+    // 3. Verify pre-activation state, pre-defined unassigned roles, and per-function auth mappings
+    assert_eq!(
+        read_u64(&client, constitution, "state()", &[]).await,
+        CONSTITUTION_STATE_PENDING_RATIFICATION
+    );
+    assert_eq!(read_u64(&client, constitution, "isActive()", &[]).await, 0);
+    assert_eq!(read_u64(&client, constitution, "isValid()", &[]).await, 0);
+    assert_eq!(read_u64(&client, constitution, "definedRoleCount()", &[]).await, 4);
+    assert_eq!(
+        read_u64(
+            &client,
+            constitution,
+            "isRoleDefined(bytes32)",
+            &[AbiValue::Bytes32(ROLE_PRODUCT_MANAGER)]
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        read_u64(
+            &client,
+            constitution,
+            "isRoleDefined(bytes32)",
+            &[AbiValue::Bytes32(role_cfo)]
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        read_u64(
+            &client,
+            constitution,
+            "roleMemberCount(bytes32)",
+            &[AbiValue::Bytes32(ROLE_PRODUCT_MANAGER)]
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        read_b32(
+            &client,
+            constitution,
+            "getFunctionAuth(bytes4)",
+            &[AbiValue::Bytes4(sel_set_price)]
+        )
+        .await,
+        POLICY_PRODUCT_MANAGEMENT
+    );
+
+    // Negative check: initializing a non-activation Board Authorization BEFORE First Shareholder Resolution MUST revert!
+    let hash_grant_pm = read_b32(
+        &client,
+        constitution,
+        "hashGrantRole(bytes32,address)",
+        &[
+            AbiValue::Bytes32(ROLE_PRODUCT_MANAGER),
+            AbiValue::Address(pm_candidate),
+        ],
+    )
+    .await;
+    let pre_act_board_rcpt = client
+        .send_call_with_targets(
+            &deployer,
+            dir_1,
+            &encode_values(
+                "initConstitutionAuth(address,address,address,address,bytes32,bytes32)",
+                &[
+                    AbiValue::Address(auth_pre_act_board),
+                    AbiValue::Address(registry),
+                    AbiValue::Address(constitution),
+                    AbiValue::Address(constitution),
+                    AbiValue::Bytes32(POLICY_BOARD_RESOLUTION),
+                    AbiValue::Bytes32(hash_grant_pm),
+                ],
+            ),
+            &[auth_pre_act_board, registry, constitution],
+        )
+        .await
+        .unwrap();
+    assert!(
+        !pre_act_board_rcpt.status,
+        "Non-ratification Authorization MUST revert while Constitution is PENDING_RATIFICATION"
+    );
+
+    // 4. Pass the First Shareholder Resolution (`activateConstitution`) via dynamic `ROLE_SHAREHOLDER` voting power!
+    let hash_activate = read_b32(&client, constitution, "hashActivateConstitution()", &[]).await;
+    assert!(
+        client
+            .send_call_with_targets(
+                &deployer,
+                sh_a,
+                &encode_values(
+                    "initConstitutionAuth(address,address,address,address,bytes32,bytes32)",
+                    &[
+                        AbiValue::Address(auth_activate),
+                        AbiValue::Address(registry),
+                        AbiValue::Address(constitution),
+                        AbiValue::Address(constitution),
+                        AbiValue::Bytes32(POLICY_FIRST_SHAREHOLDER_RESOLUTION),
+                        AbiValue::Bytes32(hash_activate),
+                    ],
+                ),
+                &[auth_activate, registry, constitution],
+            )
+            .await
+            .unwrap()
+            .status
+    );
+    // `sh_a` casts 60,000 / 100,000 votes (< 75,000 required supermajority)
+    assert!(
+        client
+            .send_call_with_targets(
+                &deployer,
+                sh_a,
+                &encode_values("approveAuth(address)", &[AbiValue::Address(auth_activate)]),
+                &[auth_activate, registry, constitution, slx_common],
+            )
+            .await
+            .unwrap()
+            .status
+    );
+    assert_eq!(
+        read_u64(
+            &client,
+            auth_activate,
+            "stageWeight(uint64)",
+            &[AbiValue::Uint(U256::from(0u64))]
+        )
+        .await,
+        60_000
+    );
+    // Finalizing with only 60% votes MUST revert!
+    assert!(
+        !client
+            .send_call_with_targets(
+                &deployer,
+                sh_a,
+                &encode_values("finalizeAuth(address)", &[AbiValue::Address(auth_activate)]),
+                &[auth_activate, registry, constitution],
+            )
+            .await
+            .unwrap()
+            .status,
+        "Finalizing First Shareholder Resolution below 75% threshold MUST revert"
+    );
+    // `sh_b` casts remaining 40,000 / 100,000 = 4,000 bps (total = 10,000 bps >= 7,500 bps) & finalizes!
+    assert!(
+        client
+            .send_call_with_targets(
+                &deployer,
+                sh_b,
+                &encode_values(
+                    "approveAndFinalizeAuth(address)",
+                    &[AbiValue::Address(auth_activate)],
+                ),
+                &[auth_activate, registry, constitution, slx_common],
+            )
+            .await
+            .unwrap()
+            .status
+    );
+    // Activate the Constitution!
+    assert!(
+        client
+            .send_call_with_targets(
+                &deployer,
+                sh_a,
+                &encode_values(
+                    "activateConstitution(address,address)",
+                    &[
+                        AbiValue::Address(constitution),
+                        AbiValue::Address(auth_activate),
+                    ],
+                ),
+                &[constitution, registry, auth_activate],
+            )
+            .await
+            .unwrap()
+            .status,
+        "activateConstitution must succeed once First Shareholder Resolution is finalized"
+    );
+    assert_eq!(
+        read_u64(&client, constitution, "state()", &[]).await,
+        CONSTITUTION_STATE_ACTIVE
+    );
+    assert_eq!(read_u64(&client, constitution, "isActive()", &[]).await, 1);
+    assert_eq!(read_u64(&client, constitution, "isValid()", &[]).await, 1);
+    assert!(read_u64(&client, constitution, "activatedAtBlock()", &[]).await > 0);
+
+    // Duplicate activation MUST revert!
+    assert!(
+        !client
+            .send_call_with_targets(
+                &deployer,
+                sh_a,
+                &encode_values(
+                    "activateConstitution(address,address)",
+                    &[
+                        AbiValue::Address(constitution),
+                        AbiValue::Address(auth_activate_dup),
+                    ],
+                ),
+                &[constitution, registry, auth_activate_dup],
+            )
+            .await
+            .unwrap()
+            .status,
+        "Duplicate activateConstitution MUST revert"
+    );
+
+    // 5. Before any identity is assigned ROLE_PRODUCT_MANAGER, nobody (not even a Director) can
+    //    approve a `POLICY_PRODUCT_MANAGEMENT` Authorization!
+    let sku_quantum = hps_client::abi::keccak256(b"SLX-QKD-MODEM");
+    let label_quantum = b"SLX-QKD-MODEM".to_vec();
+    let hash_upsert_qkd = read_b32(
+        &client,
+        constitution,
+        "hashConUpsertProduct(address,bytes32,uint64,uint64,bytes)",
+        &[
+            AbiValue::Address(product_ledger),
+            AbiValue::Bytes32(sku_quantum),
+            AbiValue::Uint(U256::from(20u64)),
+            AbiValue::Uint(U256::from(4_000u64)),
+            AbiValue::Bytes(label_quantum.clone()),
+        ],
+    )
+    .await;
+    assert!(
+        client
+            .send_call_with_targets(
+                &deployer,
+                dir_1,
+                &encode_values(
+                    "initConstitutionAuth(address,address,address,address,bytes32,bytes32)",
+                    &[
+                        AbiValue::Address(auth_unassigned_pm),
+                        AbiValue::Address(registry),
+                        AbiValue::Address(constitution),
+                        AbiValue::Address(constitution),
+                        AbiValue::Bytes32(POLICY_PRODUCT_MANAGEMENT),
+                        AbiValue::Bytes32(hash_upsert_qkd),
+                    ],
+                ),
+                &[auth_unassigned_pm, registry, constitution],
+            )
+            .await
+            .unwrap()
+            .status
+    );
+    assert!(
+        !client
+            .send_call_with_targets(
+                &deployer,
+                dir_1,
+                &encode_values(
+                    "approveAuth(address)",
+                    &[AbiValue::Address(auth_unassigned_pm)],
+                ),
+                &[auth_unassigned_pm, registry, constitution],
+            )
+            .await
+            .unwrap()
+            .status,
+        "Director without ROLE_PRODUCT_MANAGER cannot approve POLICY_PRODUCT_MANAGEMENT"
+    );
+
+    // 6. Directors (`dir_1` + `dir_2` via unanimous `ROLE_DIRECTOR` Board policy) grant
+    //    `ROLE_PRODUCT_MANAGER` -> `pm_candidate` and `ROLE_CFO` -> `cfo_candidate`!
+    let hash_grant_cfo = read_b32(
+        &client,
+        constitution,
+        "hashGrantRole(bytes32,address)",
+        &[
+            AbiValue::Bytes32(role_cfo),
+            AbiValue::Address(cfo_candidate),
+        ],
+    )
+    .await;
+    for (auth_obj, role_id, candidate, h_grant) in [
+        (auth_grant_pm, ROLE_PRODUCT_MANAGER, pm_candidate, hash_grant_pm),
+        (auth_grant_cfo, role_cfo, cfo_candidate, hash_grant_cfo),
+    ] {
+        let rcpts = client
+            .send_call_batch(
+                &deployer,
+                &[
+                    (
+                        dir_1,
+                        encode_values(
+                            "initConstitutionAuth(address,address,address,address,bytes32,bytes32)",
+                            &[
+                                AbiValue::Address(auth_obj),
+                                AbiValue::Address(registry),
+                                AbiValue::Address(constitution),
+                                AbiValue::Address(constitution),
+                                AbiValue::Bytes32(POLICY_BOARD_RESOLUTION),
+                                AbiValue::Bytes32(h_grant),
+                            ],
+                        ),
+                        vec![auth_obj, registry, constitution],
+                    ),
+                    (
+                        dir_1,
+                        encode_values("approveAuth(address)", &[AbiValue::Address(auth_obj)]),
+                        vec![auth_obj, registry, constitution],
+                    ),
+                    (
+                        dir_2,
+                        encode_values(
+                            "approveAndFinalizeAuth(address)",
+                            &[AbiValue::Address(auth_obj)],
+                        ),
+                        vec![auth_obj, registry, constitution],
+                    ),
+                    (
+                        dir_1,
+                        encode_values(
+                            "grantRole(address,bytes32,address,address)",
+                            &[
+                                AbiValue::Address(constitution),
+                                AbiValue::Bytes32(role_id),
+                                AbiValue::Address(candidate),
+                                AbiValue::Address(auth_obj),
+                            ],
+                        ),
+                        vec![constitution, registry, auth_obj, candidate],
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+        for r in &rcpts {
+            assert!(r.status, "grantRole batch via ROLE_DIRECTOR Board Resolution failed");
+        }
+    }
+
+    // `pm_candidate` now approves & finalizes `auth_upsert_pm` (`POLICY_PRODUCT_MANAGEMENT`) and lists the SKU via `Constitution.upsertProduct`!
+    let upsert_rcpts = client
+        .send_call_batch(
+            &deployer,
+            &[
+                (
+                    pm_candidate,
+                    encode_values(
+                        "initConstitutionAuth(address,address,address,address,bytes32,bytes32)",
+                        &[
+                            AbiValue::Address(auth_upsert_pm),
+                            AbiValue::Address(registry),
+                            AbiValue::Address(constitution),
+                            AbiValue::Address(constitution),
+                            AbiValue::Bytes32(POLICY_PRODUCT_MANAGEMENT),
+                            AbiValue::Bytes32(hash_upsert_qkd),
+                        ],
+                    ),
+                    vec![auth_upsert_pm, registry, constitution],
+                ),
+                (
+                    pm_candidate,
+                    encode_values(
+                        "approveAndFinalizeAuth(address)",
+                        &[AbiValue::Address(auth_upsert_pm)],
+                    ),
+                    vec![auth_upsert_pm, registry, constitution],
+                ),
+                (
+                    pm_candidate,
+                    encode_values(
+                        "execute(address,bytes)",
+                        &[
+                            AbiValue::Address(constitution),
+                            AbiValue::Bytes(encode_values(
+                                "upsertProduct(address,bytes32,uint64,uint64,bytes,address)",
+                                &[
+                                    AbiValue::Address(product_ledger),
+                                    AbiValue::Bytes32(sku_quantum),
+                                    AbiValue::Uint(U256::from(20u64)),
+                                    AbiValue::Uint(U256::from(4_000u64)),
+                                    AbiValue::Bytes(label_quantum),
+                                    AbiValue::Address(auth_upsert_pm),
+                                ],
+                            )),
+                        ],
+                    ),
+                    vec![
+                        constitution,
+                        registry,
+                        auth_upsert_pm,
+                        product_ledger,
+                        accounting_ledger,
+                    ],
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+    for r in &upsert_rcpts {
+        assert!(r.status, "Constitution.upsertProduct via POLICY_PRODUCT_MANAGEMENT failed");
+    }
+    assert_eq!(read_u64(&client, product_ledger, "productCount()", &[]).await, 1);
+
+    // 7. Dynamically rotate `setProductPrice`'s required authorization process via `setFunctionAuth`
+    //    (which itself consumes a `POLICY_SUPER_GOVERNANCE` Shareholder authorization!)
+    let hash_set_fn = read_b32(
+        &client,
+        constitution,
+        "hashSetFunctionAuth(bytes4,bytes32)",
+        &[
+            AbiValue::Bytes4(sel_set_price),
+            AbiValue::Bytes32(pol_dual_pm_cfo),
+        ],
+    )
+    .await;
+    let rotate_rcpts = client
+        .send_call_batch(
+            &deployer,
+            &[
+                (
+                    sh_a,
+                    encode_values(
+                        "initConstitutionAuth(address,address,address,address,bytes32,bytes32)",
+                        &[
+                            AbiValue::Address(auth_rotate_fn),
+                            AbiValue::Address(registry),
+                            AbiValue::Address(constitution),
+                            AbiValue::Address(constitution),
+                            AbiValue::Bytes32(POLICY_SUPER_GOVERNANCE),
+                            AbiValue::Bytes32(hash_set_fn),
+                        ],
+                    ),
+                    vec![auth_rotate_fn, registry, constitution],
+                ),
+                (
+                    sh_a,
+                    encode_values("approveAuth(address)", &[AbiValue::Address(auth_rotate_fn)]),
+                    vec![auth_rotate_fn, registry, constitution, slx_common],
+                ),
+                (
+                    sh_b,
+                    encode_values(
+                        "approveAndFinalizeAuth(address)",
+                        &[AbiValue::Address(auth_rotate_fn)],
+                    ),
+                    vec![auth_rotate_fn, registry, constitution, slx_common],
+                ),
+                (
+                    sh_a,
+                    encode_values(
+                        "setFunctionAuth(address,bytes4,bytes32,address)",
+                        &[
+                            AbiValue::Address(constitution),
+                            AbiValue::Bytes4(sel_set_price),
+                            AbiValue::Bytes32(pol_dual_pm_cfo),
+                            AbiValue::Address(auth_rotate_fn),
+                        ],
+                    ),
+                    vec![constitution, registry, auth_rotate_fn],
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+    for r in &rotate_rcpts {
+        assert!(r.status, "setFunctionAuth rotation failed");
+    }
+    assert_eq!(
+        read_b32(
+            &client,
+            constitution,
+            "getFunctionAuth(bytes4)",
+            &[AbiValue::Bytes4(sel_set_price)]
+        )
+        .await,
+        pol_dual_pm_cfo
+    );
+
+    // 8. Execute the 2-stage sequential role-backed `pol_dual_pm_cfo` (`pm_candidate` -> `cfo_candidate`)
+    //    and update the SKU price via `Constitution.setProductPrice`!
+    let hash_price_update = read_b32(
+        &client,
+        constitution,
+        "hashConSetProductPrice(address,bytes32,uint64)",
+        &[
+            AbiValue::Address(product_ledger),
+            AbiValue::Bytes32(sku_quantum),
+            AbiValue::Uint(U256::from(4_500u64)),
+        ],
+    )
+    .await;
+    let dual_price_rcpts = client
+        .send_call_batch(
+            &deployer,
+            &[
+                (
+                    pm_candidate,
+                    encode_values(
+                        "initConstitutionAuth(address,address,address,address,bytes32,bytes32)",
+                        &[
+                            AbiValue::Address(auth_dual_price),
+                            AbiValue::Address(registry),
+                            AbiValue::Address(constitution),
+                            AbiValue::Address(constitution),
+                            AbiValue::Bytes32(pol_dual_pm_cfo),
+                            AbiValue::Bytes32(hash_price_update),
+                        ],
+                    ),
+                    vec![auth_dual_price, registry, constitution],
+                ),
+                // Stage 0: ROLE_PRODUCT_MANAGER (`pm_candidate`)
+                (
+                    pm_candidate,
+                    encode_values("approveAuth(address)", &[AbiValue::Address(auth_dual_price)]),
+                    vec![auth_dual_price, registry, constitution],
+                ),
+                // Stage 1: ROLE_CFO (`cfo_candidate`) approves & finalizes!
+                (
+                    cfo_candidate,
+                    encode_values(
+                        "approveAndFinalizeAuth(address)",
+                        &[AbiValue::Address(auth_dual_price)],
+                    ),
+                    vec![auth_dual_price, registry, constitution],
+                ),
+                (
+                    pm_candidate,
+                    encode_values(
+                        "execute(address,bytes)",
+                        &[
+                            AbiValue::Address(constitution),
+                            AbiValue::Bytes(encode_values(
+                                "setProductPrice(address,bytes32,uint64,address)",
+                                &[
+                                    AbiValue::Address(product_ledger),
+                                    AbiValue::Bytes32(sku_quantum),
+                                    AbiValue::Uint(U256::from(4_500u64)),
+                                    AbiValue::Address(auth_dual_price),
+                                ],
+                            )),
+                        ],
+                    ),
+                    vec![
+                        constitution,
+                        registry,
+                        auth_dual_price,
+                        product_ledger,
+                        accounting_ledger,
+                    ],
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+    for r in &dual_price_rcpts {
+        assert!(r.status, "2-stage PM + CFO setProductPrice failed");
+    }
+
+    assert_eq!(
+        read_u64(
+            &client,
+            product_ledger,
+            "latestPriceOf(bytes32)",
+            &[AbiValue::Bytes32(sku_quantum)]
+        )
+        .await,
+        4_500
+    );
+
+    println!(
+        "[initializeWithGovernance Live E2E] All checks passed: pre-defined unassigned roles, First Shareholder Resolution activation, role-backed multi-stage auth, and setFunctionAuth rotation verified on-chain!"
+    );
 }

@@ -14,7 +14,20 @@ use crate::selector;
 pub const POLICY_WIRE_VERSION: u8 = 1;
 pub const MAX_STAGES: usize = 4;
 pub const MAX_MEMBERS_PER_STAGE: usize = 64;
+pub const MAX_ROLES_PER_STAGE: usize = 4;
 pub const MAX_ENCODED_POLICY_BYTES: usize = 4096;
+
+/// Lifecycle states of a `Constitution` Haltproof Subroutine.
+/// Newly constructed Constitutions start in `CONSTITUTION_STATE_PENDING_RATIFICATION` (inactive)
+/// and become valid/active (`CONSTITUTION_STATE_ACTIVE`) only after a First Shareholder Resolution
+/// (`activateConstitution`) is passed.
+pub const CONSTITUTION_STATE_UNINITIALIZED: u64 = 0;
+pub const CONSTITUTION_STATE_PENDING_RATIFICATION: u64 = 1;
+pub const CONSTITUTION_STATE_ACTIVE: u64 = 2;
+
+/// Special `required_weight` sentinel on a role-backed `StageSpec` requiring unanimous approval
+/// from all currently assigned members of the stage's role(s) (with `>= 1` active member).
+pub const ROLE_ALL_MEMBERS_WEIGHT: u64 = u64::MAX;
 
 /// Canonical 32-byte action keys used in `AssetLedger` permissions and `Constitution` policies.
 pub const ACTION_ISSUE: [u8; 32] = keccak256(b"ISSUE");
@@ -33,12 +46,17 @@ pub const ACTION_RESTOCK_PRODUCT: [u8; 32] = keccak256(b"RESTOCK_PRODUCT");
 pub const ACTION_SET_PRODUCT_PRICE: [u8; 32] = keccak256(b"SET_PRODUCT_PRICE");
 pub const ACTION_GRANT_ROLE: [u8; 32] = keccak256(b"GRANT_ROLE");
 pub const ACTION_REVOKE_ROLE: [u8; 32] = keccak256(b"REVOKE_ROLE");
+pub const ACTION_DEFINE_ROLE: [u8; 32] = keccak256(b"DEFINE_ROLE");
+pub const ACTION_SET_FUNCTION_AUTH: [u8; 32] = keccak256(b"SET_FUNCTION_AUTH");
+pub const ACTION_ACTIVATE_CONSTITUTION: [u8; 32] = keccak256(b"ACTIVATE_CONSTITUTION");
 pub const ACTION_REGISTER_PRODUCT_LEDGER: [u8; 32] = keccak256(b"REGISTER_PRODUCT_LEDGER");
 pub const ACTION_AUTHORIZE_FUTURES_UNDERWRITING: [u8; 32] =
     keccak256(b"AUTHORIZE_FUTURES_UNDERWRITING");
 pub const ACTION_SET_ATTACHED_DEX: [u8; 32] = keccak256(b"SET_ATTACHED_DEX");
 
-/// Canonical administrative Role IDs assigned by Directors (`POLICY_BOARD_RESOLUTION`) in `Constitution`.
+/// Canonical governance & administrative Role IDs defined in `Constitution`.
+pub const ROLE_SHAREHOLDER: [u8; 32] = keccak256(b"ROLE_SHAREHOLDER");
+pub const ROLE_DIRECTOR: [u8; 32] = keccak256(b"ROLE_DIRECTOR");
 pub const ROLE_PRODUCT_MANAGER: [u8; 32] = keccak256(b"ROLE_PRODUCT_MANAGER");
 pub const ROLE_TREASURY_MANAGER: [u8; 32] = keccak256(b"ROLE_TREASURY_MANAGER");
 pub const ROLE_BANK_ORACLE: [u8; 32] = keccak256(b"ROLE_BANK_ORACLE");
@@ -46,7 +64,10 @@ pub const ROLE_BANK_ORACLE: [u8; 32] = keccak256(b"ROLE_BANK_ORACLE");
 /// Canonical policy IDs for `Constitution`, `AssetLedger`, `ProductLedger`, and `IdentityRegistry` governance.
 pub const POLICY_SUPER_GOVERNANCE: [u8; 32] = keccak256(b"SUPER_GOVERNANCE");
 pub const POLICY_SHAREHOLDER_SUPERMAJORITY: [u8; 32] = keccak256(b"SHAREHOLDER_SUPERMAJORITY");
+pub const POLICY_FIRST_SHAREHOLDER_RESOLUTION: [u8; 32] =
+    keccak256(b"FIRST_SHAREHOLDER_RESOLUTION");
 pub const POLICY_BOARD_RESOLUTION: [u8; 32] = keccak256(b"BOARD_RESOLUTION");
+pub const POLICY_PRODUCT_MANAGEMENT: [u8; 32] = keccak256(b"PRODUCT_MANAGEMENT");
 pub const POLICY_SHARE_TRANSFER_AUCTION: [u8; 32] = keccak256(b"SHARE_TRANSFER_AUCTION");
 pub const POLICY_FUTURES_UNDERWRITING: [u8; 32] = keccak256(b"FUTURES_UNDERWRITING");
 pub const POLICY_BANK_ORACLE: [u8; 32] = keccak256(b"BANK_ORACLE");
@@ -95,6 +116,10 @@ pub const ERR_FUTURES_CAP_EXCEEDED: i32 = -87;
 pub const ERR_DEX_NOT_ATTACHED: i32 = -88;
 pub const ERR_ORDERBOOK_FULL: i32 = -89;
 pub const ERR_INVALID_DEX_ORDER: i32 = -90;
+pub const ERR_CONSTITUTION_NOT_ACTIVE: i32 = -91;
+pub const ERR_CONSTITUTION_ALREADY_ACTIVE: i32 = -92;
+pub const ERR_ROLE_NOT_DEFINED: i32 = -93;
+pub const ERR_FUNCTION_AUTH_NOT_SET: i32 = -94;
 pub const ERR_CONSTITUTION_MISMATCH: i32 = -19;
 
 /// Order side/step tags for `POLICY_SHARE_TRANSFER_AUCTION` 3-step share transfer auctions.
@@ -106,8 +131,9 @@ pub const MAX_AUCTION_ORDERS: usize = 64;
 pub const MAX_ENCODED_AUCTION_BOOK_BYTES: usize = 4 + MAX_AUCTION_ORDERS * 37;
 pub const MAX_SHARE_CLASSES: usize = 8;
 pub const MAX_BANK_LEDGERS: usize = 8;
+pub const MAX_DEFINED_ROLES: usize = 32;
 
-/// Single authorizer entry within a sequential authorization stage.
+/// Single explicit authorizer entry within a sequential authorization stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AuthorizerMember {
     pub identity: [u8; 20],
@@ -123,9 +149,69 @@ impl Default for AuthorizerMember {
     }
 }
 
+/// Role requirement entry within a sequential authorization stage.
+/// Any active `Identity` holding `role_id` in the bound `Constitution` contributes `weight`
+/// when approving this stage — allowing authorization processes and roles to be defined at
+/// `Constitution` construction even before any `Identity` is assigned to `role_id`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StageRole {
+    pub role_id: [u8; 32],
+    pub weight: u64,
+}
+
+impl Default for StageRole {
+    fn default() -> Self {
+        Self {
+            role_id: [0u8; 32],
+            weight: 0,
+        }
+    }
+}
+
+/// Per-function authorization binding (`fn_selector -> policy_id`) stored in `Constitution`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FunctionAuthRule {
+    pub fn_selector: [u8; 4],
+    pub policy_id: [u8; 32],
+}
+
+impl FunctionAuthRule {
+    pub const ENCODED_LEN: usize = 36;
+
+    pub const fn new(fn_selector: [u8; 4], policy_id: [u8; 32]) -> Self {
+        Self {
+            fn_selector,
+            policy_id,
+        }
+    }
+
+    pub fn encode(&self) -> [u8; Self::ENCODED_LEN] {
+        let mut out = [0u8; Self::ENCODED_LEN];
+        out[0..4].copy_from_slice(&self.fn_selector);
+        out[4..36].copy_from_slice(&self.policy_id);
+        out
+    }
+
+    pub fn decode(raw: &[u8]) -> Option<Self> {
+        if raw.len() != Self::ENCODED_LEN {
+            return None;
+        }
+        let fn_selector = [raw[0], raw[1], raw[2], raw[3]];
+        let mut policy_id = [0u8; 32];
+        policy_id.copy_from_slice(&raw[4..36]);
+        if fn_selector == [0u8; 4] || policy_id == [0u8; 32] {
+            return None;
+        }
+        Some(Self {
+            fn_selector,
+            policy_id,
+        })
+    }
+}
+
 /// One sequential step in a multi-stage authorization process.
 ///
-/// Stage `s` must accumulate `>= required_weight` from its listed `members` within
+/// Stage `s` must accumulate `>= required_weight` from its listed `members` and/or `roles` within
 /// `expiry_blocks` of Stage `s` becoming active before Stage `s + 1` can accept any approvals.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StageSpec {
@@ -133,6 +219,8 @@ pub struct StageSpec {
     pub expiry_blocks: u64,
     pub member_count: usize,
     pub members: [AuthorizerMember; MAX_MEMBERS_PER_STAGE],
+    pub role_count: usize,
+    pub roles: [StageRole; MAX_ROLES_PER_STAGE],
 }
 
 impl Default for StageSpec {
@@ -142,6 +230,8 @@ impl Default for StageSpec {
             expiry_blocks: 0,
             member_count: 0,
             members: [AuthorizerMember::default(); MAX_MEMBERS_PER_STAGE],
+            role_count: 0,
+            roles: [StageRole::default(); MAX_ROLES_PER_STAGE],
         }
     }
 }
@@ -153,7 +243,15 @@ impl StageSpec {
             expiry_blocks,
             member_count: 0,
             members: [AuthorizerMember::default(); MAX_MEMBERS_PER_STAGE],
+            role_count: 0,
+            roles: [StageRole::default(); MAX_ROLES_PER_STAGE],
         }
+    }
+
+    /// Construct a role-backed stage where each holder of `role_id` contributes approval weight `1`
+    /// toward `required_weight` (valid even when `0` identities are assigned `role_id` at genesis).
+    pub fn for_role(role_id: [u8; 32], required_weight: u64, expiry_blocks: u64) -> Option<Self> {
+        Self::new(required_weight, expiry_blocks).add_role(role_id, 1)
     }
 
     pub fn add_member(mut self, identity: [u8; 20], weight: u64) -> Option<Self> {
@@ -172,15 +270,43 @@ impl StageSpec {
         Some(self)
     }
 
+    pub fn add_role(mut self, role_id: [u8; 32], weight: u64) -> Option<Self> {
+        if self.role_count >= MAX_ROLES_PER_STAGE || role_id == [0u8; 32] || weight == 0 {
+            return None;
+        }
+        let mut i = 0;
+        while i < self.role_count {
+            if self.roles[i].role_id == role_id {
+                return None; // duplicate role in same stage
+            }
+            i += 1;
+        }
+        self.roles[self.role_count] = StageRole { role_id, weight };
+        self.role_count += 1;
+        Some(self)
+    }
+
+    pub fn has_role(&self, role_id: &[u8; 32]) -> bool {
+        let mut i = 0;
+        while i < self.role_count {
+            if &self.roles[i].role_id == role_id {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
     pub fn validate(&self) -> bool {
         if self.required_weight == 0
             || self.expiry_blocks == 0
-            || self.member_count == 0
+            || (self.member_count == 0 && self.role_count == 0)
             || self.member_count > MAX_MEMBERS_PER_STAGE
+            || self.role_count > MAX_ROLES_PER_STAGE
         {
             return false;
         }
-        let mut total_weight: u64 = 0;
+        let mut total_member_weight: u64 = 0;
         let mut i = 0;
         while i < self.member_count {
             let m = &self.members[i];
@@ -194,13 +320,32 @@ impl StageSpec {
                 }
                 j += 1;
             }
-            total_weight = match total_weight.checked_add(m.weight) {
+            total_member_weight = match total_member_weight.checked_add(m.weight) {
                 Some(v) => v,
                 None => return false,
             };
             i += 1;
         }
-        self.required_weight <= total_weight
+        let mut r = 0;
+        while r < self.role_count {
+            let rl = &self.roles[r];
+            if rl.role_id == [0u8; 32] || rl.weight == 0 {
+                return false;
+            }
+            let mut k = 0;
+            while k < r {
+                if self.roles[k].role_id == rl.role_id {
+                    return false;
+                }
+                k += 1;
+            }
+            r += 1;
+        }
+        if self.role_count == 0 {
+            self.required_weight <= total_member_weight
+        } else {
+            true
+        }
     }
 
     pub fn member_weight(&self, identity: &[u8; 20]) -> Option<u64> {
@@ -271,8 +416,9 @@ impl PolicySpec {
 
     /// Encode into deterministic binary wire format:
     /// - Header (12 B): `[version=1, active=1, stage_count: u8, 0u8, overall_expiry_blocks: u64 BE]`
-    /// - Per stage: `[required_weight: u64 BE (8B)][expiry_blocks: u64 BE (8B)][member_count: u8][0u8; 7]` (24 B)
-    ///   followed by `member_count * 28` bytes of `[identity: 20B][weight: u64 BE (8B)]`.
+    /// - Per stage: `[required_weight: u64 BE (8B)][expiry_blocks: u64 BE (8B)][member_count: u8][role_count: u8][0u8; 6]` (24 B)
+    ///   followed by `member_count * 28` bytes of `[identity: 20B][weight: u64 BE (8B)]`
+    ///   followed by `role_count * 40` bytes of `[role_id: 32B][weight: u64 BE (8B)]`.
     pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
         if !self.validate() || out.len() < 12 {
             return None;
@@ -287,14 +433,15 @@ impl PolicySpec {
         let mut s = 0;
         while s < self.stage_count {
             let st = &self.stages[s];
-            let need = 24 + st.member_count * 28;
+            let need = 24 + st.member_count * 28 + st.role_count * 40;
             if pos + need > out.len() {
                 return None;
             }
             out[pos..pos + 8].copy_from_slice(&st.required_weight.to_be_bytes());
             out[pos + 8..pos + 16].copy_from_slice(&st.expiry_blocks.to_be_bytes());
             out[pos + 16] = st.member_count as u8;
-            out[pos + 17..pos + 24].copy_from_slice(&[0u8; 7]);
+            out[pos + 17] = st.role_count as u8;
+            out[pos + 18..pos + 24].copy_from_slice(&[0u8; 6]);
             pos += 24;
 
             let mut m = 0;
@@ -303,6 +450,13 @@ impl PolicySpec {
                 out[pos + 20..pos + 28].copy_from_slice(&st.members[m].weight.to_be_bytes());
                 pos += 28;
                 m += 1;
+            }
+            let mut r = 0;
+            while r < st.role_count {
+                out[pos..pos + 32].copy_from_slice(&st.roles[r].role_id);
+                out[pos + 32..pos + 40].copy_from_slice(&st.roles[r].weight.to_be_bytes());
+                pos += 40;
+                r += 1;
             }
             s += 1;
         }
@@ -342,11 +496,13 @@ impl PolicySpec {
             let expiry_blocks = u64::from_be_bytes(ebb);
 
             let member_count = raw[pos + 16] as usize;
+            let role_count = raw[pos + 17] as usize;
             pos += 24;
 
-            if member_count == 0
+            if (member_count == 0 && role_count == 0)
                 || member_count > MAX_MEMBERS_PER_STAGE
-                || pos + member_count * 28 > raw.len()
+                || role_count > MAX_ROLES_PER_STAGE
+                || pos + member_count * 28 + role_count * 40 > raw.len()
             {
                 return None;
             }
@@ -356,6 +512,8 @@ impl PolicySpec {
                 expiry_blocks,
                 member_count,
                 members: [AuthorizerMember::default(); MAX_MEMBERS_PER_STAGE],
+                role_count,
+                roles: [StageRole::default(); MAX_ROLES_PER_STAGE],
             };
             let mut m = 0;
             while m < member_count {
@@ -369,6 +527,19 @@ impl PolicySpec {
                 };
                 pos += 28;
                 m += 1;
+            }
+            let mut r = 0;
+            while r < role_count {
+                let mut rid = [0u8; 32];
+                rid.copy_from_slice(&raw[pos..pos + 32]);
+                let mut wb = [0u8; 8];
+                wb.copy_from_slice(&raw[pos + 32..pos + 40]);
+                stage.roles[r] = StageRole {
+                    role_id: rid,
+                    weight: u64::from_be_bytes(wb),
+                };
+                pos += 40;
+                r += 1;
             }
             spec.stages[s] = stage;
             s += 1;
