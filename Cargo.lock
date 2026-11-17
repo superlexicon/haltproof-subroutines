@@ -99,6 +99,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9d297deb1925b89f2ccc13d7635fa0714f12c87adce1c75356b39ca9b7178567"
 
 [[package]]
+name = "battleship"
+version = "0.1.0"
+dependencies = [
+ "hps-sdk",
+]
+
+[[package]]
 name = "bitflags"
 version = "1.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -298,6 +305,13 @@ checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
 dependencies = [
  "generic-array",
  "typenum",
+]
+
+[[package]]
+name = "dead-drop"
+version = "0.1.0"
+dependencies = [
+ "hps-sdk",
 ]
 
 [[package]]
@@ -1294,6 +1308,34 @@ name = "smallvec"
 version = "1.16.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
+
+[[package]]
+name = "social-charter"
+version = "0.1.0"
+dependencies = [
+ "hps-sdk",
+]
+
+[[package]]
+name = "social-events"
+version = "0.1.0"
+dependencies = [
+ "hps-sdk",
+]
+
+[[package]]
+name = "social-feed"
+version = "0.1.0"
+dependencies = [
+ "hps-sdk",
+]
+
+[[package]]
+name = "social-relationships"
+version = "0.1.0"
+dependencies = [
+ "hps-sdk",
+]
 
 [[package]]
 name = "socket2"

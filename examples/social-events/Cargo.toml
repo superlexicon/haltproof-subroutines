@@ -1,0 +1,13 @@
+[package]
+name = "social-events"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SocialEvents: Local Neighborhood Meetups, Messaging Chat & <=150m RF Proof-of-Attendance (HPS #14D)"
+
+[[bin]]
+name = "social_events"
+path = "src/main.rs"
+
+[dependencies]
+hps-sdk = { path = "../../crates/hps-sdk" }

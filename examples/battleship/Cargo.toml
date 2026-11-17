@@ -1,0 +1,13 @@
+[package]
+name = "battleship"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Phantom Fleet: Muzzle-Flash & Drift Battleship — Haltproof Subroutine (HPS #13) with 3x3 public muzzle-flash radar, 1-cell ship drift, and full keccak256 commit-chain fair-play audit"
+
+[[bin]]
+name = "battleship"
+path = "src/main.rs"
+
+[dependencies]
+hps-sdk = { path = "../../crates/hps-sdk" }

@@ -1,0 +1,13 @@
+[package]
+name = "social-charter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SocialCharter: Radio-Bounded Social Root of Trust, Presence Lease, Web-of-Trust & Module Registry (HPS #14A)"
+
+[[bin]]
+name = "social_charter"
+path = "src/main.rs"
+
+[dependencies]
+hps-sdk = { path = "../../crates/hps-sdk" }

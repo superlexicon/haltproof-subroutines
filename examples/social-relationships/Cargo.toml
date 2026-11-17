@@ -1,0 +1,13 @@
+[package]
+name = "social-relationships"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SocialRelationships: 2.4 GHz RF Encounter Handshakes & Relationship Tiers pinned to SocialCharter (HPS #14B)"
+
+[[bin]]
+name = "social_relationships"
+path = "src/main.rs"
+
+[dependencies]
+hps-sdk = { path = "../../crates/hps-sdk" }

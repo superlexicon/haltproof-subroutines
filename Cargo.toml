@@ -15,6 +15,12 @@ members = [
     "examples/product-ledger",
     "examples/accounting-ledger",
     "examples/dex-clob",
+    "examples/dead-drop",
+    "examples/battleship",
+    "examples/social-charter",
+    "examples/social-relationships",
+    "examples/social-feed",
+    "examples/social-events",
 ]
 
 [workspace.package]

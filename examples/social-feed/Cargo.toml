@@ -1,0 +1,13 @@
+[package]
+name = "social-feed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SocialFeed: Scoped Wall Feed, Reactions, Comments & Proximity Messenger backed by Messaging HFS (HPS #14C)"
+
+[[bin]]
+name = "social_feed"
+path = "src/main.rs"
+
+[dependencies]
+hps-sdk = { path = "../../crates/hps-sdk" }

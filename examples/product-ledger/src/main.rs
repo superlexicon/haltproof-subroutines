@@ -27,6 +27,9 @@ use hps_sdk::governance::{
     ERR_PRODUCT_NOT_FOUND, POLICY_BOARD_RESOLUTION, POLICY_PRODUCT_MANAGEMENT,
     ROLE_PRODUCT_MANAGER,
 };
+use hps_sdk::social::{
+    adjust_standing_from_module, require_active_member, require_mutual_rf_proximity,
+};
 use hps_sdk::storage::KeyBuilder;
 use hps_sdk::{context, event_topic, events, hps_entry, ret, selector, storage};
 
@@ -59,6 +62,13 @@ const KEY_ACCOUNTING: &[u8] = b"prd:acc";
 const KEY_OP_BANK_LEDGER: &[u8] = b"prd:bank_led";
 const KEY_OP_REV_ACCOUNT: &[u8] = b"prd:rev_acct";
 const KEY_PRODUCT_COUNT: &[u8] = b"prd:cnt";
+const KEY_OWNER_IDENTITY: &[u8] = b"prd:owner_id";
+const KEY_SOCIAL_SALES_CNT: &[u8] = b"prd:soc_scnt";
+
+pub const MODE_CORPORATE_CHARTER: u64 = 1;
+pub const MODE_IDENTITY_SOCIAL: u64 = 2;
+
+static mut CATALOG_SNAP_BUF: [u8; 8192] = [0u8; 8192];
 
 const PRODUCT_ROW_LEN: usize = 58;
 const GENESIS_PRODUCT_PACK_LEN: usize = 80;
@@ -113,12 +123,16 @@ impl ProductRow {
 hps_entry! {
     "initialize(address,address,address,bytes)"                                 => handle_initialize_4,
     "initializeWithBank(address,address,address,address,address,bytes)"         => handle_initialize_6,
+    "initializeForIdentity(address,address,address,bytes)"                      => handle_initialize_for_identity,
     "setOperatingAccount(address,address,address)"                              => handle_set_operating_account,
     "upsertProduct(bytes32,uint64,uint64,bytes,address)"                        => handle_upsert_product,
     "restockProduct(bytes32,uint64,uint64,address)"                             => handle_restock_product,
     "setProductPrice(bytes32,uint64,address)"                                   => handle_set_product_price,
     "buyProduct(bytes32,uint64)"                                                => handle_buy_product,
     "getProduct(bytes32)"                                                       => handle_get_product,
+    "getCatalogSnapshot()"                                                      => handle_get_catalog_snapshot,
+    "ownerIdentity()"                                                           => handle_owner_identity,
+    "ledgerMode()"                                                              => handle_ledger_mode,
     "unitsAvailableOf(bytes32)"                                                 => handle_units_available_of,
     "latestPriceOf(bytes32)"                                                    => handle_latest_price_of,
     "productCount()"                                                            => handle_product_count,
@@ -407,6 +421,105 @@ fn handle_initialize_6(args: &CalldataReader) -> Result<(), i32> {
     )
 }
 
+/// Initialize a Personal / Identity-Owned `ProductLedger` storefront pinned to an `Identity` HFS
+/// (`ownerIdentity`), `IdentityRegistry`, and a neighborhood `SocialCharter` (`MODE_IDENTITY_SOCIAL`).
+fn handle_initialize_for_identity(args: &CalldataReader) -> Result<(), i32> {
+    if storage::get_u64(KEY_INIT) != 0 {
+        return Err(-11);
+    }
+    let registry = args.address(0).ok_or(-3)?;
+    let owner_identity = args.address(1).ok_or(-3)?;
+    let social_charter = args.address(2).ok_or(-3)?;
+    let initial_products = args.dynamic_bytes(3).ok_or(-3)?;
+
+    if registry == [0u8; 20]
+        || owner_identity == [0u8; 20]
+        || social_charter == [0u8; 20]
+        || initial_products.len() % GENESIS_PRODUCT_PACK_LEN != 0
+    {
+        return Err(ERR_CHARTER_MISMATCH);
+    }
+
+    require_valid_identity(&registry, &owner_identity)?;
+    let caller = context::msg_sender();
+    if caller != owner_identity {
+        return Err(ERR_MISSING_ROLE);
+    }
+
+    // Owner Identity must be an Active In-Subnet Verified Citizen (`Trust >= 60`) on `SocialCharter`!
+    require_active_member(&social_charter, &owner_identity, 60)?;
+
+    storage::set_u64(KEY_INIT, MODE_IDENTITY_SOCIAL);
+    storage::set_address(KEY_REGISTRY, &registry);
+    storage::set_address(KEY_OWNER_IDENTITY, &owner_identity);
+    storage::set_address(KEY_CHARTER, &social_charter);
+    storage::set_address(KEY_INITIALIZER, &owner_identity);
+    storage::set_u64(KEY_PRODUCT_COUNT, 0);
+
+    let count = initial_products.len() / GENESIS_PRODUCT_PACK_LEN;
+    let mut i = 0usize;
+    while i < count {
+        let base = i * GENESIS_PRODUCT_PACK_LEN;
+        let mut product_id = [0u8; 32];
+        product_id.copy_from_slice(&initial_products[base..base + 32]);
+        let mut ub = [0u8; 8];
+        ub.copy_from_slice(&initial_products[base + 32..base + 40]);
+        let units_available = u64::from_be_bytes(ub);
+        let mut pb = [0u8; 8];
+        pb.copy_from_slice(&initial_products[base + 40..base + 48]);
+        let latest_price = u64::from_be_bytes(pb);
+        let mut name = [0u8; 32];
+        name.copy_from_slice(&initial_products[base + 48..base + 80]);
+
+        if product_id == [0u8; 32] {
+            return Err(ERR_INVALID_PRODUCT_PARAMS);
+        }
+        let mut name_len = 32usize;
+        while name_len > 0 && name[name_len - 1] == 0 {
+            name_len -= 1;
+        }
+        let row = ProductRow {
+            active: true,
+            name_len: name_len as u8,
+            units_available,
+            latest_price,
+            total_units_sold: 0,
+            name,
+        };
+        save_product(&product_id, &row);
+
+        let mut ev = [0u8; 16];
+        ev[0..8].copy_from_slice(&units_available.to_be_bytes());
+        ev[8..16].copy_from_slice(&latest_price.to_be_bytes());
+        events::emit(&[PRODUCT_UPSERTED, product_id, addr_topic(&owner_identity)], &ev);
+        i += 1;
+    }
+
+    events::emit(
+        &[
+            PRODUCT_LEDGER_INITIALIZED,
+            addr_topic(&social_charter),
+            addr_topic(&owner_identity),
+        ],
+        &(count as u64).to_be_bytes(),
+    );
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn ensure_owner_identity_seller() -> Result<([u8; 20], [u8; 20]), i32> {
+    let registry = storage::get_address(KEY_REGISTRY).ok_or(-10)?;
+    let owner_id = storage::get_address(KEY_OWNER_IDENTITY).ok_or(-10)?;
+    let social_charter = storage::get_address(KEY_CHARTER).ok_or(-10)?;
+    let caller = context::msg_sender();
+    if caller != owner_id {
+        return Err(ERR_MISSING_ROLE);
+    }
+    require_valid_identity(&registry, &caller)?;
+    require_active_member(&social_charter, &caller, 60)?;
+    Ok((owner_id, social_charter))
+}
+
 fn handle_set_operating_account(args: &CalldataReader) -> Result<(), i32> {
     let (registry, charter, caller) = ensure_active_and_valid_caller()?;
     let bank_ledger = args.address(0).ok_or(-3)?;
@@ -454,26 +567,36 @@ fn handle_set_operating_account(args: &CalldataReader) -> Result<(), i32> {
 }
 
 fn handle_upsert_product(args: &CalldataReader) -> Result<(), i32> {
-    let (registry, charter, caller) = ensure_active_and_valid_caller()?;
+    let mode = storage::get_u64(KEY_INIT);
     let product_id = args.bytes32(0).ok_or(-3)?;
     let units_available = args.u64(1).ok_or(-3)?;
     let latest_price = args.u64(2).ok_or(-3)?;
     let raw_name = args.dynamic_bytes(3).ok_or(-3)?;
     let auth_obj = args.address(4).ok_or(-3)?;
 
-    if product_id == [0u8; 32] || latest_price == 0 || raw_name.is_empty() || raw_name.len() > 32 {
-        return Err(ERR_INVALID_PRODUCT_PARAMS);
-    }
-
-    let action_hash = compute_upsert_hash(&product_id, units_available, latest_price, raw_name);
-    require_product_catalog_auth(
-        &registry,
-        &charter,
-        &SEL_UPSERT_PRODUCT,
-        &action_hash,
-        &auth_obj,
-        &caller,
-    )?;
+    let caller = if mode == MODE_IDENTITY_SOCIAL {
+        if product_id == [0u8; 32] || raw_name.is_empty() || raw_name.len() > 32 {
+            return Err(ERR_INVALID_PRODUCT_PARAMS);
+        }
+        let (owner_id, _sc) = ensure_owner_identity_seller()?;
+        owner_id
+    } else {
+        let (registry, charter, c) = ensure_active_and_valid_caller()?;
+        if product_id == [0u8; 32] || latest_price == 0 || raw_name.is_empty() || raw_name.len() > 32
+        {
+            return Err(ERR_INVALID_PRODUCT_PARAMS);
+        }
+        let action_hash = compute_upsert_hash(&product_id, units_available, latest_price, raw_name);
+        require_product_catalog_auth(
+            &registry,
+            &charter,
+            &SEL_UPSERT_PRODUCT,
+            &action_hash,
+            &auth_obj,
+            &c,
+        )?;
+        c
+    };
 
     let prev_sold = load_product(&product_id)
         .map(|r| r.total_units_sold)
@@ -501,7 +624,7 @@ fn handle_upsert_product(args: &CalldataReader) -> Result<(), i32> {
 }
 
 fn handle_restock_product(args: &CalldataReader) -> Result<(), i32> {
-    let (registry, charter, caller) = ensure_active_and_valid_caller()?;
+    let mode = storage::get_u64(KEY_INIT);
     let product_id = args.bytes32(0).ok_or(-3)?;
     let additional_units = args.u64(1).ok_or(-3)?;
     let new_price = args.u64(2).ok_or(-3)?;
@@ -516,15 +639,22 @@ fn handle_restock_product(args: &CalldataReader) -> Result<(), i32> {
         return Err(ERR_PRODUCT_NOT_FOUND);
     }
 
-    let action_hash = compute_restock_hash(&product_id, additional_units, new_price);
-    require_product_catalog_auth(
-        &registry,
-        &charter,
-        &SEL_RESTOCK_PRODUCT,
-        &action_hash,
-        &auth_obj,
-        &caller,
-    )?;
+    let caller = if mode == MODE_IDENTITY_SOCIAL {
+        let (owner_id, _sc) = ensure_owner_identity_seller()?;
+        owner_id
+    } else {
+        let (registry, charter, c) = ensure_active_and_valid_caller()?;
+        let action_hash = compute_restock_hash(&product_id, additional_units, new_price);
+        require_product_catalog_auth(
+            &registry,
+            &charter,
+            &SEL_RESTOCK_PRODUCT,
+            &action_hash,
+            &auth_obj,
+            &c,
+        )?;
+        c
+    };
 
     row.units_available = row
         .units_available
@@ -546,29 +676,35 @@ fn handle_restock_product(args: &CalldataReader) -> Result<(), i32> {
 }
 
 fn handle_set_product_price(args: &CalldataReader) -> Result<(), i32> {
-    let (registry, charter, caller) = ensure_active_and_valid_caller()?;
+    let mode = storage::get_u64(KEY_INIT);
     let product_id = args.bytes32(0).ok_or(-3)?;
     let new_price = args.u64(1).ok_or(-3)?;
     let auth_obj = args.address(2).ok_or(-3)?;
-
-    if new_price == 0 {
-        return Err(ERR_INVALID_PRODUCT_PARAMS);
-    }
 
     let mut row = load_product(&product_id).ok_or(ERR_PRODUCT_NOT_FOUND)?;
     if !row.active {
         return Err(ERR_PRODUCT_NOT_FOUND);
     }
 
-    let action_hash = compute_set_price_hash(&product_id, new_price);
-    require_product_catalog_auth(
-        &registry,
-        &charter,
-        &SEL_SET_PRODUCT_PRICE,
-        &action_hash,
-        &auth_obj,
-        &caller,
-    )?;
+    let caller = if mode == MODE_IDENTITY_SOCIAL {
+        let (owner_id, _sc) = ensure_owner_identity_seller()?;
+        owner_id
+    } else {
+        let (registry, charter, c) = ensure_active_and_valid_caller()?;
+        if new_price == 0 {
+            return Err(ERR_INVALID_PRODUCT_PARAMS);
+        }
+        let action_hash = compute_set_price_hash(&product_id, new_price);
+        require_product_catalog_auth(
+            &registry,
+            &charter,
+            &SEL_SET_PRODUCT_PRICE,
+            &action_hash,
+            &auth_obj,
+            &c,
+        )?;
+        c
+    };
 
     let old_price = row.latest_price;
     row.latest_price = new_price;
@@ -584,13 +720,64 @@ fn handle_set_product_price(args: &CalldataReader) -> Result<(), i32> {
 }
 
 fn handle_buy_product(args: &CalldataReader) -> Result<(), i32> {
-    let (_registry, _charter, buyer) = ensure_active_and_valid_caller()?;
+    let mode = storage::get_u64(KEY_INIT);
     let product_id = args.bytes32(0).ok_or(-3)?;
     let quantity = args.u64(1).ok_or(-3)?;
     if quantity == 0 {
         return Err(ERR_INVALID_PRODUCT_PARAMS);
     }
 
+    if mode == MODE_IDENTITY_SOCIAL {
+        let registry = storage::get_address(KEY_REGISTRY).ok_or(-10)?;
+        let owner_id = storage::get_address(KEY_OWNER_IDENTITY).ok_or(-10)?;
+        let social_charter = storage::get_address(KEY_CHARTER).ok_or(-10)?;
+        let buyer = context::msg_sender();
+        if buyer == owner_id {
+            return Err(ERR_INVALID_PRODUCT_PARAMS);
+        }
+
+        // Both Buyer and Seller MUST be verified `Identity` HFS instances & Active In-Subnet!
+        require_valid_identity(&registry, &buyer)?;
+        require_active_member(&social_charter, &owner_id, 60)?;
+        require_active_member(&social_charter, &buyer, 25)?;
+
+        // Physical Marketplace Anti-Scam Rule: Seller & Buyer MUST be within <=150m 2.4 GHz RF!
+        require_mutual_rf_proximity(&social_charter, &owner_id, &buyer)?;
+
+        let mut row = load_product(&product_id).ok_or(ERR_PRODUCT_NOT_FOUND)?;
+        if !row.active {
+            return Err(ERR_PRODUCT_NOT_FOUND);
+        }
+        if row.units_available < quantity {
+            return Err(ERR_INSUFFICIENT_PRODUCT_UNITS);
+        }
+
+        let unit_price = row.latest_price;
+        let total_cost = quantity.checked_mul(unit_price).ok_or(-15)?;
+
+        row.units_available -= quantity;
+        row.total_units_sold = row.total_units_sold.saturating_add(quantity);
+        save_product(&product_id, &row);
+
+        let sale_idx = storage::get_u64(KEY_SOCIAL_SALES_CNT);
+        storage::set_u64(KEY_SOCIAL_SALES_CNT, sale_idx + 1);
+
+        let _ = adjust_standing_from_module(&social_charter, &owner_id, 2, true);
+        let _ = adjust_standing_from_module(&social_charter, &buyer, 2, true);
+
+        let mut ev = [0u8; 40];
+        ev[0..8].copy_from_slice(&quantity.to_be_bytes());
+        ev[8..16].copy_from_slice(&unit_price.to_be_bytes());
+        ev[16..24].copy_from_slice(&total_cost.to_be_bytes());
+        ev[24..32].copy_from_slice(&row.units_available.to_be_bytes());
+        ev[32..40].copy_from_slice(&sale_idx.to_be_bytes());
+        events::emit(&[PRODUCT_PURCHASED, product_id, addr_topic(&buyer)], &ev);
+
+        ret::write_u64_word(sale_idx);
+        return Ok(());
+    }
+
+    let (_registry, _charter, buyer) = ensure_active_and_valid_caller()?;
     let mut row = load_product(&product_id).ok_or(ERR_PRODUCT_NOT_FOUND)?;
     if !row.active {
         return Err(ERR_PRODUCT_NOT_FOUND);
@@ -644,6 +831,55 @@ fn handle_buy_product(args: &CalldataReader) -> Result<(), i32> {
 
     ret::write_u64_word(sale_idx);
     Ok(())
+}
+
+fn handle_owner_identity(_args: &CalldataReader) -> Result<(), i32> {
+    ret::write_address(&storage::get_address(KEY_OWNER_IDENTITY).unwrap_or([0u8; 20]));
+    Ok(())
+}
+
+fn handle_ledger_mode(_args: &CalldataReader) -> Result<(), i32> {
+    ret::write_u64_word(storage::get_u64(KEY_INIT));
+    Ok(())
+}
+
+fn handle_get_catalog_snapshot(_args: &CalldataReader) -> Result<i32, i32> {
+    let count = storage::get_u64(KEY_PRODUCT_COUNT).min(64) as usize;
+    unsafe {
+        // Frame: `[u32 LE written][20B ownerIdentity][per SKU (90B): id(32) ++ units(8 LE) ++ price(8 LE) ++ sold(8 LE) ++ active(1) ++ nlen(1) ++ name(32)]`
+        let out = &mut *core::ptr::addr_of_mut!(CATALOG_SNAP_BUF);
+        let owner_id = storage::get_address(KEY_OWNER_IDENTITY).unwrap_or([0u8; 20]);
+        out[4..24].copy_from_slice(&owner_id);
+        let mut pos: usize = 24;
+        let mut written: u32 = 0;
+
+        let mut idx = 0usize;
+        while idx < count {
+            let ik = product_index_key(idx as u64);
+            let mut pid = [0u8; 32];
+            if storage::get_into(ik.as_slice(), &mut pid) == Some(32) {
+                if let Some(row) = load_product(&pid) {
+                    if pos + 90 > out.len() {
+                        break;
+                    }
+                    out[pos..pos + 32].copy_from_slice(&pid);
+                    out[pos + 32..pos + 40].copy_from_slice(&row.units_available.to_le_bytes());
+                    out[pos + 40..pos + 48].copy_from_slice(&row.latest_price.to_le_bytes());
+                    out[pos + 48..pos + 56].copy_from_slice(&row.total_units_sold.to_le_bytes());
+                    out[pos + 56] = u8::from(row.active);
+                    out[pos + 57] = row.name_len;
+                    out[pos + 58..pos + 90].copy_from_slice(&row.name);
+                    pos += 90;
+                    written += 1;
+                }
+            }
+            idx += 1;
+        }
+
+        out[0..4].copy_from_slice(&written.to_le_bytes());
+        ret::write(&out[..pos]);
+        Ok(pos as i32)
+    }
 }
 
 fn handle_get_product(args: &CalldataReader) -> Result<(), i32> {
@@ -1021,5 +1257,125 @@ mod tests {
         )
         .unwrap();
         assert_eq!(u64::from_be_bytes(tot_rev[24..32].try_into().unwrap()), 19_500);
+    }
+
+    #[test]
+    fn identity_owned_social_storefront_enforces_verified_standing_and_rf_proximity() {
+        use hps_sdk::social::{MemberStanding, ERR_SOCIAL_OUTSIDE_RF_RANGE};
+
+        mock::reset();
+        let registry = [0x10; 20];
+        let social_charter = [0x20; 20];
+        let store_ledger = [0x45; 20];
+        let seller_id = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let buyer_id = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+
+        mock::register_hps(registry, |raw| {
+            let Some((sel, _)) = CalldataReader::parse(raw) else { return -1; };
+            if sel == const { selector("isValidIdentity(address)") } {
+                ret::write_bool(true);
+                0
+            } else {
+                -2
+            }
+        });
+
+        mock::register_hps(social_charter, |raw| {
+            let Some((sel, args)) = CalldataReader::parse(raw) else { return -1; };
+            if sel == const { selector("memberStanding(address)") } {
+                let u = args.address(0).unwrap();
+                ret::write_u64_word(
+                    (MemberStanding {
+                        registered: true,
+                        is_active: true,
+                        sanctioned: false,
+                        trust_score: if u[19] == 1 { 82 } else { 60 },
+                        uid: u[19],
+                    })
+                    .pack(),
+                );
+                0
+            } else if sel == const { selector("checkMutualRfProximity(address,address)") } {
+                ret::write_bool(storage::get_u64(b"far") == 0);
+                0
+            } else if sel == const { selector("adjustStandingFromModule(address,uint64,bool)") } {
+                0
+            } else {
+                -1
+            }
+        });
+
+        mock::register_hps(store_ledger, dispatch_calldata);
+
+        // Seller Identity initializes its personal ProductLedger storefront
+        mock::transact_as(
+            seller_id,
+            store_ledger,
+            CallEncoder::<256>::new(const {
+                selector("initializeForIdentity(address,address,address,bytes)")
+            })
+            .push_address(&registry)
+            .push_address(&seller_id)
+            .push_address(&social_charter)
+            .push_u64(0x80)
+            .push_dynamic_bytes_tail(&[])
+            .as_slice(),
+        )
+        .unwrap();
+
+        let sku = keccak256(b"SOON_KUEH_BOX");
+        mock::transact_as(
+            seller_id,
+            store_ledger,
+            CallEncoder::<256>::new(const {
+                selector("upsertProduct(bytes32,uint64,uint64,bytes,address)")
+            })
+            .push_bytes32(&sku)
+            .push_u64(10)
+            .push_u64(12)
+            .push_u64(160)
+            .push_address(&[0u8; 20])
+            .push_dynamic_bytes_tail(b"Soon Kueh Box (12pc)")
+            .as_slice(),
+        )
+        .unwrap();
+
+        // Out of <=150m 2.4 GHz range -> `buyProduct` rejected!
+        mock::set_self_address(social_charter);
+        storage::set_u64(b"far", 1);
+        assert_eq!(
+            mock::transact_as(
+                buyer_id,
+                store_ledger,
+                CallEncoder::<96>::new(const { selector("buyProduct(bytes32,uint64)") })
+                    .push_bytes32(&sku)
+                    .push_u64(2)
+                    .as_slice(),
+            ),
+            Err(ERR_SOCIAL_OUTSIDE_RF_RANGE)
+        );
+
+        // Within <=150m 2.4 GHz range -> `buyProduct` decrements ProductLedger inventory `10 -> 8`!
+        mock::set_self_address(social_charter);
+        storage::set_u64(b"far", 0);
+        mock::transact_as(
+            buyer_id,
+            store_ledger,
+            CallEncoder::<96>::new(const { selector("buyProduct(bytes32,uint64)") })
+                .push_bytes32(&sku)
+                .push_u64(2)
+                .as_slice(),
+        )
+        .unwrap();
+
+        let rem = mock::transact_as(
+            buyer_id,
+            store_ledger,
+            CallEncoder::<64>::new(const { selector("unitsAvailableOf(bytes32)") })
+                .push_bytes32(&sku)
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(u64::from_be_bytes(rem[24..32].try_into().unwrap()), 8);
     }
 }
