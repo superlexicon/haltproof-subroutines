@@ -25,7 +25,7 @@ use hps_sdk::{context, event_topic, events, hps_entry, ret, storage};
 
 pub const MAX_MEMBERS: usize = 64;
 pub const MAX_PENDING: usize = 24;
-pub const HANDSHAKE_WINDOW_BLOCKS: u64 = 6;
+pub const HANDSHAKE_WINDOW_BLOCKS: u64 = 180;
 
 const KEY_CHARTER: &[u8] = b"sr:chr";
 const KEY_ENC_COUNTS: &[u8] = b"sr:encc";
