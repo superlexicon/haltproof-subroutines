@@ -1,0 +1,13 @@
+[package]
+name = "hfs-registry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Global Haltproof Subroutine Directory (HPS #18) — organizes deployed HFS instances by typeId with live WASM code_hash verification, creator Identity links, and 1-call binary slice queries"
+
+[[bin]]
+name = "hfs_registry"
+path = "src/main.rs"
+
+[dependencies]
+hps-sdk = { path = "../../crates/hps-sdk" }

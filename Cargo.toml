@@ -21,6 +21,7 @@ members = [
     "examples/social-relationships",
     "examples/social-feed",
     "examples/social-events",
+    "examples/hfs-registry",
 ]
 
 [workspace.package]
