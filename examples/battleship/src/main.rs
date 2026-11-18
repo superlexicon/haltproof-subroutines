@@ -70,10 +70,6 @@ pub const ENGINE_MAX_TIER: u8 = 2;
 pub const ENGINE_UPGRADE_COST: [u64; 2] = [200, 450];
 pub const ENGINE_SPEED_BONUS: [u8; 3] = [0, 2, 4];
 
-/// 8 Compass Directions (`0..=7`: N, NE, E, SE, S, SW, W, NW).
-const DIR8_DX: [i16; 8] = [0, 1, 1, 1, 0, -1, -1, -1];
-const DIR8_DY: [i16; 8] = [-1, -1, 0, 1, 1, 1, 0, -1];
-
 // ---------------------------------------------------------------------------
 // Indexed Events
 // ---------------------------------------------------------------------------
@@ -112,7 +108,7 @@ hps_entry! {
     "setPlayerIdentity(bytes32,address)"                                          => handle_set_player_identity,
     "startAnew(bytes32,uint64,uint64,uint64)"                                     => handle_start_anew,
     "buyShip(bytes32,uint64,uint64,uint64,uint64,uint64)"                         => handle_buy_ship,
-    "moveShip(bytes32,uint64,uint64,uint64)"                      => handle_move_ship,
+    "moveShip(bytes32,uint64,uint64,uint64,uint64)"               => handle_move_ship,
     "fireWeapon(bytes32,uint64,uint64,uint64)"                    => handle_fire_weapon,
     "upgradeGun(bytes32,uint64,uint64)"                           => handle_upgrade_gun,
     "upgradeArmor(bytes32,uint64)"                                => handle_upgrade_engine,
@@ -1276,25 +1272,59 @@ fn resolve_vessel_collisions(
     }
 }
 
-/// 8-Compass-Direction (`dir8`: `0..=7` = N, NE, E, SE, S, SW, W, NW) + Percentage Throttle
-/// (`speed_pct`: `25`, `50`, `75`, or `100`) navigation!
-/// Bounded only by ocean edges; if the vessel ends up in overlapping grid squares with another
+fn heading8_from_delta(dx: i32, dy: i32, fallback: u8) -> u8 {
+    if dx == 0 && dy == 0 {
+        return fallback;
+    }
+    let ax = dx.abs();
+    let ay = dy.abs();
+    if ay * 100 >= ax * 241 {
+        if dy < 0 { 0 } else { 4 }
+    } else if ax * 100 >= ay * 241 {
+        if dx > 0 { 2 } else { 6 }
+    } else if dx > 0 {
+        if dy < 0 { 1 } else { 3 }
+    } else if dy > 0 {
+        5
+    } else {
+        7
+    }
+}
+
+fn isqrt_u64(n: u64) -> u64 {
+    if n == 0 {
+        return 0;
+    }
+    let mut x = n;
+    let mut y = (x + 1) / 2;
+    while y < x {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    x
+}
+
+/// Free 2D single-click navigation anywhere inside the vessel's max range circle (`dx^2 + dy^2 <= max_range^2`)!
+/// `hull_dir`: `0` = horizontal, `1` = vertical, `2` = auto-orient from movement vector.
+/// Bounded by ocean edges; if the vessel ends up in overlapping grid squares with another
 /// vessel, mutual `100%` square collision damage is applied!
 fn handle_move_ship(args: &CalldataReader) -> Result<i32, i32> {
     let bid = args.bytes32(0).ok_or(-10)?;
     let slot_idx = args.u64(1).ok_or(-10)?;
-    let dir8 = args.u64(2).ok_or(-10)?;
-    let speed_pct = args.u64(3).ok_or(-10)?;
+    let dest_x = args.u64(2).ok_or(-10)?;
+    let dest_y = args.u64(3).ok_or(-10)?;
+    let hull_dir = args.u64(4).ok_or(-10)?;
 
-    if slot_idx >= SHIPS_PER_PLAYER || dir8 > 7 {
+    if slot_idx >= SHIPS_PER_PLAYER || hull_dir > 2 {
         return Err(-30);
-    }
-    if speed_pct != 25 && speed_pct != 50 && speed_pct != 75 && speed_pct != 100 {
-        return Err(-34);
     }
 
     let mut hdr = load_hdr(&bid).ok_or(-13)?;
     sync_pending_shells(&bid, &mut hdr);
+
+    if dest_x >= (hdr.grid_w as u64) || dest_y >= (hdr.grid_h as u64) {
+        return Err(-33);
+    }
 
     let caller = context::msg_sender();
     let pid = find_pid(&bid, &caller).ok_or(-21)?;
@@ -1309,57 +1339,53 @@ fn handle_move_ship(args: &CalldataReader) -> Result<i32, i32> {
         return Err(-32);
     }
 
-    let max_spd = effective_max_speed(&ship);
-    let target_steps = (((max_spd as u32) * (speed_pct as u32) + 50) / 100).max(1) as i16;
-
-    let dx = DIR8_DX[dir8 as usize];
-    let dy = DIR8_DY[dir8 as usize];
     let from_x = ship.x;
     let from_y = ship.y;
+    let (w, h) = ship_dims(ship.class_id, ship.dir);
+    let from_cx = (from_x as i32) + ((w as i32) / 2);
+    let from_cy = (from_y as i32) + ((h as i32) / 2);
 
-    let preferred_hull_dir = if dir8 == 0 || dir8 == 4 {
-        1u8
-    } else if dir8 == 2 || dir8 == 6 {
-        0u8
+    let best_dir = if hull_dir <= 1 {
+        hull_dir as u8
     } else {
-        ship.dir
+        let raw_dx = ((dest_x as i32) - (from_x as i32)).abs();
+        let raw_dy = ((dest_y as i32) - (from_y as i32)).abs();
+        if raw_dx > raw_dy {
+            0
+        } else if raw_dy > raw_dx {
+            1
+        } else {
+            ship.dir
+        }
     };
 
-    let mut best_x = from_x;
-    let mut best_y = from_y;
-    let mut best_dir = ship.dir;
-    let mut actual_steps = 0u64;
-
-    let mut step = 1i16;
-    while step <= target_steps {
-        let nx = (from_x as i16) + dx * step;
-        let ny = (from_y as i16) + dy * step;
-        if in_ocean_bounds(hdr.grid_w, hdr.grid_h, ship.class_id, preferred_hull_dir, nx, ny) {
-            best_x = nx as u8;
-            best_y = ny as u8;
-            best_dir = preferred_hull_dir;
-            actual_steps = step as u64;
-        } else if preferred_hull_dir != ship.dir
-            && in_ocean_bounds(hdr.grid_w, hdr.grid_h, ship.class_id, ship.dir, nx, ny)
-        {
-            best_x = nx as u8;
-            best_y = ny as u8;
-            best_dir = ship.dir;
-            actual_steps = step as u64;
-        } else {
-            break;
-        }
-        step += 1;
+    let best_x = dest_x as u8;
+    let best_y = dest_y as u8;
+    if !in_ocean_bounds(hdr.grid_w, hdr.grid_h, ship.class_id, best_dir, best_x as i16, best_y as i16) {
+        return Err(-33);
+    }
+    if best_x == from_x && best_y == from_y && best_dir == ship.dir {
+        return Err(-35);
     }
 
-    if actual_steps == 0 {
-        return Err(-35); // right up against the ocean edge in chosen heading!
+    let (dw, dh) = ship_dims(ship.class_id, best_dir);
+    let dest_cx = (best_x as i32) + ((dw as i32) / 2);
+    let dest_cy = (best_y as i32) + ((dh as i32) / 2);
+    let dx = dest_cx - from_cx;
+    let dy = dest_cy - from_cy;
+    let dist_sq = (dx * dx + dy * dy) as u64;
+    let max_rng = effective_max_speed(&ship) as u64;
+    if dist_sq > max_rng * max_rng {
+        return Err(-34);
     }
+
+    let heading8 = heading8_from_delta(dx, dy, ship.pad);
+    let dist_tiles = isqrt_u64(dist_sq).max(1);
 
     ship.x = best_x;
     ship.y = best_y;
     ship.dir = best_dir;
-    ship.pad = dir8 as u8;
+    ship.pad = heading8;
     ship.last_move_block = blk;
 
     // Emit 8-word (64-byte) `ShipMoved` payload first so UI always teleports to `(best_x, best_y)`!
@@ -1370,8 +1396,8 @@ fn handle_move_ship(args: &CalldataReader) -> Result<i32, i32> {
     ev[24..32].copy_from_slice(&(best_x as u64).to_be_bytes());
     ev[32..40].copy_from_slice(&(best_y as u64).to_be_bytes());
     ev[40..48].copy_from_slice(&(best_dir as u64).to_be_bytes());
-    ev[48..56].copy_from_slice(&dir8.to_be_bytes());
-    ev[56..64].copy_from_slice(&actual_steps.to_be_bytes());
+    ev[48..56].copy_from_slice(&(heading8 as u64).to_be_bytes());
+    ev[56..64].copy_from_slice(&dist_tiles.to_be_bytes());
     events::emit(&[EV_SHIP_MOVED, bid, addr_topic(&caller)], &ev);
 
     // Resolve vessel-to-vessel hull collisions if 2+ vessels now overlap grid squares!
@@ -1793,16 +1819,33 @@ mod tests {
         )
         .unwrap();
 
-        // Move Gunboat NE (`dir8 = 1`, dx=+1, dy=-1) at `50%` throttle (`6` squares) -> `(9, 12)`!
+        // Verify destination outside max range circle (`max_rng = 12`) is rejected (`-34`)!
         mock::set_block_number(601);
+        assert_eq!(
+            mock::transact_as(
+                red_p,
+                CONTRACT,
+                CallEncoder::<256>::new(selector("moveShip(bytes32,uint64,uint64,uint64,uint64)"))
+                    .push_bytes32(&bid)
+                    .push_u64(0)
+                    .push_u64(25) // dx=22 > 12!
+                    .push_u64(18)
+                    .push_u64(0)
+                    .as_slice(),
+            ),
+            Err(-34)
+        );
+
+        // Free 2D move inside Gunboat's 12-tile circle (even off-axis, e.g. `(3, 18) -> (9, 12)`, `dx=6, dy=-6`, `dist_sq=72 <= 144`)!
         let mv_out = mock::transact_as(
             red_p,
             CONTRACT,
-            CallEncoder::<256>::new(selector("moveShip(bytes32,uint64,uint64,uint64)"))
+            CallEncoder::<256>::new(selector("moveShip(bytes32,uint64,uint64,uint64,uint64)"))
                 .push_bytes32(&bid)
-                .push_u64(0)  // slot 0
-                .push_u64(1)  // NE
-                .push_u64(50) // 50% of 12 = 6 squares
+                .push_u64(0) // slot 0
+                .push_u64(9)
+                .push_u64(12)
+                .push_u64(0)
                 .as_slice(),
         )
         .unwrap();
@@ -1825,16 +1868,17 @@ mod tests {
         )
         .unwrap();
 
-        // Red moves Gunboat E (`dir8 = 2`) at `25%` (`3` squares -> `(12, 12)`) and fires Autocannon (`range 10`) at `(20, 12)`!
+        // Red moves Gunboat directly to `(12, 12)` and fires Autocannon (`range 10`) at `(20, 12)`!
         mock::set_block_number(602);
         mock::transact_as(
             red_p,
             CONTRACT,
-            CallEncoder::<256>::new(selector("moveShip(bytes32,uint64,uint64,uint64)"))
+            CallEncoder::<256>::new(selector("moveShip(bytes32,uint64,uint64,uint64,uint64)"))
                 .push_bytes32(&bid)
                 .push_u64(0)
-                .push_u64(2)  // E
-                .push_u64(25) // 25% of 12 = 3 squares -> (12, 12)
+                .push_u64(12)
+                .push_u64(12)
+                .push_u64(0)
                 .as_slice(),
         )
         .unwrap();
@@ -1877,11 +1921,12 @@ mod tests {
         mock::transact_as(
             blue_p,
             CONTRACT,
-            CallEncoder::<256>::new(selector("moveShip(bytes32,uint64,uint64,uint64)"))
+            CallEncoder::<256>::new(selector("moveShip(bytes32,uint64,uint64,uint64,uint64)"))
                 .push_bytes32(&bid)
                 .push_u64(0)
-                .push_u64(6)  // West
-                .push_u64(50) // 50% of (6 + 2) = 4 squares -> (16, 12)
+                .push_u64(16)
+                .push_u64(12)
+                .push_u64(0)
                 .as_slice(),
         )
         .unwrap();
@@ -1911,11 +1956,12 @@ mod tests {
             mock::transact_as(
                 blue_p,
                 CONTRACT,
-                CallEncoder::<256>::new(selector("moveShip(bytes32,uint64,uint64,uint64)"))
+                CallEncoder::<256>::new(selector("moveShip(bytes32,uint64,uint64,uint64,uint64)"))
                     .push_bytes32(&bid)
                     .push_u64(0)
-                    .push_u64(6)
-                    .push_u64(25)
+                    .push_u64(14)
+                    .push_u64(12)
+                    .push_u64(0)
                     .as_slice(),
             ),
             Err(-32)
@@ -1987,16 +2033,17 @@ mod tests {
         )
         .unwrap();
 
-        // 2. Red moves Cruiser East (`dir8 = 2`) at `100%` (`6` sq -> `(34, 10)`), directly overlapping Blue's Gunboat at `(34..36, 10)`!
+        // 2. Red moves Cruiser directly to `(34, 10)` inside its 6-tile max range, overlapping Blue's Gunboat at `(34..36, 10)`!
         mock::set_block_number(701);
         mock::transact_as(
             red_p,
             CONTRACT,
-            CallEncoder::<256>::new(selector("moveShip(bytes32,uint64,uint64,uint64)"))
+            CallEncoder::<256>::new(selector("moveShip(bytes32,uint64,uint64,uint64,uint64)"))
                 .push_bytes32(&bid)
                 .push_u64(0)
-                .push_u64(2)
-                .push_u64(100)
+                .push_u64(34)
+                .push_u64(10)
+                .push_u64(0)
                 .as_slice(),
         )
         .unwrap();
