@@ -28,9 +28,14 @@ pub const MAX_SHIPS: usize = 300;
 pub const MAX_INFLIGHT_SHELLS: usize = 128;
 
 pub const STARTING_CREDITS: u64 = 1000;
-pub const EMERGENCY_GUNBOAT_FLOOR: u64 = 200;
 pub const CREDITS_PER_CELL_HIT: u64 = 120;
 pub const REPAIR_COST_PER_CELL: u64 = 100;
+
+/// Combat Score points (tracked independently from spendable `Credits`!):
+/// - `+100 pts` per enemy hull square destroyed
+/// - `+250 / +450 / +750 / +1,500 pts` sink bonus by class
+pub const SCORE_PER_CELL_HIT: u64 = 100;
+pub const CLASS_SCORE_BONUS: [u64; 4] = [250, 450, 750, 1500];
 
 pub const TEAM_RED: u8 = 0;
 pub const TEAM_BLUE: u8 = 1;
@@ -86,6 +91,8 @@ const EV_VESSEL_COLLISION: [u8; 32] = event_topic(
 const EV_WEAPON_FIRED: [u8; 32] =
     event_topic("WeaponFired(bytes32,uint64,uint64,uint64,uint64,uint64)");
 const EV_SHIP_SUNK: [u8; 32] = event_topic("ShipSunk(bytes32,uint64,uint64,uint64)");
+const EV_PLAYER_RESTARTED: [u8; 32] =
+    event_topic("PlayerRestarted(bytes32,address,uint64,uint64,uint64)");
 
 fn addr_topic(addr: &[u8; 20]) -> [u8; 32] {
     let mut t = [0u8; 32];
@@ -103,6 +110,7 @@ hps_entry! {
     "joinAndDeploy(bytes32,uint64,uint64,uint64,uint64)"                          => handle_join_and_deploy,
     "joinAndDeployWithIdentity(bytes32,uint64,address,uint64,uint64,uint64)"      => handle_join_and_deploy_with_identity,
     "setPlayerIdentity(bytes32,address)"                                          => handle_set_player_identity,
+    "startAnew(bytes32,uint64,uint64,uint64)"                                     => handle_start_anew,
     "buyShip(bytes32,uint64,uint64,uint64,uint64,uint64)"                         => handle_buy_ship,
     "moveShip(bytes32,uint64,uint64,uint64)"                      => handle_move_ship,
     "fireWeapon(bytes32,uint64,uint64,uint64)"                    => handle_fire_weapon,
@@ -174,13 +182,14 @@ struct PlayerRec {
     addr: [u8; 20],
     team: u8,
     kills: u16,
-    pad: u8,
+    restarts: u8,
     credits: u64,
     score: u64,
     identity_addr: [u8; 20],
+    best_score: u64,
 }
 
-const PLR_LEN: usize = 60;
+const PLR_LEN: usize = 68;
 
 impl PlayerRec {
     fn encode(&self) -> [u8; PLR_LEN] {
@@ -188,10 +197,11 @@ impl PlayerRec {
         b[0..20].copy_from_slice(&self.addr);
         b[20] = self.team;
         b[21..23].copy_from_slice(&self.kills.to_be_bytes());
-        b[23] = self.pad;
+        b[23] = self.restarts;
         b[24..32].copy_from_slice(&self.credits.to_be_bytes());
         b[32..40].copy_from_slice(&self.score.to_be_bytes());
         b[40..60].copy_from_slice(&self.identity_addr);
+        b[60..68].copy_from_slice(&self.best_score.to_be_bytes());
         b
     }
 
@@ -204,10 +214,11 @@ impl PlayerRec {
             addr,
             team: b[20],
             kills: u16::from_be_bytes([b[21], b[22]]),
-            pad: b[23],
+            restarts: b[23],
             credits: u64::from_be_bytes(b[24..32].try_into().unwrap()),
             score: u64::from_be_bytes(b[32..40].try_into().unwrap()),
             identity_addr: id_addr,
+            best_score: u64::from_be_bytes(b[60..68].try_into().unwrap()),
         }
     }
 }
@@ -570,6 +581,7 @@ fn detonate_salvo_at(
     }
 
     let mut credits_earned = 0u64;
+    let mut score_earned = 0u64;
     let mut kills_scored = 0u16;
 
     let total_ships = (hdr.player_count as u16).min(MAX_PLAYERS as u16) * 3;
@@ -585,6 +597,7 @@ fn detonate_salvo_at(
                     if ship.cell_dmg[h_idx] < 100 {
                         ship.cell_dmg[h_idx] = 100; // 100% square hit!
                         credits_earned += CREDITS_PER_CELL_HIT;
+                        score_earned += SCORE_PER_CELL_HIT;
                         touched = true;
                     }
                 }
@@ -604,7 +617,9 @@ fn detonate_salvo_at(
                 if breached >= CLASS_SINK_CELLS[ship.class_id as usize] {
                     ship.alive = 0;
                     let bounty = CLASS_BOUNTY[ship.class_id as usize];
+                    let score_bonus = CLASS_SCORE_BONUS[ship.class_id as usize];
                     credits_earned += bounty;
+                    score_earned += score_bonus;
                     kills_scored += 1;
                     if attacker_team == TEAM_RED {
                         hdr.red_kills += 1;
@@ -624,10 +639,13 @@ fn detonate_salvo_at(
         s_idx += 1;
     }
 
-    if credits_earned > 0 || kills_scored > 0 {
+    if credits_earned > 0 || score_earned > 0 || kills_scored > 0 {
         if let Some(mut att) = load_plr(bid, attacker_pid) {
             att.credits = att.credits.saturating_add(credits_earned);
-            att.score = att.score.saturating_add(credits_earned);
+            att.score = att.score.saturating_add(score_earned);
+            if att.score > att.best_score {
+                att.best_score = att.score;
+            }
             att.kills = att.kills.saturating_add(kills_scored);
             save_plr(bid, attacker_pid, &att);
         }
@@ -775,10 +793,11 @@ fn join_player_internal(
         addr: caller,
         team: assigned_team,
         kills: 0,
-        pad: 0,
+        restarts: 0,
         credits: STARTING_CREDITS,
         score: 0,
         identity_addr: [0u8; 20],
+        best_score: 0,
     };
     save_plr(bid, pid, &rec);
     storage::set(addr_pid_key(bid, &caller).as_slice(), &[pid]);
@@ -810,28 +829,21 @@ fn handle_join_battle(args: &CalldataReader) -> Result<i32, i32> {
     Ok(assigned_team as i32)
 }
 
-fn join_and_deploy_common(
-    bid: [u8; 32],
-    preferred_team: u64,
-    identity_addr: [u8; 20],
+fn spawn_starter_ships_internal(
+    bid: &[u8; 32],
+    hdr: &BattleHeader,
+    pid: u8,
+    team: u8,
+    plr: &mut PlayerRec,
     classes: [u64; 3],
-) -> Result<i32, i32> {
-    let mut hdr = load_hdr(&bid).ok_or(-13)?;
-    sync_pending_shells(&bid, &mut hdr);
-
-    let caller = context::msg_sender();
-    let (pid, team) = join_player_internal(&bid, &mut hdr, caller, preferred_team)?;
-    let mut plr = load_plr(&bid, pid).ok_or(-21)?;
-    if identity_addr != [0u8; 20] {
-        plr.identity_addr = identity_addr;
-    }
-
+    seed_salt: u16,
+) {
     let mut slot = 0usize;
     while slot < 3 {
         let cid = classes[slot];
         if cid < (CLASS_COUNT as u64) {
             let gidx = (pid as u16) * 3 + (slot as u16);
-            let existing = load_ship(&bid, gidx);
+            let existing = load_ship(bid, gidx);
             let cost = CLASS_COST[cid as usize];
             if existing.alive == 0 && plr.credits >= cost {
                 let l = CLASS_LEN[cid as usize];
@@ -839,8 +851,10 @@ fn join_and_deploy_common(
                 let max_x_span = hdr.grid_w.saturating_sub(l + 2).max(1);
                 let max_y_span = hdr.grid_h.saturating_sub(w + 2).max(1);
 
-                let x_seed = (((pid as u16) * 11 + (slot as u16) * 7 + 3) % (max_x_span as u16)) as u8;
-                let y_seed = (((pid as u16) * 7 + (slot as u16) * 5 + 2) % (max_y_span as u16)) as u8;
+                let x_seed =
+                    (((pid as u16) * 11 + (slot as u16) * 7 + 3 + seed_salt) % (max_x_span as u16)) as u8;
+                let y_seed =
+                    (((pid as u16) * 7 + (slot as u16) * 5 + 2 + seed_salt) % (max_y_span as u16)) as u8;
 
                 let mut placed = false;
                 let mut dy_off = 0u8;
@@ -867,16 +881,23 @@ fn join_and_deploy_common(
                             flash_y: 255,
                             pad2: [0; 2],
                         };
-                        if check_ship_placement_free(&bid, hdr.player_count, hdr.grid_w, hdr.grid_h, gidx, &cand) {
+                        if check_ship_placement_free(
+                            bid,
+                            hdr.player_count,
+                            hdr.grid_w,
+                            hdr.grid_h,
+                            gidx,
+                            &cand,
+                        ) {
                             plr.credits -= cost;
-                            save_ship(&bid, gidx, &cand);
+                            save_ship(bid, gidx, &cand);
                             let mut ev = [0u8; 40];
                             ev[0..8].copy_from_slice(&(gidx as u64).to_be_bytes());
                             ev[8..16].copy_from_slice(&(team as u64).to_be_bytes());
                             ev[16..24].copy_from_slice(&cid.to_be_bytes());
                             ev[24..32].copy_from_slice(&(x as u64).to_be_bytes());
                             ev[32..40].copy_from_slice(&(y as u64).to_be_bytes());
-                            events::emit(&[EV_SHIP_COMMISSIONED, bid], &ev);
+                            events::emit(&[EV_SHIP_COMMISSIONED, *bid], &ev);
                             placed = true;
                             break;
                         }
@@ -888,11 +909,83 @@ fn join_and_deploy_common(
         }
         slot += 1;
     }
+}
+
+fn join_and_deploy_common(
+    bid: [u8; 32],
+    preferred_team: u64,
+    identity_addr: [u8; 20],
+    classes: [u64; 3],
+) -> Result<i32, i32> {
+    let mut hdr = load_hdr(&bid).ok_or(-13)?;
+    sync_pending_shells(&bid, &mut hdr);
+
+    let caller = context::msg_sender();
+    let (pid, team) = join_player_internal(&bid, &mut hdr, caller, preferred_team)?;
+    let mut plr = load_plr(&bid, pid).ok_or(-21)?;
+    if identity_addr != [0u8; 20] {
+        plr.identity_addr = identity_addr;
+    }
+
+    spawn_starter_ships_internal(&bid, &hdr, pid, team, &mut plr, classes, 0);
 
     save_plr(&bid, pid, &plr);
     save_hdr(&bid, &hdr);
     ret::write_u64_word(team as u64);
     Ok(team as i32)
+}
+
+/// True Game-Over Restart (`startAnew`):
+/// - Allowed STRICTLY when the player has `0` alive ships AND `credits < 200` (cannot buy any vessel).
+/// - Locks Peak High Score (`best_score`), applies `-50%` penalty to `score` (`score / 2`),
+///   increments `restarts`, grants a fresh `1,000 CR` bankroll, and spawns up to 3 starter ships!
+fn handle_start_anew(args: &CalldataReader) -> Result<i32, i32> {
+    let bid = args.bytes32(0).ok_or(-10)?;
+    let s0 = args.u64(1).ok_or(-10)?;
+    let s1 = args.u64(2).ok_or(-10)?;
+    let s2 = args.u64(3).ok_or(-10)?;
+
+    let mut hdr = load_hdr(&bid).ok_or(-13)?;
+    sync_pending_shells(&bid, &mut hdr);
+
+    let caller = context::msg_sender();
+    let pid = find_pid(&bid, &caller).ok_or(-21)?;
+    let mut plr = load_plr(&bid, pid).ok_or(-21)?;
+
+    // Must have 0 alive ships
+    let sh0 = load_ship(&bid, (pid as u16) * 3).alive;
+    let sh1 = load_ship(&bid, (pid as u16) * 3 + 1).alive;
+    let sh2 = load_ship(&bid, (pid as u16) * 3 + 2).alive;
+    if sh0 != 0 || sh1 != 0 || sh2 != 0 {
+        return Err(-27);
+    }
+
+    // Must have < 200 CR (cannot buy even the cheapest Patrol Gunboat)
+    if plr.credits >= CLASS_COST[0] {
+        return Err(-28);
+    }
+
+    if plr.score > plr.best_score {
+        plr.best_score = plr.score;
+    }
+    plr.score /= 2; // -50% Current Score penalty!
+    plr.restarts = plr.restarts.saturating_add(1);
+    plr.credits = STARTING_CREDITS;
+
+    let salt = ((context::block_number() as u16).wrapping_mul(5)).wrapping_add((plr.restarts as u16) * 13);
+    spawn_starter_ships_internal(&bid, &hdr, pid, plr.team, &mut plr, [s0, s1, s2], salt);
+
+    save_plr(&bid, pid, &plr);
+    save_hdr(&bid, &hdr);
+
+    let mut ev = [0u8; 24];
+    ev[0..8].copy_from_slice(&plr.score.to_be_bytes());
+    ev[8..16].copy_from_slice(&plr.best_score.to_be_bytes());
+    ev[16..24].copy_from_slice(&(plr.restarts as u64).to_be_bytes());
+    events::emit(&[EV_PLAYER_RESTARTED, bid, addr_topic(&caller)], &ev);
+
+    ret::write_u64_word(plr.score);
+    Ok(plr.team as i32)
 }
 
 /// 1-Block Atomic Onboarding: joins battle (if not already joined) and auto-spawns up to 3 starter
@@ -952,15 +1045,6 @@ fn handle_buy_ship(args: &CalldataReader) -> Result<(), i32> {
     let existing = load_ship(&bid, gidx);
     if existing.alive != 0 {
         return Err(-22);
-    }
-
-    if class_id == 0 && plr.credits < EMERGENCY_GUNBOAT_FLOOR {
-        let s0 = load_ship(&bid, (pid as u16) * 3).alive;
-        let s1 = load_ship(&bid, (pid as u16) * 3 + 1).alive;
-        let s2 = load_ship(&bid, (pid as u16) * 3 + 2).alive;
-        if s0 == 0 && s1 == 0 && s2 == 0 {
-            plr.credits = EMERGENCY_GUNBOAT_FLOOR;
-        }
     }
 
     let cost = CLASS_COST[class_id as usize];
@@ -1045,6 +1129,7 @@ fn resolve_vessel_collisions(
     let (sw, sh) = ship_dims(ship.class_id, ship.dir);
     let total_slots = (hdr.player_count as u16).min(MAX_PLAYERS as u16) * 3;
     let mut mover_credits_earned = 0u64;
+    let mut mover_score_earned = 0u64;
     let mut mover_kills = 0u16;
     let mut last_enemy_collider: Option<(u8, u8)> = None;
 
@@ -1060,6 +1145,7 @@ fn resolve_vessel_collisions(
 
                 let mut overlap_squares = 0u64;
                 let mut other_credits_earned = 0u64;
+                let mut other_score_earned = 0u64;
 
                 let mut ry = 0u8;
                 while ry < sh {
@@ -1076,12 +1162,14 @@ fn resolve_vessel_collisions(
                                 ship.cell_dmg[s_idx] = 100;
                                 if is_enemy {
                                     other_credits_earned += CREDITS_PER_CELL_HIT;
+                                    other_score_earned += SCORE_PER_CELL_HIT;
                                 }
                             }
                             if other.cell_dmg[o_idx] < 100 {
                                 other.cell_dmg[o_idx] = 100;
                                 if is_enemy {
                                     mover_credits_earned += CREDITS_PER_CELL_HIT;
+                                    mover_score_earned += SCORE_PER_CELL_HIT;
                                 }
                             }
                         }
@@ -1098,6 +1186,7 @@ fn resolve_vessel_collisions(
                         let bounty = if is_enemy {
                             let b = CLASS_BOUNTY[other.class_id as usize];
                             mover_credits_earned += b;
+                            mover_score_earned += CLASS_SCORE_BONUS[other.class_id as usize];
                             mover_kills += 1;
                             if ship.team == TEAM_RED {
                                 hdr.red_kills += 1;
@@ -1116,10 +1205,13 @@ fn resolve_vessel_collisions(
                     }
                     save_ship(bid, other_gidx, &other);
 
-                    if other_credits_earned > 0 {
+                    if other_credits_earned > 0 || other_score_earned > 0 {
                         if let Some(mut oplr) = load_plr(bid, other.owner_pid) {
                             oplr.credits = oplr.credits.saturating_add(other_credits_earned);
-                            oplr.score = oplr.score.saturating_add(other_credits_earned);
+                            oplr.score = oplr.score.saturating_add(other_score_earned);
+                            if oplr.score > oplr.best_score {
+                                oplr.best_score = oplr.score;
+                            }
                             save_plr(bid, other.owner_pid, &oplr);
                         }
                     }
@@ -1145,6 +1237,7 @@ fn resolve_vessel_collisions(
         ship.alive = 0;
         let (killer_pid, bounty) = if let Some((enemy_pid, enemy_team)) = last_enemy_collider {
             let b = CLASS_BOUNTY[ship.class_id as usize];
+            let sb = CLASS_SCORE_BONUS[ship.class_id as usize];
             if enemy_team == TEAM_RED {
                 hdr.red_kills += 1;
             } else {
@@ -1152,7 +1245,10 @@ fn resolve_vessel_collisions(
             }
             if let Some(mut eplr) = load_plr(bid, enemy_pid) {
                 eplr.credits = eplr.credits.saturating_add(b);
-                eplr.score = eplr.score.saturating_add(b);
+                eplr.score = eplr.score.saturating_add(sb);
+                if eplr.score > eplr.best_score {
+                    eplr.best_score = eplr.score;
+                }
                 eplr.kills = eplr.kills.saturating_add(1);
                 save_plr(bid, enemy_pid, &eplr);
             }
@@ -1167,10 +1263,13 @@ fn resolve_vessel_collisions(
         events::emit(&[EV_SHIP_SUNK, *bid], &sev);
     }
 
-    if mover_credits_earned > 0 || mover_kills > 0 {
+    if mover_credits_earned > 0 || mover_score_earned > 0 || mover_kills > 0 {
         if let Some(mut mplr) = load_plr(bid, mover_pid) {
             mplr.credits = mplr.credits.saturating_add(mover_credits_earned);
-            mplr.score = mplr.score.saturating_add(mover_credits_earned);
+            mplr.score = mplr.score.saturating_add(mover_score_earned);
+            if mplr.score > mplr.best_score {
+                mplr.best_score = mplr.score;
+            }
             mplr.kills = mplr.kills.saturating_add(mover_kills);
             save_plr(bid, mover_pid, &mplr);
         }
@@ -1924,5 +2023,200 @@ mod tests {
         assert_eq!(st[38 + 11], 100);
         assert_eq!(st[38 + 12], 0);
         assert_eq!(st[38 + 13], 0);
+    }
+
+    #[test]
+    fn game_over_start_anew_applies_50_pct_score_penalty_and_preserves_best_score() {
+        mock::reset();
+        mock::register_hps(CONTRACT, dispatch_calldata);
+        mock::set_block_number(900);
+
+        let bid = [0x99; 32];
+        let red_p = [0xA1; 20];
+        let blue_p = [0xB1; 20];
+
+        mock::transact_as(
+            red_p,
+            CONTRACT,
+            CallEncoder::<128>::new(selector("createBattle(bytes32)"))
+                .push_bytes32(&bid)
+                .as_slice(),
+        )
+        .unwrap();
+        mock::transact_as(
+            red_p,
+            CONTRACT,
+            CallEncoder::<128>::new(selector("joinBattle(bytes32,uint64)"))
+                .push_bytes32(&bid)
+                .push_u64(0)
+                .as_slice(),
+        )
+        .unwrap();
+        mock::transact_as(
+            blue_p,
+            CONTRACT,
+            CallEncoder::<128>::new(selector("joinBattle(bytes32,uint64)"))
+                .push_bytes32(&bid)
+                .push_u64(1)
+                .as_slice(),
+        )
+        .unwrap();
+
+        // Red spends 900 CR (`1000 -> 100 CR`) on Cruiser (550) + Frigate (350) — wait: let's buy 1 Cruiser (550) + upgrade gun Howitzer (450) = 1000 CR (`0 CR` left)!
+        mock::transact_as(
+            red_p,
+            CONTRACT,
+            CallEncoder::<256>::new(selector("buyShip(bytes32,uint64,uint64,uint64,uint64,uint64)"))
+                .push_bytes32(&bid)
+                .push_u64(0)
+                .push_u64(2) // Cruiser (550 CR, 4x1)
+                .push_u64(10)
+                .push_u64(10)
+                .push_u64(0)
+                .as_slice(),
+        )
+        .unwrap();
+        mock::transact_as(
+            red_p,
+            CONTRACT,
+            CallEncoder::<192>::new(selector("upgradeGun(bytes32,uint64,uint64)"))
+                .push_bytes32(&bid)
+                .push_u64(0)
+                .push_u64(2) // Howitzer (450 CR) -> Red now has 0 CR!
+                .as_slice(),
+        )
+        .unwrap();
+
+        // Blue buys 2 Gunboats at (15, 10) and (25, 10)
+        mock::transact_as(
+            blue_p,
+            CONTRACT,
+            CallEncoder::<256>::new(selector("buyShip(bytes32,uint64,uint64,uint64,uint64,uint64)"))
+                .push_bytes32(&bid)
+                .push_u64(0)
+                .push_u64(0)
+                .push_u64(15)
+                .push_u64(10)
+                .push_u64(0)
+                .as_slice(),
+        )
+        .unwrap();
+        mock::transact_as(
+            blue_p,
+            CONTRACT,
+            CallEncoder::<256>::new(selector("buyShip(bytes32,uint64,uint64,uint64,uint64,uint64)"))
+                .push_bytes32(&bid)
+                .push_u64(1)
+                .push_u64(2) // Cruiser + Howitzer to sink Red
+                .push_u64(10)
+                .push_u64(16)
+                .push_u64(0)
+                .as_slice(),
+        )
+        .unwrap();
+
+        // Red sinks Blue's Gunboat #0 at (15..16, 10) with Howitzer (`+` cross):
+        // -> Red earns `2 * 120 + 120 = 360 CR`, and Score = `2 * 100 + 250 = 450 pts` (best_score = 450)!
+        mock::set_block_number(901);
+        mock::transact_as(
+            red_p,
+            CONTRACT,
+            CallEncoder::<192>::new(selector("fireWeapon(bytes32,uint64,uint64,uint64)"))
+                .push_bytes32(&bid)
+                .push_u64(0)
+                .push_u64(15)
+                .push_u64(10)
+                .as_slice(),
+        )
+        .unwrap();
+
+        // Red spends 200 CR on Engine Tier 1 -> 160 CR (< 200 CR!)
+        mock::transact_as(
+            red_p,
+            CONTRACT,
+            CallEncoder::<160>::new(selector("upgradeArmor(bytes32,uint64)"))
+                .push_bytes32(&bid)
+                .push_u64(0)
+                .as_slice(),
+        )
+        .unwrap();
+
+        // `startAnew` while Red still has an alive ship MUST fail with `-27`!
+        assert_eq!(
+            mock::transact_as(
+                red_p,
+                CONTRACT,
+                CallEncoder::<192>::new(selector("startAnew(bytes32,uint64,uint64,uint64)"))
+                    .push_bytes32(&bid)
+                    .push_u64(1)
+                    .push_u64(255)
+                    .push_u64(255)
+                    .as_slice(),
+            ),
+            Err(-27)
+        );
+
+        // Blue destroys all 4 cells of Red's Cruiser across 4 blocks -> Red has 0 alive ships & 160 CR (< 200 CR)!
+        for (idx, cx) in [10u64, 11, 12, 13].iter().enumerate() {
+            mock::set_block_number(902 + idx as u64);
+            mock::transact_as(
+                blue_p,
+                CONTRACT,
+                CallEncoder::<192>::new(selector("fireWeapon(bytes32,uint64,uint64,uint64)"))
+                    .push_bytes32(&bid)
+                    .push_u64(1)
+                    .push_u64(*cx)
+                    .push_u64(10)
+                    .as_slice(),
+            )
+            .unwrap();
+        }
+
+        // Buying a Gunboat directly MUST fail (`-23`) because free stipend is removed (true Game Over)!
+        assert_eq!(
+            mock::transact_as(
+                red_p,
+                CONTRACT,
+                CallEncoder::<256>::new(selector("buyShip(bytes32,uint64,uint64,uint64,uint64,uint64)"))
+                    .push_bytes32(&bid)
+                    .push_u64(0)
+                    .push_u64(0)
+                    .push_u64(5)
+                    .push_u64(5)
+                    .push_u64(0)
+                    .as_slice(),
+            ),
+            Err(-23)
+        );
+
+        // Now `startAnew` succeeds: score `450 -> 225` (-50%), `best_score == 450`, `restarts == 1`, `credits == 1000 - 350 == 650`!
+        mock::set_block_number(910);
+        mock::transact_as(
+            red_p,
+            CONTRACT,
+            CallEncoder::<192>::new(selector("startAnew(bytes32,uint64,uint64,uint64)"))
+                .push_bytes32(&bid)
+                .push_u64(1) // Frigate (350 CR)
+                .push_u64(255)
+                .push_u64(255)
+                .as_slice(),
+        )
+        .unwrap();
+
+        let plrs_raw = mock::transact_as(
+            red_p,
+            CONTRACT,
+            CallEncoder::<160>::new(selector("getPlayersSlice(bytes32,uint64,uint64)"))
+                .push_bytes32(&bid)
+                .push_u64(0)
+                .push_u64(10)
+                .as_slice(),
+        )
+        .unwrap();
+        let rec0 = PlayerRec::decode(plrs_raw[8..8 + PLR_LEN].try_into().unwrap());
+        assert_eq!(rec0.restarts, 1);
+        assert_eq!(rec0.credits, 650);
+        assert_eq!(rec0.score, 225);
+        assert_eq!(rec0.best_score, 450);
     }
 }
