@@ -1,26 +1,15 @@
 //! # Phantom Fleet: 100-Player Red vs. Blue Naval Warfare & Economy (`battleship` — HPS #13)
 //!
-//! Designed specifically for SuperLexicon's **public, `$0.00`-gas, `~4.3s`-block ledger**:
+//! Designed for SuperLexicon's live Subnet 1 ledger:
 //! 1. **Up to 100 Captains (`50 Red vs. 50 Blue`)** with strict on-chain team balancing
 //!    (`|red_count - blue_count| <= 1`) and **`1,000 Credits (CR)`** starting bankroll.
-//! 2. **Dynamic High-Resolution Ocean Grid (`32x32` -> `149x149`)**:
-//!    Automatically expands outward symmetrically as more captains join so crowded seas open up
-//!    without disrupting ongoing ship coordinates or in-flight shells.
-//! 3. **4 Multi-Cell Warship Classes (`up to 3 active ships per player = 300 ships max`)**:
-//!    - `0` Gunboat (`2x1`, `2` cells, `200 CR`, Speed `3`, Max Mount `S`, Base Armor `10%`)
-//!    - `1` Frigate (`3x1`, `3` cells, `350 CR`, Speed `2`, Max Mount `M`, Base Armor `20%`)
-//!    - `2` Heavy Cruiser (`4x1`, `4` cells, `550 CR`, Speed `2`, Max Mount `L`, Base Armor `30%`)
-//!    - `3` Dreadnought (`5x2`, `10` cells, `1100 CR`, Speed `1`, Max Mount `XL`, Base Armor `45%`)
-//! 4. **5 Upgradable Weapons (Gated by Credits AND Hull Mount Size)**:
-//!    - `0` Deck Autocannon (`S`, `0 CR`, Range `9`, `1x1`, `38%` dmg, `0`-blk instant)
-//!    - `1` Twin Flak Mortar (`S`, `250 CR`, Range `8`, `2x2` area, `28%` dmg, `0`-blk instant)
-//!    - `2` Cluster Rocket Pod (`M`, `450 CR`, Range `13`, `+` 5-cell cross, `36%/22%` dmg, `1`-blk ToF)
-//!    - `3` Broadside Howitzer (`L`, `700 CR`, Range `16`, `2x2` area, `54%` dmg, `1`-blk ToF)
-//!    - `4` Siege Railgun (`XL`, `1100 CR`, Range `30`, `1x1` AP, `92%` dmg, pierces 1/2 armor, `1`-blk ToF)
-//! 5. **Per-Cell `0%–100%` Structural Damage, Armor Plating, Combat Credits & Paid Repairs**:
-//!    - Earn `+2 CR` per `1%` hull damage inflicted + `40%` hull-cost Kill Bounties.
-//!    - Spend Credits to buy replacement ships, upgrade guns/armor (`+15%` / `+30%`), or pay
-//!      `1 CR` per `1%` cell damage restored (`repairShip`, up to `40%` per cell while cutting engines).
+//! 2. **Dynamic High-Resolution Ocean Grid (`40x25` -> `189x118`)**.
+//! 3. **8-Direction Compass + Percentage Throttle Navigation (`25% / 50% / 75% / 100%` Max Speed)**:
+//!    - HFS computes target grid coordinates from `(dir8, speedPct)` and emits `ShipMoved` so clients
+//!      teleport ships directly to the HFS-verified coordinates from the transaction receipt log.
+//! 4. **Crisp 1-Hit (`100%`) Per-Square Hull Destruction**:
+//!    - Every weapon impact on an intact ship square immediately destroys that square (`100%`),
+//!      awarding `+120 CR` per square destroyed + `CLASS_BOUNTY` when all squares of the ship are hit.
 
 #![cfg_attr(target_arch = "wasm32", no_std)]
 #![cfg_attr(target_arch = "wasm32", no_main)]
@@ -40,6 +29,8 @@ pub const MAX_INFLIGHT_SHELLS: usize = 128;
 
 pub const STARTING_CREDITS: u64 = 1000;
 pub const EMERGENCY_GUNBOAT_FLOOR: u64 = 200;
+pub const CREDITS_PER_CELL_HIT: u64 = 120;
+pub const REPAIR_COST_PER_CELL: u64 = 100;
 
 pub const TEAM_RED: u8 = 0;
 pub const TEAM_BLUE: u8 = 1;
@@ -49,31 +40,34 @@ pub const BASE_GRID_H: u8 = 25;
 pub const MAX_GRID_W: u8 = 200;
 pub const MAX_GRID_H: u8 = 125;
 
-/// Ship classes (`0..=3`).
+/// Ship classes (`0..=3`): Gunboat (`2x1`), Frigate (`3x1`), Cruiser (`4x1`), Dreadnought (`5x2`).
 pub const CLASS_COUNT: usize = 4;
 pub const CLASS_LEN: [u8; 4] = [2, 3, 4, 5];
 pub const CLASS_WID: [u8; 4] = [1, 1, 1, 2];
 pub const CLASS_CELLS: [u8; 4] = [2, 3, 4, 10];
 pub const CLASS_COST: [u64; 4] = [200, 350, 550, 1100];
-pub const CLASS_BOUNTY: [u64; 4] = [80, 140, 220, 440];
-pub const CLASS_SPEED: [u8; 4] = [3, 2, 2, 1];
-pub const CLASS_BASE_ARMOR: [u8; 4] = [10, 20, 30, 45];
-pub const CLASS_SINK_CELLS: [u8; 4] = [2, 3, 3, 8]; // >= 75% cells at 100% damage sinks ship
+pub const CLASS_BOUNTY: [u64; 4] = [120, 200, 320, 600];
+/// Base Max Speed at `100%` throttle (in grid squares per move):
+/// Gunboat = 12 sq, Frigate = 8 sq, Heavy Cruiser = 6 sq, Dreadnought = 4 sq.
+pub const CLASS_MAX_SPEED: [u8; 4] = [12, 8, 6, 4];
+pub const CLASS_SINK_CELLS: [u8; 4] = [2, 3, 4, 10];
 
-/// Weapon systems (`0..=4`).
+/// Weapon systems (`0..=4`) — instant `100%` destruction on every hit square in the blast pattern!
 pub const GUN_COUNT: usize = 5;
 pub const GUN_MIN_CLASS: [u8; 5] = [0, 0, 1, 2, 3]; // S=0, M=1, L=2, XL=3
 pub const GUN_COST: [u64; 5] = [0, 250, 450, 700, 1100];
-pub const GUN_RANGE: [u16; 5] = [9, 8, 13, 16, 30];
-pub const GUN_PRIMARY_DMG: [u8; 5] = [38, 28, 36, 54, 92];
-pub const GUN_SPLASH_DMG: [u8; 5] = [0, 28, 22, 54, 0];
+pub const GUN_RANGE: [u16; 5] = [10, 9, 14, 18, 30];
 pub const GUN_PATTERN: [u8; 5] = [0, 1, 2, 1, 0]; // 0 = 1x1, 1 = 2x2, 2 = '+' 5-cell cross
-pub const GUN_FLIGHT_BLOCKS: [u8; 5] = [0, 0, 1, 1, 1];
+pub const GUN_FLIGHT_BLOCKS: [u8; 5] = [0, 0, 0, 0, 0];
 
-/// Armor upgrade tiers (`0..=2`).
-pub const ARMOR_MAX_TIER: u8 = 2;
-pub const ARMOR_UPGRADE_COST: [u64; 2] = [200, 450]; // 0->1 costs 200, 1->2 costs 450
-pub const ARMOR_BONUS: [u8; 3] = [0, 15, 30];
+/// Engine / Turbine upgrade tiers (`0..=2`, stored in `ship.armor_tier` for binary compatibility).
+pub const ENGINE_MAX_TIER: u8 = 2;
+pub const ENGINE_UPGRADE_COST: [u64; 2] = [200, 450];
+pub const ENGINE_SPEED_BONUS: [u8; 3] = [0, 2, 4];
+
+/// 8 Compass Directions (`0..=7`: N, NE, E, SE, S, SW, W, NW).
+const DIR8_DX: [i16; 8] = [0, 1, 1, 1, 0, -1, -1, -1];
+const DIR8_DY: [i16; 8] = [-1, -1, 0, 1, 1, 1, 0, -1];
 
 // ---------------------------------------------------------------------------
 // Indexed Events
@@ -83,9 +77,18 @@ const EV_BATTLE_CREATED: [u8; 32] = event_topic("BattleCreated(bytes32,uint64)")
 const EV_PLAYER_JOINED: [u8; 32] = event_topic("PlayerJoined(bytes32,address,uint64,uint64,uint64)");
 const EV_SHIP_COMMISSIONED: [u8; 32] =
     event_topic("ShipCommissioned(bytes32,uint64,uint64,uint64,uint64,uint64)");
+const EV_SHIP_MOVED: [u8; 32] = event_topic(
+    "ShipMoved(bytes32,address,uint64,uint64,uint64,uint64,uint64,uint64,uint64,uint64)",
+);
 const EV_WEAPON_FIRED: [u8; 32] =
     event_topic("WeaponFired(bytes32,uint64,uint64,uint64,uint64,uint64)");
 const EV_SHIP_SUNK: [u8; 32] = event_topic("ShipSunk(bytes32,uint64,uint64,uint64)");
+
+fn addr_topic(addr: &[u8; 20]) -> [u8; 32] {
+    let mut t = [0u8; 32];
+    t[12..32].copy_from_slice(addr);
+    t
+}
 
 // ---------------------------------------------------------------------------
 // HPS Entrypoint Table
@@ -94,11 +97,12 @@ const EV_SHIP_SUNK: [u8; 32] = event_topic("ShipSunk(bytes32,uint64,uint64,uint6
 hps_entry! {
     "createBattle(bytes32)"                                       => handle_create_battle,
     "joinBattle(bytes32,uint64)"                                  => handle_join_battle,
+    "joinAndDeploy(bytes32,uint64,uint64,uint64,uint64)"          => handle_join_and_deploy,
     "buyShip(bytes32,uint64,uint64,uint64,uint64,uint64)"         => handle_buy_ship,
-    "moveShip(bytes32,uint64,uint64,uint64,uint64)"               => handle_move_ship,
+    "moveShip(bytes32,uint64,uint64,uint64)"                      => handle_move_ship,
     "fireWeapon(bytes32,uint64,uint64,uint64)"                    => handle_fire_weapon,
     "upgradeGun(bytes32,uint64,uint64)"                           => handle_upgrade_gun,
-    "upgradeArmor(bytes32,uint64)"                                => handle_upgrade_armor,
+    "upgradeArmor(bytes32,uint64)"                                => handle_upgrade_engine,
     "repairShip(bytes32,uint64)"                                  => handle_repair_ship,
     "resolvePendingShells(bytes32)"                               => handle_resolve_shells,
     "getBattleState(bytes32)"                                     => handle_get_battle_state,
@@ -109,7 +113,6 @@ hps_entry! {
 // State Records
 // ---------------------------------------------------------------------------
 
-/// Fixed 64-byte battle header under `"n:hdr:" || battleId`.
 #[derive(Clone, Copy)]
 struct BattleHeader {
     active: u8,
@@ -161,7 +164,6 @@ impl BattleHeader {
     }
 }
 
-/// Fixed 40-byte player record under `"n:plr:" || battleId || pid(1B)`.
 #[derive(Clone, Copy)]
 struct PlayerRec {
     addr: [u8; 20],
@@ -201,7 +203,6 @@ impl PlayerRec {
 }
 
 /// Fixed 32-byte ship record under `"n:shp:" || battleId || ship_global_idx(u16 BE)`.
-/// `ship_global_idx = player_id * 3 + slot_idx` (`0..299`).
 #[derive(Clone, Copy)]
 struct ShipRec {
     alive: u8,
@@ -209,12 +210,12 @@ struct ShipRec {
     team: u8,
     class_id: u8,
     gun_id: u8,
-    armor_tier: u8,
-    dir: u8, // 0 = Horizontal (L along X, W along Y), 1 = Vertical (L along Y, W along X)
+    armor_tier: u8, // Engine / Turbine tier (`0..=2`, `+0/+2/+4` squares max speed)
+    dir: u8,        // 0 = Horizontal (L along X, W along Y), 1 = Vertical (L along Y, W along X)
     x: u8,
     y: u8,
-    pad: u8,
-    cell_dmg: [u8; 10], // 0..=100 percentage damage for each of up to 10 hull grid cells!
+    pad: u8,        // Stores last compass heading `dir8` (`0..=7`)
+    cell_dmg: [u8; 10], // Binary: `0` = Intact, `100` = Destroyed (100% hit)!
     last_move_block: u32,
     last_fire_block: u32,
     flash_x: u8,
@@ -236,7 +237,7 @@ impl ShipRec {
             dir: 0,
             x: 0,
             y: 0,
-            pad: 0,
+            pad: 2,
             cell_dmg: [0; 10],
             last_move_block: 0,
             last_fire_block: 0,
@@ -291,7 +292,6 @@ impl ShipRec {
     }
 }
 
-/// Fixed 16-byte in-flight shell record under `"n:shl:" || battleId || idx(u16 BE)`.
 #[derive(Clone, Copy)]
 struct PendingShell {
     active: u8,
@@ -423,10 +423,9 @@ fn save_shell(bid: &[u8; 32], idx: u16, sh: &PendingShell) {
 }
 
 // ---------------------------------------------------------------------------
-// Dynamic Grid Math, Geometry, & Damage Resolution
+// Dynamic Grid Math, Geometry, & Instant 100% Square Hit Resolution
 // ---------------------------------------------------------------------------
 
-/// Dynamic `16:10` widescreen landscape grid (`40x25` at `<=4` players up to `190x118` at `100` players).
 pub fn compute_dynamic_grid_dims(player_count: u8) -> (u8, u8) {
     if player_count <= 4 {
         return (BASE_GRID_W, BASE_GRID_H);
@@ -452,7 +451,12 @@ fn ship_dims(class_id: u8, dir: u8) -> (u8, u8) {
     }
 }
 
-/// Check if `(cx, cy)` lies inside `ship`'s footprint, returning cell index `0..(cells-1)`.
+fn effective_max_speed(ship: &ShipRec) -> u8 {
+    let base = CLASS_MAX_SPEED[(ship.class_id as usize).min(CLASS_COUNT - 1)];
+    let bonus = ENGINE_SPEED_BONUS[(ship.armor_tier as usize).min(2)];
+    base.saturating_add(bonus)
+}
+
 fn cell_index_on_ship(ship: &ShipRec, cx: u8, cy: u8) -> Option<usize> {
     if ship.alive == 0 {
         return None;
@@ -514,16 +518,8 @@ fn check_ship_placement_free(
     true
 }
 
-fn abs_u8(a: u8, b: u8) -> u8 {
-    if a >= b {
-        a - b
-    } else {
-        b - a
-    }
-}
-
-/// Apply a weapon detonation at `(tx, ty)` against all enemy ships, awarding `+2 CR` per `1%`
-/// hull damage dealt + `CLASS_BOUNTY` on sinks!
+/// Every hit on an intact ship square deals instant `100%` square destruction (`cell_dmg = 100`),
+/// awarding `CREDITS_PER_CELL_HIT` (`+120 CR`) + `CLASS_BOUNTY` when all hull squares are hit!
 fn detonate_salvo_at(
     bid: &[u8; 32],
     hdr: &mut BattleHeader,
@@ -535,38 +531,32 @@ fn detonate_salvo_at(
 ) {
     let g = gun_id as usize;
     let pattern = GUN_PATTERN[g];
-    let prim = GUN_PRIMARY_DMG[g];
-    let splash = GUN_SPLASH_DMG[g];
 
-    // Up to 5 impact cells `(ix, iy, raw_dmg)`
-    let mut cells = [(0u8, 0u8, 0u8); 5];
+    let mut cells = [(0u8, 0u8); 5];
     let mut cell_n = 0usize;
 
     let gw = hdr.grid_w as i16;
     let gh = hdr.grid_h as i16;
-    let mut push_cell = |cx: i16, cy: i16, dmg: u8| {
-        if cx >= 0 && cy >= 0 && cx < gw && cy < gh && dmg > 0 && cell_n < 5 {
-            cells[cell_n] = (cx as u8, cy as u8, dmg);
+    let mut push_cell = |cx: i16, cy: i16| {
+        if cx >= 0 && cy >= 0 && cx < gw && cy < gh && cell_n < 5 {
+            cells[cell_n] = (cx as u8, cy as u8);
             cell_n += 1;
         }
     };
 
     if pattern == 0 {
-        // 1x1 pinpoint
-        push_cell(tx as i16, ty as i16, prim);
+        push_cell(tx as i16, ty as i16);
     } else if pattern == 1 {
-        // 2x2 area spread
-        push_cell(tx as i16, ty as i16, prim);
-        push_cell(tx as i16 + 1, ty as i16, splash);
-        push_cell(tx as i16, ty as i16 + 1, splash);
-        push_cell(tx as i16 + 1, ty as i16 + 1, splash);
+        push_cell(tx as i16, ty as i16);
+        push_cell(tx as i16 + 1, ty as i16);
+        push_cell(tx as i16, ty as i16 + 1);
+        push_cell(tx as i16 + 1, ty as i16 + 1);
     } else {
-        // '+' 5-cell cross
-        push_cell(tx as i16, ty as i16, prim);
-        push_cell(tx as i16 + 1, ty as i16, splash);
-        push_cell(tx as i16 - 1, ty as i16, splash);
-        push_cell(tx as i16, ty as i16 + 1, splash);
-        push_cell(tx as i16, ty as i16 - 1, splash);
+        push_cell(tx as i16, ty as i16);
+        push_cell(tx as i16 + 1, ty as i16);
+        push_cell(tx as i16 - 1, ty as i16);
+        push_cell(tx as i16, ty as i16 + 1);
+        push_cell(tx as i16, ty as i16 - 1);
     }
 
     let mut credits_earned = 0u64;
@@ -578,25 +568,13 @@ fn detonate_salvo_at(
         let mut ship = load_ship(bid, s_idx);
         if ship.alive != 0 && ship.team != attacker_team {
             let mut touched = false;
-            let base_arm = CLASS_BASE_ARMOR[ship.class_id as usize];
-            let bonus_arm = ARMOR_BONUS[(ship.armor_tier as usize).min(2)];
-            let mut eff_armor = (base_arm + bonus_arm).min(70) as u32;
-            if gun_id == 4 {
-                // Siege Railgun pierces half of armor!
-                eff_armor /= 2;
-            }
-
             let mut c = 0usize;
             while c < cell_n {
-                let (ix, iy, raw_dmg) = cells[c];
+                let (ix, iy) = cells[c];
                 if let Some(h_idx) = cell_index_on_ship(&ship, ix, iy) {
-                    let prev = ship.cell_dmg[h_idx];
-                    if prev < 100 {
-                        let mitigated = ((raw_dmg as u32) * (100 - eff_armor) / 100).max(5) as u8;
-                        let next = prev.saturating_add(mitigated).min(100);
-                        let delta = (next - prev) as u64;
-                        ship.cell_dmg[h_idx] = next;
-                        credits_earned += delta * 2; // +2 CR per 1% hull damage dealt!
+                    if ship.cell_dmg[h_idx] < 100 {
+                        ship.cell_dmg[h_idx] = 100; // 100% square hit!
+                        credits_earned += CREDITS_PER_CELL_HIT;
                         touched = true;
                     }
                 }
@@ -604,7 +582,6 @@ fn detonate_salvo_at(
             }
 
             if touched {
-                // Count breached (`100%` damaged) cells to check sink threshold!
                 let n_cells = CLASS_CELLS[ship.class_id as usize] as usize;
                 let mut breached = 0u8;
                 let mut k = 0usize;
@@ -647,8 +624,6 @@ fn detonate_salvo_at(
     }
 }
 
-/// Piggybacked block-tick resolver: detonates any queued `1`-block Time-of-Flight shells
-/// whose `impact_block <= current_block`.
 fn sync_pending_shells(bid: &[u8; 32], hdr: &mut BattleHeader) {
     let blk = context::block_number();
     if blk <= hdr.last_resolved_block {
@@ -713,28 +688,26 @@ fn handle_create_battle(args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
-/// Join Red (`0`) or Blue (`1`) up to `100` players.
-/// Enforces `|red_count - blue_count| <= 1` and dynamically expands `grid_size` outward!
-fn handle_join_battle(args: &CalldataReader) -> Result<i32, i32> {
-    let bid = args.bytes32(0).ok_or(-10)?;
-    let preferred_team = args.u64(1).ok_or(-10)?;
+fn join_player_internal(
+    bid: &[u8; 32],
+    hdr: &mut BattleHeader,
+    caller: [u8; 20],
+    preferred_team: u64,
+) -> Result<(u8, u8), i32> {
     if preferred_team > 1 {
         return Err(-12);
     }
-
-    let mut hdr = load_hdr(&bid).ok_or(-13)?;
-    sync_pending_shells(&bid, &mut hdr);
-
-    if (hdr.player_count as u64) >= MAX_PLAYERS {
-        return Err(-14); // 100/100 full!
-    }
-
-    let caller = context::msg_sender();
-    if caller == [0u8; 20] || find_pid(&bid, &caller).is_some() {
+    if caller == [0u8; 20] {
         return Err(-15);
     }
+    if let Some(existing_pid) = find_pid(bid, &caller) {
+        let plr = load_plr(bid, existing_pid).ok_or(-15)?;
+        return Ok((existing_pid, plr.team));
+    }
+    if (hdr.player_count as u64) >= MAX_PLAYERS {
+        return Err(-14);
+    }
 
-    // Strict on-chain team auto-balance: allow at most +1 player imbalance!
     let assigned_team = if hdr.red_count > hdr.blue_count {
         TEAM_BLUE
     } else if hdr.blue_count > hdr.red_count {
@@ -751,7 +724,6 @@ fn handle_join_battle(args: &CalldataReader) -> Result<i32, i32> {
         hdr.blue_count += 1;
     }
 
-    // Dynamic Landscape Ocean Expansion: shift existing ships & in-flight shells symmetrically outward!
     let (new_w, new_h) = compute_dynamic_grid_dims(hdr.player_count);
     if new_w > hdr.grid_w || new_h > hdr.grid_h {
         let dx = (new_w.saturating_sub(hdr.grid_w)) / 2;
@@ -760,7 +732,7 @@ fn handle_join_battle(args: &CalldataReader) -> Result<i32, i32> {
             let existing_ships = (pid as u16) * 3;
             let mut s = 0u16;
             while s < existing_ships {
-                let mut sh = load_ship(&bid, s);
+                let mut sh = load_ship(bid, s);
                 if sh.alive != 0 {
                     sh.x = sh.x.saturating_add(dx);
                     sh.y = sh.y.saturating_add(dy);
@@ -768,18 +740,18 @@ fn handle_join_battle(args: &CalldataReader) -> Result<i32, i32> {
                         sh.flash_x = sh.flash_x.saturating_add(dx);
                         sh.flash_y = sh.flash_y.saturating_add(dy);
                     }
-                    save_ship(&bid, s, &sh);
+                    save_ship(bid, s, &sh);
                 }
                 s += 1;
             }
             let sc = (hdr.shell_count as usize).min(MAX_INFLIGHT_SHELLS);
             let mut q = 0usize;
             while q < sc {
-                if let Some(mut shl) = load_shell(&bid, q as u16) {
+                if let Some(mut shl) = load_shell(bid, q as u16) {
                     if shl.active != 0 {
                         shl.tx = shl.tx.saturating_add(dx);
                         shl.ty = shl.ty.saturating_add(dy);
-                        save_shell(&bid, q as u16, &shl);
+                        save_shell(bid, q as u16, &shl);
                     }
                 }
                 q += 1;
@@ -797,19 +769,121 @@ fn handle_join_battle(args: &CalldataReader) -> Result<i32, i32> {
         credits: STARTING_CREDITS,
         score: 0,
     };
-    save_plr(&bid, pid, &rec);
-    storage::set(addr_pid_key(&bid, &caller).as_slice(), &[pid]);
-    save_hdr(&bid, &hdr);
+    save_plr(bid, pid, &rec);
+    storage::set(addr_pid_key(bid, &caller).as_slice(), &[pid]);
 
     let mut ev = [0u8; 44];
     ev[0..20].copy_from_slice(&caller);
     ev[20..28].copy_from_slice(&(pid as u64).to_be_bytes());
     ev[28..36].copy_from_slice(&(assigned_team as u64).to_be_bytes());
     ev[36..44].copy_from_slice(&(((hdr.grid_w as u64) << 8) | (hdr.grid_h as u64)).to_be_bytes());
-    events::emit(&[EV_PLAYER_JOINED, bid], &ev);
+    events::emit(&[EV_PLAYER_JOINED, *bid], &ev);
+
+    Ok((pid, assigned_team))
+}
+
+fn handle_join_battle(args: &CalldataReader) -> Result<i32, i32> {
+    let bid = args.bytes32(0).ok_or(-10)?;
+    let preferred_team = args.u64(1).ok_or(-10)?;
+    let mut hdr = load_hdr(&bid).ok_or(-13)?;
+    sync_pending_shells(&bid, &mut hdr);
+
+    let caller = context::msg_sender();
+    if find_pid(&bid, &caller).is_some() {
+        return Err(-15);
+    }
+    let (_pid, assigned_team) = join_player_internal(&bid, &mut hdr, caller, preferred_team)?;
+    save_hdr(&bid, &hdr);
 
     ret::write_u64_word(assigned_team as u64);
     Ok(assigned_team as i32)
+}
+
+/// 1-Block Atomic Onboarding: joins battle (if not already joined) and auto-spawns up to 3 starter
+/// ships (`s0, s1, s2`, pass `255` for empty slot) in unobstructed team-side coordinates!
+fn handle_join_and_deploy(args: &CalldataReader) -> Result<i32, i32> {
+    let bid = args.bytes32(0).ok_or(-10)?;
+    let preferred_team = args.u64(1).ok_or(-10)?;
+    let s0 = args.u64(2).ok_or(-10)?;
+    let s1 = args.u64(3).ok_or(-10)?;
+    let s2 = args.u64(4).ok_or(-10)?;
+
+    let mut hdr = load_hdr(&bid).ok_or(-13)?;
+    sync_pending_shells(&bid, &mut hdr);
+
+    let caller = context::msg_sender();
+    let (pid, team) = join_player_internal(&bid, &mut hdr, caller, preferred_team)?;
+    let mut plr = load_plr(&bid, pid).ok_or(-21)?;
+
+    let classes = [s0, s1, s2];
+    let half = hdr.grid_w / 2;
+    let mut slot = 0usize;
+    while slot < 3 {
+        let cid = classes[slot];
+        if cid < (CLASS_COUNT as u64) {
+            let gidx = (pid as u16) * 3 + (slot as u16);
+            let existing = load_ship(&bid, gidx);
+            let cost = CLASS_COST[cid as usize];
+            if existing.alive == 0 && plr.credits >= cost {
+                let l = CLASS_LEN[cid as usize];
+                let w = CLASS_WID[cid as usize];
+                let (x_start, x_end) = if team == TEAM_RED {
+                    (2u8, half.saturating_sub(l + 1))
+                } else {
+                    (half + 2, hdr.grid_w.saturating_sub(l + 1))
+                };
+
+                let mut placed = false;
+                let y_seed = ((pid as u16 * 5 + slot as u16 * 4 + 2) % (hdr.grid_h.saturating_sub(w + 2).max(1) as u16)) as u8 + 1;
+                let mut dy_off = 0u8;
+                while dy_off < hdr.grid_h && !placed {
+                    let y = 1 + ((y_seed + dy_off) % hdr.grid_h.saturating_sub(w + 1).max(1));
+                    let mut x = x_start;
+                    while x <= x_end {
+                        let cand = ShipRec {
+                            alive: 1,
+                            owner_pid: pid,
+                            team,
+                            class_id: cid as u8,
+                            gun_id: 0,
+                            armor_tier: 0,
+                            dir: 0,
+                            x,
+                            y,
+                            pad: if team == TEAM_RED { 2 } else { 6 },
+                            cell_dmg: [0; 10],
+                            last_move_block: 0,
+                            last_fire_block: 0,
+                            flash_x: 255,
+                            flash_y: 255,
+                            pad2: [0; 2],
+                        };
+                        if check_ship_placement_free(&bid, hdr.player_count, hdr.grid_w, hdr.grid_h, gidx, &cand) {
+                            plr.credits -= cost;
+                            save_ship(&bid, gidx, &cand);
+                            let mut ev = [0u8; 40];
+                            ev[0..8].copy_from_slice(&(gidx as u64).to_be_bytes());
+                            ev[8..16].copy_from_slice(&(team as u64).to_be_bytes());
+                            ev[16..24].copy_from_slice(&cid.to_be_bytes());
+                            ev[24..32].copy_from_slice(&(x as u64).to_be_bytes());
+                            ev[32..40].copy_from_slice(&(y as u64).to_be_bytes());
+                            events::emit(&[EV_SHIP_COMMISSIONED, bid], &ev);
+                            placed = true;
+                            break;
+                        }
+                        x += 2;
+                    }
+                    dy_off += 2;
+                }
+            }
+        }
+        slot += 1;
+    }
+
+    save_plr(&bid, pid, &plr);
+    save_hdr(&bid, &hdr);
+    ret::write_u64_word(team as u64);
+    Ok(team as i32)
 }
 
 fn handle_buy_ship(args: &CalldataReader) -> Result<(), i32> {
@@ -834,10 +908,9 @@ fn handle_buy_ship(args: &CalldataReader) -> Result<(), i32> {
     let gidx = (pid as u16) * 3 + (slot_idx as u16);
     let existing = load_ship(&bid, gidx);
     if existing.alive != 0 {
-        return Err(-22); // slot already has an active ship!
+        return Err(-22);
     }
 
-    // Emergency Gunboat stipend if all 3 slots are sunk and player has < 200 CR
     if class_id == 0 && plr.credits < EMERGENCY_GUNBOAT_FLOOR {
         let s0 = load_ship(&bid, (pid as u16) * 3).alive;
         let s1 = load_ship(&bid, (pid as u16) * 3 + 1).alive;
@@ -849,14 +922,13 @@ fn handle_buy_ship(args: &CalldataReader) -> Result<(), i32> {
 
     let cost = CLASS_COST[class_id as usize];
     if plr.credits < cost {
-        return Err(-23); // insufficient Credits!
+        return Err(-23);
     }
 
     if x >= (hdr.grid_w as u64) || y >= (hdr.grid_h as u64) {
         return Err(-24);
     }
 
-    // Spawn must be on player's team side of the ocean (`Red = West half`, `Blue = East half`)
     let half = hdr.grid_w / 2;
     if plr.team == TEAM_RED && (x as u8) >= half {
         return Err(-25);
@@ -870,12 +942,12 @@ fn handle_buy_ship(args: &CalldataReader) -> Result<(), i32> {
         owner_pid: pid,
         team: plr.team,
         class_id: class_id as u8,
-        gun_id: 0, // starts with Deck Autocannon
+        gun_id: 0,
         armor_tier: 0,
         dir: dir as u8,
         x: x as u8,
         y: y as u8,
-        pad: 0,
+        pad: if plr.team == TEAM_RED { 2 } else { 6 },
         cell_dmg: [0; 10],
         last_move_block: 0,
         last_fire_block: 0,
@@ -885,7 +957,7 @@ fn handle_buy_ship(args: &CalldataReader) -> Result<(), i32> {
     };
 
     if !check_ship_placement_free(&bid, hdr.player_count, hdr.grid_w, hdr.grid_h, gidx, &cand) {
-        return Err(-26); // out of bounds or collides with another ship!
+        return Err(-26);
     }
 
     plr.credits -= cost;
@@ -903,15 +975,21 @@ fn handle_buy_ship(args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
-fn handle_move_ship(args: &CalldataReader) -> Result<(), i32> {
+/// 8-Compass-Direction (`dir8`: `0..=7` = N, NE, E, SE, S, SW, W, NW) + Percentage Throttle
+/// (`speed_pct`: `25`, `50`, `75`, or `100`) navigation!
+/// Calculates the destination coordinates on-chain inside the HFS and emits `ShipMoved` so the
+/// client teleports the ship straight to `(final_x, final_y)` from the receipt log!
+fn handle_move_ship(args: &CalldataReader) -> Result<i32, i32> {
     let bid = args.bytes32(0).ok_or(-10)?;
     let slot_idx = args.u64(1).ok_or(-10)?;
-    let new_x = args.u64(2).ok_or(-10)?;
-    let new_y = args.u64(3).ok_or(-10)?;
-    let new_dir = args.u64(4).ok_or(-10)?;
+    let dir8 = args.u64(2).ok_or(-10)?;
+    let speed_pct = args.u64(3).ok_or(-10)?;
 
-    if slot_idx >= SHIPS_PER_PLAYER || new_dir > 1 {
+    if slot_idx >= SHIPS_PER_PLAYER || dir8 > 7 {
         return Err(-30);
+    }
+    if speed_pct != 25 && speed_pct != 50 && speed_pct != 75 && speed_pct != 100 {
+        return Err(-34);
     }
 
     let mut hdr = load_hdr(&bid).ok_or(-13)?;
@@ -927,39 +1005,92 @@ fn handle_move_ship(args: &CalldataReader) -> Result<(), i32> {
 
     let blk = context::block_number() as u32;
     if ship.last_move_block == blk {
-        return Err(-32); // already moved or repaired this block!
+        return Err(-32);
     }
 
-    if new_x >= (hdr.grid_w as u64) || new_y >= (hdr.grid_h as u64) {
-        return Err(-33);
-    }
+    let max_spd = effective_max_speed(&ship);
+    let target_steps = (((max_spd as u32) * (speed_pct as u32) + 50) / 100).max(1) as i16;
 
-    // Check effective speed (if stern cell [0] is 100% damaged, engine speed is halved -> min 1)
-    let base_spd = CLASS_SPEED[ship.class_id as usize];
-    let eff_spd = if ship.cell_dmg[0] >= 100 {
-        (base_spd / 2).max(1)
+    let dx = DIR8_DX[dir8 as usize];
+    let dy = DIR8_DY[dir8 as usize];
+    let from_x = ship.x;
+    let from_y = ship.y;
+
+    // Align hull orientation (`0` = E/W horizontal, `1` = N/S vertical) for pure cardinal headings if free
+    let preferred_hull_dir = if dir8 == 0 || dir8 == 4 {
+        1u8
+    } else if dir8 == 2 || dir8 == 6 {
+        0u8
     } else {
-        base_spd
+        ship.dir
     };
 
-    let dist = abs_u8(ship.x, new_x as u8).saturating_add(abs_u8(ship.y, new_y as u8));
-    let rot_cost = if ship.dir != (new_dir as u8) { 1u8 } else { 0u8 };
-    if dist.saturating_add(rot_cost) > eff_spd {
-        return Err(-34); // exceeds ship's per-block cruising speed!
+    let mut best_x = from_x;
+    let mut best_y = from_y;
+    let mut best_dir = ship.dir;
+    let mut actual_steps = 0u64;
+
+    let mut step = 1i16;
+    while step <= target_steps {
+        let nx = (from_x as i16) + dx * step;
+        let ny = (from_y as i16) + dy * step;
+        if nx < 0 || ny < 0 || nx >= (hdr.grid_w as i16) || ny >= (hdr.grid_h as i16) {
+            break;
+        }
+        let mut cand = ship;
+        cand.x = nx as u8;
+        cand.y = ny as u8;
+        cand.dir = preferred_hull_dir;
+        if check_ship_placement_free(&bid, hdr.player_count, hdr.grid_w, hdr.grid_h, gidx, &cand) {
+            best_x = nx as u8;
+            best_y = ny as u8;
+            best_dir = preferred_hull_dir;
+            actual_steps = step as u64;
+        } else if preferred_hull_dir != ship.dir {
+            cand.dir = ship.dir;
+            if check_ship_placement_free(&bid, hdr.player_count, hdr.grid_w, hdr.grid_h, gidx, &cand)
+            {
+                best_x = nx as u8;
+                best_y = ny as u8;
+                best_dir = ship.dir;
+                actual_steps = step as u64;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+        step += 1;
     }
 
-    ship.x = new_x as u8;
-    ship.y = new_y as u8;
-    ship.dir = new_dir as u8;
+    if actual_steps == 0 {
+        return Err(-35); // blocked immediately in chosen heading!
+    }
+
+    ship.x = best_x;
+    ship.y = best_y;
+    ship.dir = best_dir;
+    ship.pad = dir8 as u8;
     ship.last_move_block = blk;
-
-    if !check_ship_placement_free(&bid, hdr.player_count, hdr.grid_w, hdr.grid_h, gidx, &ship) {
-        return Err(-35); // collision!
-    }
 
     save_ship(&bid, gidx, &ship);
     save_hdr(&bid, &hdr);
-    Ok(())
+
+    // Emit 8-word (64-byte) `ShipMoved` payload so UI teleports directly from the HFS event log!
+    let mut ev = [0u8; 64];
+    ev[0..8].copy_from_slice(&slot_idx.to_be_bytes());
+    ev[8..16].copy_from_slice(&(from_x as u64).to_be_bytes());
+    ev[16..24].copy_from_slice(&(from_y as u64).to_be_bytes());
+    ev[24..32].copy_from_slice(&(best_x as u64).to_be_bytes());
+    ev[32..40].copy_from_slice(&(best_y as u64).to_be_bytes());
+    ev[40..48].copy_from_slice(&(best_dir as u64).to_be_bytes());
+    ev[48..56].copy_from_slice(&dir8.to_be_bytes());
+    ev[56..64].copy_from_slice(&actual_steps.to_be_bytes());
+    events::emit(&[EV_SHIP_MOVED, bid, addr_topic(&caller)], &ev);
+
+    let packed = ((best_x as u64) << 8) | (best_y as u64);
+    ret::write_u64_word(packed);
+    Ok(packed as i32)
 }
 
 fn handle_fire_weapon(args: &CalldataReader) -> Result<(), i32> {
@@ -990,10 +1121,9 @@ fn handle_fire_weapon(args: &CalldataReader) -> Result<(), i32> {
     let blk = context::block_number();
     let blk32 = blk as u32;
     if ship.last_fire_block == blk32 {
-        return Err(-43); // weapon on cooldown this block!
+        return Err(-43);
     }
 
-    // Compute distance from ship center to `(tx, ty)` and verify `<= GUN_RANGE[gun_id]`
     let (w, h) = ship_dims(ship.class_id, ship.dir);
     let cx = (ship.x as i32) + ((w as i32) / 2);
     let cy = (ship.y as i32) + ((h as i32) / 2);
@@ -1001,7 +1131,7 @@ fn handle_fire_weapon(args: &CalldataReader) -> Result<(), i32> {
     let dy = (ty as i32) - cy;
     let rng = GUN_RANGE[ship.gun_id as usize] as i32;
     if dx * dx + dy * dy > rng * rng {
-        return Err(-44); // target out of gun range!
+        return Err(-44);
     }
 
     ship.last_fire_block = blk32;
@@ -1039,7 +1169,6 @@ fn handle_fire_weapon(args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
-/// Upgrade weapon on `slotIdx` — checks BOTH `ship.class_id >= GUN_MIN_CLASS[gunId]` AND `credits >= GUN_COST[gunId]`.
 fn handle_upgrade_gun(args: &CalldataReader) -> Result<(), i32> {
     let bid = args.bytes32(0).ok_or(-10)?;
     let slot_idx = args.u64(1).ok_or(-10)?;
@@ -1064,14 +1193,13 @@ fn handle_upgrade_gun(args: &CalldataReader) -> Result<(), i32> {
     if ship.gun_id == (gun_id as u8) {
         return Err(-52);
     }
-    // Check ship hull is large enough to mount this weapon!
     if ship.class_id < GUN_MIN_CLASS[gun_id as usize] {
-        return Err(-53); // ship hull too small for this gun caliber!
+        return Err(-53);
     }
 
     let cost = GUN_COST[gun_id as usize];
     if plr.credits < cost {
-        return Err(-54); // insufficient Credits!
+        return Err(-54);
     }
 
     plr.credits -= cost;
@@ -1082,7 +1210,7 @@ fn handle_upgrade_gun(args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
-fn handle_upgrade_armor(args: &CalldataReader) -> Result<(), i32> {
+fn handle_upgrade_engine(args: &CalldataReader) -> Result<(), i32> {
     let bid = args.bytes32(0).ok_or(-10)?;
     let slot_idx = args.u64(1).ok_or(-10)?;
     if slot_idx >= SHIPS_PER_PLAYER {
@@ -1098,11 +1226,11 @@ fn handle_upgrade_armor(args: &CalldataReader) -> Result<(), i32> {
     let gidx = (pid as u16) * 3 + (slot_idx as u16);
     let mut ship = load_ship(&bid, gidx);
 
-    if ship.alive == 0 || ship.armor_tier >= ARMOR_MAX_TIER {
+    if ship.alive == 0 || ship.armor_tier >= ENGINE_MAX_TIER {
         return Err(-61);
     }
 
-    let cost = ARMOR_UPGRADE_COST[ship.armor_tier as usize];
+    let cost = ENGINE_UPGRADE_COST[ship.armor_tier as usize];
     if plr.credits < cost {
         return Err(-62);
     }
@@ -1115,8 +1243,7 @@ fn handle_upgrade_armor(args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
-/// Paid Field Repair: restores up to `40%` damage on each damaged cell of `slotIdx` at `1 CR` per `1%`
-/// restored, cutting engines & weapons on that ship for the current block!
+/// Repairs destroyed hull squares (`100` -> `0`) at `100 CR` per square restored!
 fn handle_repair_ship(args: &CalldataReader) -> Result<i32, i32> {
     let bid = args.bytes32(0).ok_or(-10)?;
     let slot_idx = args.u64(1).ok_or(-10)?;
@@ -1133,33 +1260,29 @@ fn handle_repair_ship(args: &CalldataReader) -> Result<i32, i32> {
     let gidx = (pid as u16) * 3 + (slot_idx as u16);
     let mut ship = load_ship(&bid, gidx);
 
-    if ship.alive == 0 || plr.credits == 0 {
+    if ship.alive == 0 || plr.credits < REPAIR_COST_PER_CELL {
         return Err(-71);
     }
 
     let blk32 = context::block_number() as u32;
     if ship.last_move_block == blk32 || ship.last_fire_block == blk32 {
-        return Err(-72); // must cut engines & hold fire this block to repair!
+        return Err(-72);
     }
 
     let n_cells = CLASS_CELLS[ship.class_id as usize] as usize;
-    let mut total_repaired = 0u64;
+    let mut cells_repaired = 0u64;
     let mut i = 0usize;
-    while i < n_cells && plr.credits > 0 {
-        let cur = ship.cell_dmg[i];
-        if cur > 0 {
-            let max_affordable = plr.credits.min(40).min(cur as u64) as u8;
-            if max_affordable > 0 {
-                ship.cell_dmg[i] -= max_affordable;
-                plr.credits -= max_affordable as u64;
-                total_repaired += max_affordable as u64;
-            }
+    while i < n_cells && plr.credits >= REPAIR_COST_PER_CELL {
+        if ship.cell_dmg[i] >= 100 {
+            ship.cell_dmg[i] = 0;
+            plr.credits -= REPAIR_COST_PER_CELL;
+            cells_repaired += 1;
         }
         i += 1;
     }
 
-    if total_repaired == 0 {
-        return Err(-73); // ship already at 0% damage!
+    if cells_repaired == 0 {
+        return Err(-73);
     }
 
     ship.last_move_block = blk32;
@@ -1168,8 +1291,8 @@ fn handle_repair_ship(args: &CalldataReader) -> Result<i32, i32> {
     save_ship(&bid, gidx, &ship);
     save_hdr(&bid, &hdr);
 
-    ret::write_u64_word(total_repaired);
-    Ok(total_repaired as i32)
+    ret::write_u64_word(cells_repaired);
+    Ok(cells_repaired as i32)
 }
 
 fn handle_resolve_shells(args: &CalldataReader) -> Result<(), i32> {
@@ -1184,7 +1307,6 @@ fn handle_resolve_shells(args: &CalldataReader) -> Result<(), i32> {
 // Zero-Middleware Local-Node Views (`getBattleState` & `getPlayersSlice`)
 // ---------------------------------------------------------------------------
 
-/// Returns `[header (32B)][alive_ship_count (2B BE)][shell_count (2B BE)][alive_ships * 34B][shells * 16B]`.
 fn handle_get_battle_state(args: &CalldataReader) -> Result<i32, i32> {
     let bid = args.bytes32(0).ok_or(-10)?;
     let Some(hdr) = load_hdr(&bid) else {
@@ -1292,7 +1414,6 @@ mod tests {
         )
         .unwrap();
 
-        // Even if ALL 20 players request TEAM_RED (`0`), contract strictly alternates whenever Red > Blue!
         for i in 0u8..20u8 {
             let mut addr = [0u8; 20];
             addr[0] = 0x10;
@@ -1302,7 +1423,7 @@ mod tests {
                 CONTRACT,
                 CallEncoder::<128>::new(selector("joinBattle(bytes32,uint64)"))
                     .push_bytes32(&bid)
-                    .push_u64(0) // everyone begs for Red!
+                    .push_u64(0)
                     .as_slice(),
             )
             .unwrap();
@@ -1317,15 +1438,15 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(st[1], 20); // 20 players joined
-        assert_eq!(st[2], 10); // 10 Red
-        assert_eq!(st[3], 10); // 10 Blue (`|Red - Blue| <= 1`!)
-        assert!(st[4] > st[5] && st[4] >= 80); // landscape rectangle (`grid_w > grid_h`)!
-        assert_eq!(compute_dynamic_grid_dims(100), (189, 118)); // 100 players -> widescreen landscape!
+        assert_eq!(st[1], 20);
+        assert_eq!(st[2], 10);
+        assert_eq!(st[3], 10);
+        assert!(st[4] > st[5] && st[4] >= 80);
+        assert_eq!(compute_dynamic_grid_dims(100), (189, 118));
     }
 
     #[test]
-    fn gun_mount_restrictions_aoe_cell_damage_credits_armor_and_paid_repairs() {
+    fn speed_throttle_8_directions_ship_moved_log_and_100pct_hits() {
         mock::reset();
         mock::register_hps(CONTRACT, dispatch_calldata);
         mock::set_block_number(600);
@@ -1343,10 +1464,11 @@ mod tests {
         )
         .unwrap();
 
+        // Red joins & deploys Cruiser (class 2, 4x1, max speed 6) + Gunboat (class 0, 2x1, max speed 12)
         mock::transact_as(
             red_p,
             CONTRACT,
-            CallEncoder::<128>::new(selector("joinBattle(bytes32,uint64)"))
+            CallEncoder::<256>::new(selector("joinBattle(bytes32,uint64)"))
                 .push_bytes32(&bid)
                 .push_u64(0)
                 .as_slice(),
@@ -1355,69 +1477,46 @@ mod tests {
         mock::transact_as(
             blue_p,
             CONTRACT,
-            CallEncoder::<128>::new(selector("joinBattle(bytes32,uint64)"))
+            CallEncoder::<256>::new(selector("joinBattle(bytes32,uint64)"))
                 .push_bytes32(&bid)
                 .push_u64(1)
                 .as_slice(),
         )
         .unwrap();
 
-        // Red buys 1 Heavy Cruiser (`550 CR`, class 2, 4x1) at `(12, 15)` + 1 Gunboat (`200 CR`, class 0) at `(8, 10)`
+        // Red places Gunboat (Max Speed = 12) at (3, 18)
         mock::transact_as(
             red_p,
             CONTRACT,
             CallEncoder::<256>::new(selector("buyShip(bytes32,uint64,uint64,uint64,uint64,uint64)"))
                 .push_bytes32(&bid)
                 .push_u64(0)
-                .push_u64(2) // Heavy Cruiser (4x1, Max Mount L = 2)
-                .push_u64(11)
-                .push_u64(15)
+                .push_u64(0) // Gunboat (speed 12)
+                .push_u64(3)
+                .push_u64(18)
                 .push_u64(0)
                 .as_slice(),
         )
         .unwrap();
 
-        mock::transact_as(
+        // Move Gunboat NE (`dir8 = 1`, dx=+1, dy=-1) at `50%` throttle (`6` squares) -> `(9, 12)`!
+        mock::set_block_number(601);
+        let mv_out = mock::transact_as(
             red_p,
             CONTRACT,
-            CallEncoder::<256>::new(selector("buyShip(bytes32,uint64,uint64,uint64,uint64,uint64)"))
+            CallEncoder::<256>::new(selector("moveShip(bytes32,uint64,uint64,uint64)"))
                 .push_bytes32(&bid)
-                .push_u64(1)
-                .push_u64(0) // Gunboat (2x1, Max Mount S = 0)
-                .push_u64(15)
-                .push_u64(12)
-                .push_u64(0)
+                .push_u64(0)  // slot 0
+                .push_u64(1)  // NE
+                .push_u64(50) // 50% of 12 = 6 squares
                 .as_slice(),
         )
         .unwrap();
+        let packed = u64::from_be_bytes(mv_out[24..32].try_into().unwrap());
+        assert_eq!(packed >> 8, 9);
+        assert_eq!(packed & 0xff, 12);
 
-        // Gunboat CANNOT mount Cluster Rocket Pod (`M = 1`) -> rejected with `Err(-53)`!
-        assert_eq!(
-            mock::transact_as(
-                red_p,
-                CONTRACT,
-                CallEncoder::<128>::new(selector("upgradeGun(bytes32,uint64,uint64)"))
-                    .push_bytes32(&bid)
-                    .push_u64(1)
-                    .push_u64(2)
-                    .as_slice(),
-            ),
-            Err(-53)
-        );
-
-        // Gunboat CAN mount Twin Flak Mortar (`S = 0`, `250 CR`, `2x2` area)!
-        mock::transact_as(
-            red_p,
-            CONTRACT,
-            CallEncoder::<128>::new(selector("upgradeGun(bytes32,uint64,uint64)"))
-                .push_bytes32(&bid)
-                .push_u64(1)
-                .push_u64(1)
-                .as_slice(),
-        )
-        .unwrap();
-
-        // Blue buys Heavy Cruiser (`550 CR`) at `(20, 12)` (East half of 40x25) and upgrades Armor Tier 1 (`200 CR`)!
+        // Blue places Cruiser (4x1, 4 cells) at (20, 12)
         mock::transact_as(
             blue_p,
             CONTRACT,
@@ -1431,58 +1530,43 @@ mod tests {
                 .as_slice(),
         )
         .unwrap();
+
+        // Red moves Gunboat E (`dir8 = 2`) at `25%` (`3` squares -> `(12, 12)`) and fires Autocannon (`range 10`) at `(20, 12)`!
+        mock::set_block_number(602);
         mock::transact_as(
-            blue_p,
+            red_p,
             CONTRACT,
-            CallEncoder::<128>::new(selector("upgradeArmor(bytes32,uint64)"))
+            CallEncoder::<256>::new(selector("moveShip(bytes32,uint64,uint64,uint64)"))
                 .push_bytes32(&bid)
                 .push_u64(0)
+                .push_u64(2)  // E
+                .push_u64(25) // 25% of 12 = 3 squares -> (12, 12)
                 .as_slice(),
         )
         .unwrap();
 
-        // Red's Gunboat at `(15, 12)` fires `2x2` Twin Flak Mortar at `(20, 12)` -> hits BOTH `(20,12)` & `(21,12)`!
-        mock::set_block_number(601);
         mock::transact_as(
             red_p,
             CONTRACT,
             CallEncoder::<256>::new(selector("fireWeapon(bytes32,uint64,uint64,uint64)"))
                 .push_bytes32(&bid)
-                .push_u64(1)
+                .push_u64(0)
                 .push_u64(20)
                 .push_u64(12)
                 .as_slice(),
         )
         .unwrap();
 
-        // Check Red earned Credits (`+2 CR` per `1%` damage across 2 cells!)
-        let plrs = mock::transact_as(
+        // Verify cell 0 of Blue's Cruiser is immediately 100% destroyed (`cell_dmg[0] == 100`)!
+        let st = mock::transact_as(
             red_p,
             CONTRACT,
-            CallEncoder::<128>::new(selector("getPlayersSlice(bytes32,uint64,uint64)"))
+            CallEncoder::<128>::new(selector("getBattleState(bytes32)"))
                 .push_bytes32(&bid)
-                .push_u64(0)
-                .push_u64(2)
                 .as_slice(),
         )
         .unwrap();
-        let red_credits = u64::from_be_bytes(plrs[8 + 24..8 + 32].try_into().unwrap());
-        let red_score = u64::from_be_bytes(plrs[8 + 32..8 + 40].try_into().unwrap());
-        assert!(red_score > 0);
-        assert_eq!(red_credits, red_score); // started with 1000, spent 550+200+250=1000, earned `red_score`!
-
-        // On block 602, Blue pays Credits to `repairShip` on its Cruiser!
-        mock::set_block_number(602);
-        let rep = mock::transact_as(
-            blue_p,
-            CONTRACT,
-            CallEncoder::<128>::new(selector("repairShip(bytes32,uint64)"))
-                .push_bytes32(&bid)
-                .push_u64(0)
-                .as_slice(),
-        )
-        .unwrap();
-        let repaired_pct = u64::from_be_bytes(rep[24..32].try_into().unwrap());
-        assert!(repaired_pct > 0);
+        // Second alive ship starts at 36 + 34 = 70; ship record starts at 72; cell_dmg[0] is at 72 + 10 = 82
+        assert_eq!(st[82], 100);
     }
 }
