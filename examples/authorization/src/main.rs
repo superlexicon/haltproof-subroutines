@@ -18,12 +18,13 @@
 use hps_sdk::abi::CalldataReader;
 use hps_sdk::call::{self, CallEncoder};
 use hps_sdk::governance::{
-    is_authorized_charter_module, oracle_policy_id, require_valid_identity,
-    share_issuance_auction_policy_spec, ActionHasher, AuctionBook, AuctionOrder, PolicySpec,
-    StageSpec, ACTION_ISSUE, ACTION_TRANSFER, CAP_EQUITY_SETTLEMENT, CONSTITUTION_STATE_ACTIVE,
-    CONSTITUTION_STATE_PENDING_RATIFICATION, ERR_CONSTITUTION_NOT_ACTIVE, ERR_NO_BIDS_IN_STAGE,
-    ERR_NOT_EXISTING_SHAREHOLDER, ERR_NOT_ORDER_OWNER, ERR_ORDER_ALREADY_CANCELLED,
-    ERR_ORDER_NOT_FOUND, ERR_POLICY_INVALID, ERR_STEP2_SELLER_INELIGIBLE_STEP3,
+    compute_sha_doc_hash, compute_ssa_doc_hash, is_authorized_charter_module, oracle_policy_id,
+    require_valid_identity, share_issuance_auction_policy_spec, ActionHasher, AuctionBook,
+    AuctionOrder, PolicySpec, StageSpec, ACTION_ISSUE, ACTION_TRANSFER, CAP_EQUITY_SETTLEMENT,
+    CONSTITUTION_STATE_ACTIVE, CONSTITUTION_STATE_PENDING_RATIFICATION, ERR_CONSTITUTION_NOT_ACTIVE,
+    ERR_NO_BIDS_IN_STAGE, ERR_NOT_EXISTING_SHAREHOLDER, ERR_NOT_ORDER_OWNER,
+    ERR_ORDER_ALREADY_CANCELLED, ERR_ORDER_NOT_FOUND, ERR_POLICY_INVALID,
+    ERR_SHA_SIGNATURE_REQUIRED, ERR_SSA_SIGNATURE_REQUIRED, ERR_STEP2_SELLER_INELIGIBLE_STEP3,
     ERR_WRONG_AUCTION_STEP, MAX_ENCODED_AUCTION_BOOK_BYTES, MAX_ENCODED_POLICY_BYTES,
     ORDER_SIDE_BUY_STEP1, ORDER_SIDE_BUY_STEP3, ORDER_SIDE_CANCELLED, ORDER_SIDE_SELL_STEP2,
     POLICY_FIRST_SHAREHOLDER_RESOLUTION, POLICY_SHAREHOLDER_SUPERMAJORITY,
@@ -79,6 +80,12 @@ const KEY_ACTION_HASH: &[u8] = b"au:act_hash";
 const KEY_SPEC: &[u8] = b"au:spec";
 const KEY_IS_AUCTION: &[u8] = b"au:is_auc";
 const KEY_IS_ISSUANCE: &[u8] = b"au:is_iss";
+const KEY_IS_EQUITY_FINANCING: &[u8] = b"au:is_eqf";
+const KEY_EQ_CLASS_CODE: &[u8] = b"au:eq_cls";
+const KEY_EQ_CONV_RATE: &[u8] = b"au:eq_conv";
+const KEY_EQ_MIN_RAISE: &[u8] = b"au:eq_minr";
+const KEY_EQ_MAX_OWN_BPS: &[u8] = b"au:eq_bps";
+const KEY_EQ_PRE_MONEY: &[u8] = b"au:eq_pre";
 const KEY_MAX_NEW_SHARES: &[u8] = b"au:iss_max";
 const KEY_MIN_ISSUE_PRICE: &[u8] = b"au:iss_px";
 const KEY_AUCTION_STARTED: &[u8] = b"au:auc_started";
@@ -87,16 +94,23 @@ const KEY_STEP2_DL: &[u8] = b"au:step2_dl";
 const KEY_STEP3_DL: &[u8] = b"au:step3_dl";
 const KEY_AUCTION_BOOK: &[u8] = b"au:auc_book";
 
+const SSA_SIGNED_TOPIC: [u8; 32] = event_topic("SubscriptionAgreementSigned(address,bytes32,uint64,uint64)");
+const SHA_SIGNED_TOPIC: [u8; 32] = event_topic("ShareholdersAgreementSigned(address,bytes32,uint64)");
+
 hps_entry! {
     "initializeFromCharter(address,address,address,bytes32,bytes32)"               => handle_init_from_constitution,
     "initializeFromConstitution(address,address,address,bytes32,bytes32)"          => handle_init_from_constitution,
     "initializeTransferAuction(address,address,address)"                           => handle_init_transfer_auction,
     "initializeShareIssuance(address,address,address,uint64,uint64)"               => handle_init_share_issuance,
+    "initializeEquityFinancing(address,address,address,uint64,uint64,uint64,uint64)" => handle_init_equity_financing,
     "initializeOracle(address,address,address,bytes32,uint64)"                     => handle_init_oracle,
     "initializeCustom(address,address,bytes32,bytes32,bytes)"                      => handle_init_custom,
     "approve()"                                                                    => handle_approve,
+    "signShareholdersAgreement(bytes32)"                                           => handle_sign_sha,
+    "signShareholdersAgreementAndFinalize(bytes32)"                                => handle_sign_sha_and_finalize,
     "placeBuyOrder(uint64,uint64)"                                                 => handle_place_buy_order,
     "placeBuyOrderFor(address,uint64,uint64)"                                      => handle_place_buy_order_for,
+    "placeSubscriptionOrderFor(address,uint64,uint64,bytes32)"                     => handle_place_subscription_order_for,
     "cancelBuyOrder(uint64)"                                                       => handle_cancel_buy_order,
     "cancelBuyOrderFor(address,uint64)"                                            => handle_cancel_buy_order_for,
     "placeSellOrder(uint64,uint64)"                                                => handle_place_sell_order,
@@ -114,8 +128,14 @@ hps_entry! {
     "auctionDeadlines()"                                                           => handle_auction_deadlines,
     "orderCount()"                                                                 => handle_order_count,
     "activeStep1BidCount()"                                                        => handle_active_step1_bid_count,
+    "subscribedAtOrAboveOffer()"                                                   => handle_subscribed_at_or_above_offer,
     "hasFailedBidsStage()"                                                         => handle_has_failed_bids_stage,
     "issuanceTerms()"                                                              => handle_issuance_terms,
+    "equityFinancingTerms()"                                                       => handle_equity_financing_terms,
+    "ssaTemplateHash()"                                                            => handle_ssa_template_hash,
+    "shaTemplateHash()"                                                            => handle_sha_template_hash,
+    "hasSignedSubscriptionAgreement(address)"                                      => handle_has_signed_ssa,
+    "hasSignedShareholdersAgreement(address)"                                      => handle_has_signed_sha,
     "getOrdersRaw()"                                                               => handle_get_orders_raw,
     "isReadyToConsume()"                                                           => handle_is_ready_to_consume,
     "targetHps()"                                                                  => handle_target_hps,
@@ -150,6 +170,14 @@ fn seller_offered_key(identity: &[u8; 20]) -> KeyBuilder<36> {
     KeyBuilder::<36>::new().push(b"au:s2qty:").push(identity)
 }
 
+fn ssa_signed_key(identity: &[u8; 20]) -> KeyBuilder<36> {
+    KeyBuilder::<36>::new().push(b"au:ssa:").push(identity)
+}
+
+fn sha_signed_key(identity: &[u8; 20]) -> KeyBuilder<36> {
+    KeyBuilder::<36>::new().push(b"au:sha:").push(identity)
+}
+
 fn load_auction_book() -> Result<AuctionBook, i32> {
     let mut buf = [0u8; MAX_ENCODED_AUCTION_BOOK_BYTES];
     match storage::get_into(KEY_AUCTION_BOOK, &mut buf) {
@@ -170,6 +198,37 @@ fn query_ledger_balance(ledger: &[u8; 20], holder: &[u8; 20]) -> Result<u64, i32
     call::call_u64(ledger, cd.as_slice())
 }
 
+fn query_pre_money_common_shares(constitution: &[u8; 20], fallback_ledger: &[u8; 20]) -> Result<u64, i32> {
+    let cd = CallEncoder::<64>::new(const { selector("convertedCommonTotals(address)") })
+        .push_address(&[0u8; 20]);
+    if let Ok(raw) = call::call_raw(constitution, cd.as_slice()) {
+        if raw.len() >= 64 {
+            let mut w_tot = [0u8; 8];
+            w_tot.copy_from_slice(&raw[56..64]);
+            let tot = u64::from_be_bytes(w_tot);
+            if tot > 0 {
+                return Ok(tot);
+            }
+        }
+    }
+    let cd_sup = CallEncoder::<16>::new(const { selector("totalOutstanding()") });
+    call::call_u64(fallback_ledger, cd_sup.as_slice())
+}
+
+fn current_ssa_template_hash() -> [u8; 32] {
+    let me = context::self_address();
+    let con = storage::get_address(KEY_CONSTITUTION).unwrap_or([0u8; 20]);
+    let tgt = storage::get_address(KEY_TARGET).unwrap_or([0u8; 20]);
+    let target_sh = storage::get_u64(KEY_MAX_NEW_SHARES);
+    let offer_px = storage::get_u64(KEY_MIN_ISSUE_PRICE);
+    compute_ssa_doc_hash(&me, &con, &tgt, target_sh, offer_px)
+}
+
+fn current_sha_template_hash() -> [u8; 32] {
+    let con = storage::get_address(KEY_CONSTITUTION).unwrap_or([0u8; 20]);
+    compute_sha_doc_hash(&con)
+}
+
 fn load_spec() -> Result<PolicySpec, i32> {
     let mut buf = [0u8; MAX_ENCODED_POLICY_BYTES];
     let n = storage::get_into(KEY_SPEC, &mut buf).ok_or(ERR_POLICY_INVALID)?;
@@ -177,16 +236,24 @@ fn load_spec() -> Result<PolicySpec, i32> {
 }
 
 fn has_failed_bids_stage() -> bool {
-    if storage::get_u64(KEY_IS_AUCTION) != 1 && storage::get_u64(KEY_IS_ISSUANCE) != 1 {
+    let is_auc = storage::get_u64(KEY_IS_AUCTION) == 1;
+    let is_iss = storage::get_u64(KEY_IS_ISSUANCE) == 1;
+    if !is_auc && !is_iss {
         return false;
     }
     let step1_dl = storage::get_u64(KEY_STEP1_DL);
     if context::block_number() <= step1_dl {
         return false;
     }
-    load_auction_book()
-        .map(|b| b.active_step1_bid_count() == 0)
-        .unwrap_or(true)
+    let Ok(book) = load_auction_book() else {
+        return true;
+    };
+    if is_iss && storage::get_u64(KEY_IS_EQUITY_FINANCING) == 1 {
+        let target_sh = storage::get_u64(KEY_MAX_NEW_SHARES);
+        let offer_px = storage::get_u64(KEY_MIN_ISSUE_PRICE);
+        return target_sh == 0 || book.total_step1_subscribed_at_or_above(offer_px) < target_sh;
+    }
+    book.active_step1_bid_count() == 0
 }
 
 fn setup_instance(
@@ -463,6 +530,122 @@ fn handle_init_share_issuance(args: &CalldataReader) -> Result<(), i32> {
         &raw_spec[..spec_len],
     )?;
     ret::write_bool(true);
+    Ok(())
+}
+
+/// Initialize a multi-class **Equity Financing (`POLICY_SHARE_ISSUANCE_AUCTION`)**:
+/// - `classCode`: `0 = Common`, `1 = Preferred A`, `2 = Preferred B`, `>= 3 = Custom Preferred`
+/// - `conversionRate`: common shares per offered share (also equal to voting rights per share, `>= 1`)
+/// - `minRaiseAmount`: minimum SGD capital raise required (`>= 1`)
+/// - `maxOwnershipBps`: maximum post-money ownership offered in basis points (`1..=9900`, e.g. `2000 = 20.0%`)
+///
+/// Deterministically computes:
+/// - `targetShares = floor((preMoneyCommon * maxOwnershipBps) / ((10_000 - maxOwnershipBps) * conversionRate))`
+/// - `offerPrice   = ceil(minRaiseAmount / targetShares)`
+/// and starts **Stage 0 (Investor Subscription & Bidding Window)** immediately.
+fn handle_init_equity_financing(args: &CalldataReader) -> Result<(), i32> {
+    let registry = args.address(0).ok_or(-3)?;
+    let constitution = args.address(1).ok_or(-3)?;
+    let target_hps = args.address(2).ok_or(-3)?;
+    let class_code = args.u64(3).ok_or(-3)?;
+    let conversion_rate = args.u64(4).ok_or(-3)?;
+    let min_raise_amount = args.u64(5).ok_or(-3)?;
+    let max_ownership_bps = args.u64(6).ok_or(-3)?;
+
+    if constitution == [0u8; 20]
+        || target_hps == [0u8; 20]
+        || conversion_rate == 0
+        || min_raise_amount == 0
+        || max_ownership_bps == 0
+        || max_ownership_bps >= 9_900
+    {
+        return Err(-61);
+    }
+    if class_code == 0 && conversion_rate != 1 {
+        return Err(-61); // Common shares always convert 1:1 to Common!
+    }
+
+    let caller = context::msg_sender();
+    require_valid_identity(&registry, &caller)?;
+
+    let st_cd = CallEncoder::<16>::new(const { selector("state()") });
+    if let Ok(st) = call::call_u64(&constitution, st_cd.as_slice()) {
+        if st != CONSTITUTION_STATE_ACTIVE {
+            return Err(ERR_CONSTITUTION_NOT_ACTIVE);
+        }
+    }
+
+    let pre_money_common = query_pre_money_common_shares(&constitution, &target_hps)?;
+    if pre_money_common == 0 {
+        return Err(-61);
+    }
+
+    let numer = (pre_money_common as u128).saturating_mul(max_ownership_bps as u128);
+    let denom = ((10_000u64 - max_ownership_bps) as u128).saturating_mul(conversion_rate as u128);
+    let target_shares_u128 = numer / denom;
+    if target_shares_u128 == 0 || target_shares_u128 > (u64::MAX as u128) {
+        return Err(-61);
+    }
+    let target_shares = target_shares_u128 as u64;
+
+    let offer_price_u128 = ((min_raise_amount as u128)
+        .saturating_add(target_shares_u128 - 1))
+        / target_shares_u128;
+    if offer_price_u128 == 0 || offer_price_u128 > (u64::MAX as u128) {
+        return Err(-61);
+    }
+    let offer_price = offer_price_u128 as u64;
+
+    let mut raw_spec = [0u8; MAX_ENCODED_POLICY_BYTES];
+    let q_iss = CallEncoder::<96>::new(const { selector("getPolicyRaw(address,bytes32)") })
+        .push_address(&target_hps)
+        .push_bytes32(&POLICY_SHARE_ISSUANCE_AUCTION);
+    let (spec, spec_len) = match call::call_abi_bytes_into(&constitution, q_iss.as_slice(), &mut raw_spec) {
+        Ok(n) => {
+            let s = PolicySpec::decode(&raw_spec[..n]).ok_or(ERR_POLICY_INVALID)?;
+            (s, n)
+        }
+        Err(_) => {
+            // Also check Charter-level or primary ShareLedger transfer auction window
+            let (w0, w1, ov) = (6, 30, 200);
+            let s = share_issuance_auction_policy_spec(w0, w1, ov).ok_or(ERR_POLICY_INVALID)?;
+            let n = s.encode(&mut raw_spec).ok_or(ERR_POLICY_INVALID)?;
+            (s, n)
+        }
+    };
+
+    let action_hash = ActionHasher::<192>::new(&target_hps, &ACTION_ISSUE)
+        .push_u64(class_code)
+        .push_u64(conversion_rate)
+        .push_u64(min_raise_amount)
+        .push_u64(max_ownership_bps)
+        .push_u64(target_shares)
+        .push_u64(offer_price)
+        .finish();
+
+    storage::set_u64(KEY_IS_EQUITY_FINANCING, 1);
+    storage::set_u64(KEY_EQ_CLASS_CODE, class_code);
+    storage::set_u64(KEY_EQ_CONV_RATE, conversion_rate);
+    storage::set_u64(KEY_EQ_MIN_RAISE, min_raise_amount);
+    storage::set_u64(KEY_EQ_MAX_OWN_BPS, max_ownership_bps);
+    storage::set_u64(KEY_EQ_PRE_MONEY, pre_money_common);
+    storage::set_u64(KEY_MAX_NEW_SHARES, target_shares);
+    storage::set_u64(KEY_MIN_ISSUE_PRICE, offer_price);
+
+    setup_instance(
+        &registry,
+        &constitution,
+        &target_hps,
+        &POLICY_SHARE_ISSUANCE_AUCTION,
+        &action_hash,
+        &spec,
+        &raw_spec[..spec_len],
+    )?;
+
+    let mut out = [0u8; 64];
+    out[24..32].copy_from_slice(&target_shares.to_be_bytes());
+    out[56..64].copy_from_slice(&offer_price.to_be_bytes());
+    ret::write(&out);
     Ok(())
 }
 
@@ -795,9 +978,15 @@ fn execute_finalize_step(caller: &[u8; 20]) -> Result<(), i32> {
 /// - **Transfer Step 2 (`step1_deadline < now <= step2_deadline`)**: Buy orders rejected (`ERR_WRONG_AUCTION_STEP`).
 /// - **Transfer Step 3 (`step2_deadline < now <= step3_deadline`)**: Non-selling existing shareholders only.
 /// - **Issuance Stage 1 (`step1_deadline < now <= step2_deadline`)**: Existing shareholders Pre-Emptive Subscription Bids.
-fn execute_place_buy_order(buyer: &[u8; 20], price: u64, quantity: u64) -> Result<u64, i32> {
+fn execute_place_buy_order_inner(
+    buyer: &[u8; 20],
+    price: u64,
+    quantity: u64,
+    ssa_doc_hash_opt: Option<[u8; 32]>,
+) -> Result<u64, i32> {
     let is_auc = storage::get_u64(KEY_IS_AUCTION) == 1;
     let is_iss = storage::get_u64(KEY_IS_ISSUANCE) == 1;
+    let is_eqf = storage::get_u64(KEY_IS_EQUITY_FINANCING) == 1;
     if (!is_auc && !is_iss) || storage::get_u64(KEY_STATE) != STATE_PENDING {
         return Err(-62);
     }
@@ -809,6 +998,14 @@ fn execute_place_buy_order(buyer: &[u8; 20], price: u64, quantity: u64) -> Resul
     }
     if is_iss && price < storage::get_u64(KEY_MIN_ISSUE_PRICE) {
         return Err(-61); // Subscription bid below constitutional minimum issue price
+    }
+    if is_eqf {
+        let Some(ssa_hash) = ssa_doc_hash_opt else {
+            return Err(ERR_SSA_SIGNATURE_REQUIRED);
+        };
+        if ssa_hash != current_ssa_template_hash() {
+            return Err(ERR_SSA_SIGNATURE_REQUIRED);
+        }
     }
 
     let registry = storage::get_address(KEY_REGISTRY).ok_or(-62)?;
@@ -830,7 +1027,25 @@ fn execute_place_buy_order(buyer: &[u8; 20], price: u64, quantity: u64) -> Resul
             st_ev[32..40].copy_from_slice(&step3_dl.to_be_bytes());
             events::emit(&[AUCTION_STEP1_STARTED, addr_topic(buyer)], &st_ev);
         }
+        if is_eqf {
+            storage::set_u64(ssa_signed_key(buyer).as_slice(), 1);
+            let mut ssa_ev = [0u8; 16];
+            ssa_ev[0..8].copy_from_slice(&price.to_be_bytes());
+            ssa_ev[8..16].copy_from_slice(&quantity.to_be_bytes());
+            events::emit(
+                &[
+                    SSA_SIGNED_TOPIC,
+                    addr_topic(buyer),
+                    current_ssa_template_hash(),
+                ],
+                &ssa_ev,
+            );
+        }
         ORDER_SIDE_BUY_STEP1
+    } else if is_eqf {
+        // In full Equity Financing, prospective investor buy orders ONLY occur in Stage 0;
+        // Stage 1 is dedicated to signing the Shareholders' Agreement to finalize allocation!
+        return Err(ERR_WRONG_AUCTION_STEP);
     } else if is_iss {
         if now <= step2_dl {
             let target_ledger = storage::get_address(KEY_TARGET).ok_or(-62)?;
@@ -887,6 +1102,10 @@ fn execute_place_buy_order(buyer: &[u8; 20], price: u64, quantity: u64) -> Resul
     Ok(order_idx)
 }
 
+fn execute_place_buy_order(buyer: &[u8; 20], price: u64, quantity: u64) -> Result<u64, i32> {
+    execute_place_buy_order_inner(buyer, price, quantity, None)
+}
+
 fn handle_place_buy_order(args: &CalldataReader) -> Result<(), i32> {
     let price = args.u64(0).ok_or(-3)?;
     let quantity = args.u64(1).ok_or(-3)?;
@@ -912,6 +1131,21 @@ fn handle_place_buy_order_for(args: &CalldataReader) -> Result<(), i32> {
     let price = args.u64(1).ok_or(-3)?;
     let quantity = args.u64(2).ok_or(-3)?;
     let order_idx = execute_place_buy_order(&buyer, price, quantity)?;
+    ret::write_u64_word(order_idx);
+    Ok(())
+}
+
+/// ShareCapital-proxied prospective investor subscription order with signed **Share Subscription Agreement (SSA)**.
+fn handle_place_subscription_order_for(args: &CalldataReader) -> Result<(), i32> {
+    let bound_con = storage::get_address(KEY_CONSTITUTION).ok_or(-62)?;
+    if !is_authorized_auction_broker(&bound_con, &context::msg_sender()) {
+        return Err(ERR_WRONG_TARGET);
+    }
+    let buyer = args.address(0).ok_or(-3)?;
+    let price = args.u64(1).ok_or(-3)?;
+    let quantity = args.u64(2).ok_or(-3)?;
+    let ssa_doc_hash = args.bytes32(3).ok_or(-3)?;
+    let order_idx = execute_place_buy_order_inner(&buyer, price, quantity, Some(ssa_doc_hash))?;
     ret::write_u64_word(order_idx);
     Ok(())
 }
@@ -1108,8 +1342,46 @@ fn handle_place_sell_order_for(args: &CalldataReader) -> Result<(), i32> {
 }
 
 fn handle_approve(_args: &CalldataReader) -> Result<(), i32> {
-    let _caller = execute_approve_step()?;
+    let caller = execute_approve_step()?;
+    if storage::get_u64(KEY_IS_EQUITY_FINANCING) == 1 {
+        storage::set_u64(sha_signed_key(&caller).as_slice(), 1);
+    }
     ret::write_bool(storage::get_u64(KEY_STAGES_DONE) == 1);
+    Ok(())
+}
+
+fn handle_sign_sha(args: &CalldataReader) -> Result<(), i32> {
+    let sha_hash = args.bytes32(0).ok_or(-3)?;
+    if sha_hash != current_sha_template_hash() {
+        return Err(ERR_SHA_SIGNATURE_REQUIRED);
+    }
+    let caller = execute_approve_step()?;
+    storage::set_u64(sha_signed_key(&caller).as_slice(), 1);
+    events::emit(
+        &[SHA_SIGNED_TOPIC, addr_topic(&caller), sha_hash],
+        &context::block_number().to_be_bytes(),
+    );
+    ret::write_bool(storage::get_u64(KEY_STAGES_DONE) == 1);
+    Ok(())
+}
+
+fn handle_sign_sha_and_finalize(args: &CalldataReader) -> Result<(), i32> {
+    let sha_hash = args.bytes32(0).ok_or(-3)?;
+    if sha_hash != current_sha_template_hash() {
+        return Err(ERR_SHA_SIGNATURE_REQUIRED);
+    }
+    let caller = execute_approve_step()?;
+    storage::set_u64(sha_signed_key(&caller).as_slice(), 1);
+    events::emit(
+        &[SHA_SIGNED_TOPIC, addr_topic(&caller), sha_hash],
+        &context::block_number().to_be_bytes(),
+    );
+    if storage::get_u64(KEY_STAGES_DONE) == 1 {
+        execute_finalize_step(&caller)?;
+        ret::write_bool(true);
+    } else {
+        ret::write_bool(false);
+    }
     Ok(())
 }
 
@@ -1124,6 +1396,9 @@ fn handle_finalize(_args: &CalldataReader) -> Result<(), i32> {
 
 fn handle_approve_and_finalize(_args: &CalldataReader) -> Result<(), i32> {
     let caller = execute_approve_step()?;
+    if storage::get_u64(KEY_IS_EQUITY_FINANCING) == 1 {
+        storage::set_u64(sha_signed_key(&caller).as_slice(), 1);
+    }
     if storage::get_u64(KEY_STAGES_DONE) == 1 {
         execute_finalize_step(&caller)?;
         ret::write_bool(true);
@@ -1212,7 +1487,13 @@ fn handle_consume_auction(args: &CalldataReader) -> Result<(), i32> {
     }
 
     let book_check = load_auction_book()?;
-    if book_check.active_step1_bid_count() == 0 {
+    if storage::get_u64(KEY_IS_EQUITY_FINANCING) == 1 {
+        let target_sh = storage::get_u64(KEY_MAX_NEW_SHARES);
+        let offer_px = storage::get_u64(KEY_MIN_ISSUE_PRICE);
+        if target_sh == 0 || book_check.total_step1_subscribed_at_or_above(offer_px) < target_sh {
+            return Err(ERR_NO_BIDS_IN_STAGE);
+        }
+    } else if book_check.active_step1_bid_count() == 0 {
         return Err(ERR_NO_BIDS_IN_STAGE);
     }
 
@@ -1302,7 +1583,13 @@ fn handle_consume_issuance_auction(args: &CalldataReader) -> Result<(), i32> {
     }
 
     let book_check = load_auction_book()?;
-    if book_check.active_step1_bid_count() == 0 {
+    if storage::get_u64(KEY_IS_EQUITY_FINANCING) == 1 {
+        let target_sh = storage::get_u64(KEY_MAX_NEW_SHARES);
+        let offer_px = storage::get_u64(KEY_MIN_ISSUE_PRICE);
+        if target_sh == 0 || book_check.total_step1_subscribed_at_or_above(offer_px) < target_sh {
+            return Err(ERR_NO_BIDS_IN_STAGE);
+        }
+    } else if book_check.active_step1_bid_count() == 0 {
         return Err(ERR_NO_BIDS_IN_STAGE);
     }
     if storage::get_u64(KEY_STAGES_DONE) != 1 || storage::get_u64(KEY_STATE) != STATE_FINALIZED {
@@ -1435,6 +1722,15 @@ fn handle_active_step1_bid_count(_args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
+fn handle_subscribed_at_or_above_offer(_args: &CalldataReader) -> Result<(), i32> {
+    let offer_px = storage::get_u64(KEY_MIN_ISSUE_PRICE);
+    let sub = load_auction_book()
+        .map(|b| b.total_step1_subscribed_at_or_above(offer_px))
+        .unwrap_or(0);
+    ret::write_u64_word(sub);
+    Ok(())
+}
+
 fn handle_has_failed_bids_stage(_args: &CalldataReader) -> Result<(), i32> {
     ret::write_bool(has_failed_bids_stage());
     Ok(())
@@ -1445,6 +1741,57 @@ fn handle_issuance_terms(_args: &CalldataReader) -> Result<(), i32> {
     out[24..32].copy_from_slice(&storage::get_u64(KEY_MAX_NEW_SHARES).to_be_bytes());
     out[56..64].copy_from_slice(&storage::get_u64(KEY_MIN_ISSUE_PRICE).to_be_bytes());
     ret::write(&out);
+    Ok(())
+}
+
+/// Returns `(uint64 isEquityFinancing, uint64 classCode, uint64 conversionRate, uint64 minRaiseAmount,
+///           uint64 maxOwnershipBps, uint64 targetShares, uint64 offerPrice, uint64 preMoneyCommon,
+///           uint64 subscribedAtOrAboveOffer)`.
+fn handle_equity_financing_terms(_args: &CalldataReader) -> Result<(), i32> {
+    let offer_px = storage::get_u64(KEY_MIN_ISSUE_PRICE);
+    let sub = load_auction_book()
+        .map(|b| b.total_step1_subscribed_at_or_above(offer_px))
+        .unwrap_or(0);
+    let mut out = [0u8; 9 * 32];
+    let vals = [
+        storage::get_u64(KEY_IS_EQUITY_FINANCING),
+        storage::get_u64(KEY_EQ_CLASS_CODE),
+        storage::get_u64(KEY_EQ_CONV_RATE).max(1),
+        storage::get_u64(KEY_EQ_MIN_RAISE),
+        storage::get_u64(KEY_EQ_MAX_OWN_BPS),
+        storage::get_u64(KEY_MAX_NEW_SHARES),
+        offer_px,
+        storage::get_u64(KEY_EQ_PRE_MONEY),
+        sub,
+    ];
+    let mut i = 0usize;
+    while i < vals.len() {
+        out[i * 32 + 24..(i + 1) * 32].copy_from_slice(&vals[i].to_be_bytes());
+        i += 1;
+    }
+    ret::write(&out);
+    Ok(())
+}
+
+fn handle_ssa_template_hash(_args: &CalldataReader) -> Result<(), i32> {
+    ret::write_word(&current_ssa_template_hash());
+    Ok(())
+}
+
+fn handle_sha_template_hash(_args: &CalldataReader) -> Result<(), i32> {
+    ret::write_word(&current_sha_template_hash());
+    Ok(())
+}
+
+fn handle_has_signed_ssa(args: &CalldataReader) -> Result<(), i32> {
+    let who = args.address(0).ok_or(-3)?;
+    ret::write_bool(storage::get_u64(ssa_signed_key(&who).as_slice()) == 1);
+    Ok(())
+}
+
+fn handle_has_signed_sha(args: &CalldataReader) -> Result<(), i32> {
+    let who = args.address(0).ok_or(-3)?;
+    ret::write_bool(storage::get_u64(sha_signed_key(&who).as_slice()) == 1);
     Ok(())
 }
 

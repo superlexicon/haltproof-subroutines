@@ -62,6 +62,15 @@ pub const ACTION_REGISTER_PRODUCT_LEDGER: [u8; 32] = keccak256(b"REGISTER_PRODUC
 pub const ACTION_AUTHORIZE_FUTURES_UNDERWRITING: [u8; 32] =
     keccak256(b"AUTHORIZE_FUTURES_UNDERWRITING");
 pub const ACTION_SET_ATTACHED_DEX: [u8; 32] = keccak256(b"SET_ATTACHED_DEX");
+pub const ACTION_EXECUTE_SHARE_BUYBACK: [u8; 32] = keccak256(b"EXECUTE_SHARE_BUYBACK");
+pub const ACTION_EXECUTE_SHARE_SPLIT: [u8; 32] = keccak256(b"EXECUTE_SHARE_SPLIT");
+pub const ACTION_EXECUTE_REVERSE_SPLIT: [u8; 32] = keccak256(b"EXECUTE_REVERSE_SPLIT");
+pub const ACTION_CREATE_ESOP_PROGRAM: [u8; 32] = keccak256(b"CREATE_ESOP_PROGRAM");
+pub const ACTION_AWARD_ESOP_OPTIONS: [u8; 32] = keccak256(b"AWARD_ESOP_OPTIONS");
+
+pub const DOC_TAG_SUBSCRIPTION_AGREEMENT: [u8; 32] = keccak256(b"SHARE_SUBSCRIPTION_AGREEMENT");
+pub const DOC_TAG_SHAREHOLDERS_AGREEMENT: [u8; 32] = keccak256(b"SHAREHOLDERS_AGREEMENT");
+pub const DOC_TAG_ESOP_EXERCISE_LETTER: [u8; 32] = keccak256(b"ESOP_EXERCISE_LETTER");
 
 /// Governed sibling-module capabilities registered in `CorporateCharter` so pinned `AssetLedger`
 /// and `Authorization` instances trust authorized company modules (`ShareCapital`, `ProductLedger`)
@@ -140,6 +149,11 @@ pub const ERR_FUNCTION_AUTH_NOT_SET: i32 = -94;
 pub const ERR_UNAUTHORIZED_MODULE: i32 = -95;
 pub const ERR_DIRECTOR_CONSENT_REQUIRED: i32 = -96;
 pub const ERR_NO_BIDS_IN_STAGE: i32 = -97;
+pub const ERR_SUBSCRIPTION_SHORTFALL: i32 = ERR_NO_BIDS_IN_STAGE;
+pub const ERR_ESOP_CLIFF_NOT_PASSED: i32 = -98;
+pub const ERR_SHA_SIGNATURE_REQUIRED: i32 = -99;
+pub const ERR_SSA_SIGNATURE_REQUIRED: i32 = -100;
+pub const ERR_ESOP_POOL_EXCEEDED: i32 = -101;
 pub const ERR_CHARTER_MISMATCH: i32 = -19;
 pub const ERR_CONSTITUTION_MISMATCH: i32 = ERR_CHARTER_MISMATCH;
 
@@ -1058,6 +1072,20 @@ impl AuctionBook {
         cnt
     }
 
+    /// Sum active (`quantity > 0`) Stage 0 (`ORDER_SIDE_BUY_STEP1`) bid quantities at or above `min_price`.
+    pub fn total_step1_subscribed_at_or_above(&self, min_price: u64) -> u64 {
+        let mut sum = 0u64;
+        let mut i = 0usize;
+        while i < self.order_count {
+            let o = &self.orders[i];
+            if o.side == ORDER_SIDE_BUY_STEP1 && o.quantity > 0 && o.price >= min_price {
+                sum = sum.saturating_add(o.quantity);
+            }
+            i += 1;
+        }
+        sum
+    }
+
     /// Encode into `out`:
     /// `[version = 1 (1B)][reserved = 0 (1B)][order_count: u16 BE (2B)]`
     /// followed by `order_count * 37` bytes of `[side (1B)][trader (20B)][price (8B BE)][quantity (8B BE)]`.
@@ -1228,4 +1256,44 @@ pub fn verify_and_consume_issuance_auction_auth(
     }
     let book = AuctionBook::decode(&ret[dyn_off + 32..dyn_off + 32 + len]).ok_or(ERR_POLICY_INVALID)?;
     Ok((book, max_new_shares, min_issue_price))
+}
+
+/// Deterministic 32-byte commitment hash for a **Share Subscription Agreement (SSA)** bound to an
+/// Equity Financing `Authorization` instance.
+pub fn compute_ssa_doc_hash(
+    auth_obj: &[u8; 20],
+    charter: &[u8; 20],
+    target_share_ledger: &[u8; 20],
+    target_shares: u64,
+    offer_price: u64,
+) -> [u8; 32] {
+    ActionHasher::<160>::new(auth_obj, &DOC_TAG_SUBSCRIPTION_AGREEMENT)
+        .push_address(charter)
+        .push_address(target_share_ledger)
+        .push_u64(target_shares)
+        .push_u64(offer_price)
+        .finish()
+}
+
+/// Deterministic 32-byte commitment hash for a company's **Shareholders' Agreement (SHA)**.
+pub fn compute_sha_doc_hash(charter: &[u8; 20]) -> [u8; 32] {
+    ActionHasher::<160>::new(charter, &DOC_TAG_SHAREHOLDERS_AGREEMENT)
+        .push_address(charter)
+        .finish()
+}
+
+/// Deterministic 32-byte commitment hash for an employee **Option Exercise Letter**.
+pub fn compute_esop_exercise_letter_hash(
+    share_capital: &[u8; 20],
+    program_id: u64,
+    grant_id: u64,
+    employee: &[u8; 20],
+    amount: u64,
+) -> [u8; 32] {
+    ActionHasher::<160>::new(share_capital, &DOC_TAG_ESOP_EXERCISE_LETTER)
+        .push_u64(program_id)
+        .push_u64(grant_id)
+        .push_address(employee)
+        .push_u64(amount)
+        .finish()
 }

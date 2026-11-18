@@ -26,14 +26,15 @@
 use hps_sdk::abi::CalldataReader;
 use hps_sdk::call::{self, CallEncoder};
 use hps_sdk::governance::{
-    require_valid_authorization_hps, require_valid_identity, verify_and_consume_auth, ActionHasher,
-    AuthorizedModuleSpec, FunctionAuthRule, PolicySpec, ShareClassSpec, StageSpec,
-    ACTION_ACTIVATE_CHARTER, ACTION_ADD_DIRECTOR, ACTION_AUTHORIZE_MODULE, ACTION_DEFINE_ROLE,
-    ACTION_GRANT_ROLE, ACTION_REGISTER_SHARE_CLASS, ACTION_REMOVE_DIRECTOR, ACTION_REVOKE_ROLE,
-    ACTION_SET_FUNCTION_AUTH, CHARTER_STATE_ACTIVE, CHARTER_STATE_PENDING_RATIFICATION,
-    CHARTER_STATE_UNINITIALIZED, ERR_CHARTER_ALREADY_ACTIVE, ERR_CHARTER_NOT_ACTIVE,
-    ERR_DIRECTOR_CONSENT_REQUIRED, ERR_FUNCTION_AUTH_NOT_SET, ERR_NO_BIDS_IN_STAGE,
-    ERR_POLICY_INVALID, ERR_ROLE_NOT_DEFINED, MAX_AUTHORIZED_MODULES, MAX_DEFINED_ROLES,
+    compute_sha_doc_hash, require_valid_authorization_hps, require_valid_identity,
+    verify_and_consume_auth, ActionHasher, AuthorizedModuleSpec, FunctionAuthRule, PolicySpec,
+    ShareClassSpec, StageSpec, ACTION_ACTIVATE_CHARTER, ACTION_ADD_DIRECTOR,
+    ACTION_AUTHORIZE_MODULE, ACTION_DEFINE_ROLE, ACTION_GRANT_ROLE, ACTION_REGISTER_SHARE_CLASS,
+    ACTION_REMOVE_DIRECTOR, ACTION_REVOKE_ROLE, ACTION_SET_FUNCTION_AUTH, CAP_EQUITY_SETTLEMENT,
+    CHARTER_STATE_ACTIVE, CHARTER_STATE_PENDING_RATIFICATION, CHARTER_STATE_UNINITIALIZED,
+    ERR_CHARTER_ALREADY_ACTIVE, ERR_CHARTER_NOT_ACTIVE, ERR_DIRECTOR_CONSENT_REQUIRED,
+    ERR_FUNCTION_AUTH_NOT_SET, ERR_NO_BIDS_IN_STAGE, ERR_POLICY_INVALID, ERR_ROLE_NOT_DEFINED,
+    ERR_SHA_SIGNATURE_REQUIRED, ERR_UNAUTHORIZED_MODULE, MAX_AUTHORIZED_MODULES, MAX_DEFINED_ROLES,
     MAX_ENCODED_POLICY_BYTES, MAX_MEMBERS_PER_STAGE, MAX_SHARE_CLASSES, POLICY_BANK_ORACLE,
     POLICY_BOARD_RESOLUTION, POLICY_FIRST_SHAREHOLDER_RESOLUTION, POLICY_PRODUCT_MANAGEMENT,
     POLICY_SHAREHOLDER_SUPERMAJORITY, POLICY_SHARE_ISSUANCE_AUCTION,
@@ -129,6 +130,11 @@ hps_entry! {
     "roleMemberCount(bytes32)"                                                  => handle_role_member_count,
     "roleMemberAt(bytes32,uint64)"                                              => handle_role_member_at,
     "registerShareClass(address,uint64,uint64,uint64,address)"                  => handle_register_share_class,
+    "moduleEnsureShareClass(address,uint64,uint64,uint64)"                      => handle_module_ensure_share_class,
+    "moduleRecordShareholdersAgreement(address,bytes32)"                        => handle_module_record_sha,
+    "signShareholdersAgreement(bytes32)"                                        => handle_sign_sha_direct,
+    "hasSignedShareholdersAgreement(address)"                                   => handle_has_signed_sha,
+    "shaDocumentHash()"                                                         => handle_sha_document_hash,
     "shareClassCount()"                                                         => handle_share_class_count,
     "getShareClass(uint64)"                                                     => handle_get_share_class,
     "shareholderVotingPower(address)"                                           => handle_shareholder_voting_power,
@@ -2214,12 +2220,142 @@ fn handle_validate_capital_process_auth(args: &CalldataReader) -> Result<(), i32
         return Err(ERR_NO_BIDS_IN_STAGE);
     }
 
+    // For Equity Financing (`POLICY_SHARE_ISSUANCE_AUCTION` with `isEquityFinancing == 1`),
+    // constitutionally enforce `subscribedAtOrAboveOffer >= targetShares`!
+    if pid == POLICY_SHARE_ISSUANCE_AUCTION {
+        let eq_cd = CallEncoder::<16>::new(const { selector("equityFinancingTerms()") });
+        if let Ok(eq_raw) = call::call_raw(&auth_obj, eq_cd.as_slice()) {
+            if eq_raw.len() >= 9 * 32 {
+                let mut w_flag = [0u8; 8];
+                let mut w_tgt = [0u8; 8];
+                let mut w_sub = [0u8; 8];
+                w_flag.copy_from_slice(&eq_raw[24..32]);
+                w_tgt.copy_from_slice(&eq_raw[5 * 32 + 24..6 * 32]);
+                w_sub.copy_from_slice(&eq_raw[8 * 32 + 24..9 * 32]);
+                let is_eqf = u64::from_be_bytes(w_flag);
+                let tgt_sh = u64::from_be_bytes(w_tgt);
+                let sub_sh = u64::from_be_bytes(w_sub);
+                if is_eqf == 1 && (tgt_sh == 0 || sub_sh < tgt_sh) {
+                    return Err(ERR_NO_BIDS_IN_STAGE);
+                }
+            }
+        }
+    }
+
     let ready_cd = CallEncoder::<16>::new(const { selector("isReadyToConsume()") });
     if !matches!(call::call_bool(&auth_obj, ready_cd.as_slice()), Ok(true)) {
         return Err(-62);
     }
 
     ret::write_bool(true);
+    Ok(())
+}
+
+fn sha_signed_charter_key(account: &[u8; 20]) -> KeyBuilder<36> {
+    KeyBuilder::<36>::new().push(b"chr:sha:").push(account)
+}
+
+fn require_equity_settlement_module() -> Result<(), i32> {
+    if storage::get_u64(KEY_INIT) != 1 || storage::get_u64(KEY_STATE) != CHARTER_STATE_ACTIVE {
+        return Err(ERR_CHARTER_NOT_ACTIVE);
+    }
+    let caller = context::msg_sender();
+    if storage::get_u64(module_auth_key(&caller, &CAP_EQUITY_SETTLEMENT).as_slice()) != 1 {
+        return Err(ERR_UNAUTHORIZED_MODULE);
+    }
+    Ok(())
+}
+
+fn handle_sha_document_hash(_args: &CalldataReader) -> Result<(), i32> {
+    ret::write_word(&compute_sha_doc_hash(&context::self_address()));
+    Ok(())
+}
+
+fn handle_has_signed_sha(args: &CalldataReader) -> Result<(), i32> {
+    let who = args.address(0).ok_or(-3)?;
+    let signed = storage::get_u64(sha_signed_charter_key(&who).as_slice()) == 1
+        || storage::get_u64(role_has_key(&ROLE_SHAREHOLDER, &who).as_slice()) == 1;
+    ret::write_bool(signed);
+    Ok(())
+}
+
+fn handle_sign_sha_direct(args: &CalldataReader) -> Result<(), i32> {
+    let (_registry, caller) = ensure_initialized_and_valid_caller()?;
+    let sha_hash = args.bytes32(0).ok_or(-3)?;
+    let expected = compute_sha_doc_hash(&context::self_address());
+    if sha_hash != expected {
+        return Err(ERR_SHA_SIGNATURE_REQUIRED);
+    }
+    storage::set_u64(sha_signed_charter_key(&caller).as_slice(), 1);
+    if is_role_defined(&ROLE_SHAREHOLDER)
+        && storage::get_u64(role_has_key(&ROLE_SHAREHOLDER, &caller).as_slice()) == 0
+    {
+        let _ = grant_role_internal(&ROLE_SHAREHOLDER, &caller);
+    }
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_module_record_sha(args: &CalldataReader) -> Result<(), i32> {
+    require_equity_settlement_module()?;
+    let shareholder = args.address(0).ok_or(-3)?;
+    let sha_hash = args.bytes32(1).ok_or(-3)?;
+    if shareholder == [0u8; 20] || sha_hash != compute_sha_doc_hash(&context::self_address()) {
+        return Err(ERR_SHA_SIGNATURE_REQUIRED);
+    }
+    storage::set_u64(sha_signed_charter_key(&shareholder).as_slice(), 1);
+    if is_role_defined(&ROLE_SHAREHOLDER)
+        && storage::get_u64(role_has_key(&ROLE_SHAREHOLDER, &shareholder).as_slice()) == 0
+    {
+        let _ = grant_role_internal(&ROLE_SHAREHOLDER, &shareholder);
+    }
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_module_ensure_share_class(args: &CalldataReader) -> Result<(), i32> {
+    require_equity_settlement_module()?;
+    let share_ledger = args.address(0).ok_or(-3)?;
+    let votes_per_share = args.u64(1).ok_or(-3)?;
+    let conversion_numer = args.u64(2).ok_or(-3)?;
+    let conversion_denom = args.u64(3).ok_or(-3)?;
+    if share_ledger == [0u8; 20]
+        || votes_per_share == 0
+        || conversion_numer == 0
+        || conversion_denom == 0
+    {
+        return Err(-59);
+    }
+
+    let mut classes = [ShareClassSpec::empty(); MAX_SHARE_CLASSES];
+    let count = load_share_classes(&mut classes);
+    let mut i = 0;
+    while i < count {
+        if classes[i].ledger == share_ledger {
+            ret::write_u64_word(count as u64);
+            return Ok(());
+        }
+        i += 1;
+    }
+    if count >= MAX_SHARE_CLASSES {
+        return Err(-61);
+    }
+    classes[count] = ShareClassSpec {
+        ledger: share_ledger,
+        votes_per_share,
+        conversion_numer,
+        conversion_denom,
+    };
+    let new_count = count + 1;
+    save_share_classes(&classes, new_count);
+
+    let mut ev = [0u8; 24];
+    ev[0..8].copy_from_slice(&votes_per_share.to_be_bytes());
+    ev[8..16].copy_from_slice(&conversion_numer.to_be_bytes());
+    ev[16..24].copy_from_slice(&conversion_denom.to_be_bytes());
+    events::emit(&[SHARE_CLASS_REGISTERED, addr_topic(&share_ledger)], &ev);
+
+    ret::write_u64_word(new_count as u64);
     Ok(())
 }
 

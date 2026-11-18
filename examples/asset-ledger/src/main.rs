@@ -23,7 +23,7 @@
 use hps_sdk::abi::CalldataReader;
 use hps_sdk::call::{self, CallEncoder};
 use hps_sdk::governance::{
-    is_authorized_charter_module, oracle_policy_id, require_valid_identity,
+    compute_sha_doc_hash, is_authorized_charter_module, oracle_policy_id, require_valid_identity,
     validate_charter_capital_auth, verify_and_consume_auction_auth, verify_and_consume_auth,
     verify_and_consume_issuance_auction_auth, ActionHasher, AuctionOrder, ACTION_APPROVE,
     ACTION_CANCEL, ACTION_ISSUE, ACTION_SET_ATTACHED_DEX, ACTION_SUPER, ACTION_TRANSFER,
@@ -51,6 +51,9 @@ const AUCTION_BUYER_FILLED: [u8; 32] =
     event_topic("AuctionBuyerFilled(address,uint64,uint64,uint64)");
 const AUCTION_SELLER_FILLED: [u8; 32] =
     event_topic("AuctionSellerFilled(address,uint64,uint64,uint64,uint64)");
+const SHARE_SPLIT_TOPIC: [u8; 32] = event_topic("ShareSplitApplied(uint64,uint64,uint64)");
+const SHARE_REVERSE_SPLIT_TOPIC: [u8; 32] =
+    event_topic("ShareReverseSplitApplied(uint64,uint64,uint64)");
 
 const KEY_INIT: &[u8] = b"meta:init";
 const KEY_REGISTRY: &[u8] = b"meta:registry";
@@ -60,6 +63,7 @@ const KEY_SYMBOL: &[u8] = b"meta:symbol";
 const KEY_DECIMALS: &[u8] = b"meta:decimals";
 const KEY_SUPPLY: &[u8] = b"meta:supply";
 const KEY_HOLDER_COUNT: &[u8] = b"meta:holders";
+const KEY_EVER_HOLDERS: &[u8] = b"meta:ever_hld";
 const KEY_LAST_AUC_PRICE: &[u8] = b"meta:auc_price";
 const KEY_LAST_AUC_QTY: &[u8] = b"meta:auc_qty";
 const KEY_LAST_AUC_BUY_DEMAND: &[u8] = b"meta:auc_buy_q";
@@ -74,6 +78,8 @@ hps_entry! {
     "charterModuleClearTransfer(address,address,uint64)"    => handle_constitution_clear_transfer,
     "charterModuleIssue(address,uint64)"                    => handle_constitution_issue,
     "charterModuleCancel(address,uint64)"                   => handle_constitution_cancel,
+    "charterModuleSplit(uint64)"                            => handle_charter_module_split,
+    "charterModuleReverseSplit(uint64)"                     => handle_charter_module_reverse_split,
     "constitutionClearTransfer(address,address,uint64)"     => handle_constitution_clear_transfer,
     "constitutionIssue(address,uint64)"                     => handle_constitution_issue,
     "constitutionCancel(address,uint64)"                    => handle_constitution_cancel,
@@ -89,6 +95,8 @@ hps_entry! {
     "totalSupply()"                                         => handle_total_supply,
     "totalOutstanding()"                                    => handle_total_supply,
     "holderCount()"                                         => handle_holder_count,
+    "registeredHolderCount()"                               => handle_registered_holder_count,
+    "registeredHolderAt(uint64)"                            => handle_registered_holder_at,
     "decimals()"                                            => handle_decimals,
     "symbol()"                                              => handle_symbol,
     "identityRegistry()"                                    => handle_identity_registry,
@@ -124,6 +132,14 @@ fn balance_key(identity: &[u8; 20]) -> KeyBuilder<32> {
 
 fn holder_seen_key(identity: &[u8; 20]) -> KeyBuilder<32> {
     KeyBuilder::<32>::new().push(b"hld:").push(identity)
+}
+
+fn holder_ever_key(identity: &[u8; 20]) -> KeyBuilder<32> {
+    KeyBuilder::<32>::new().push(b"hev:").push(identity)
+}
+
+fn holder_index_key(idx: u64) -> KeyBuilder<24> {
+    KeyBuilder::<24>::new().push(b"hix:").push_u64_le(idx)
 }
 
 fn allowance_key(owner: &[u8; 20], spender: &[u8; 20]) -> KeyBuilder<64> {
@@ -184,6 +200,14 @@ fn internal_credit(identity: &[u8; 20], amount: u64) -> Result<u64, i32> {
         storage::set_u64(hk.as_slice(), 1);
         let cnt = storage::get_u64(KEY_HOLDER_COUNT);
         storage::set_u64(KEY_HOLDER_COUNT, cnt + 1);
+    }
+
+    let hev = holder_ever_key(identity);
+    if storage::get_u64(hev.as_slice()) == 0 {
+        let e_idx = storage::get_u64(KEY_EVER_HOLDERS);
+        storage::set_u64(hev.as_slice(), 1);
+        storage::set_address(holder_index_key(e_idx).as_slice(), identity);
+        storage::set_u64(KEY_EVER_HOLDERS, e_idx + 1);
     }
 
     let mut ev = [0u8; 16];
@@ -759,6 +783,131 @@ fn handle_constitution_cancel(args: &CalldataReader) -> Result<(), i32> {
         &amount.to_be_bytes(),
     );
     ret::write_u64_word(new_bal);
+    Ok(())
+}
+
+/// Forward Share Split (`multiplier`-for-1) across ALL holders on this `AssetLedger`, invoked
+/// exclusively by an authorized `CAP_EQUITY_SETTLEMENT` module (`ShareCapital`) or pinned Charter.
+fn handle_charter_module_split(args: &CalldataReader) -> Result<(), i32> {
+    if storage::get_u64(KEY_INIT) != 1 {
+        return Err(-10);
+    }
+    let pinned_con = storage::get_address(KEY_CONSTITUTION).unwrap_or([0u8; 20]);
+    let sender = context::msg_sender();
+    if pinned_con == [0u8; 20]
+        || (sender != pinned_con
+            && !is_authorized_charter_module(&pinned_con, &sender, &CAP_EQUITY_SETTLEMENT))
+    {
+        return Err(ERR_CONSTITUTION_MISMATCH);
+    }
+    let multiplier = args.u64(0).ok_or(-3)?;
+    if multiplier < 2 || multiplier > 100 {
+        return Err(-14);
+    }
+    let old_supply = storage::get_u64(KEY_SUPPLY);
+    if old_supply == 0 {
+        return Err(-16);
+    }
+    let new_supply = old_supply.checked_mul(multiplier).ok_or(-15)?;
+
+    let ever_cnt = storage::get_u64(KEY_EVER_HOLDERS);
+    let mut added_total = 0u64;
+    let mut i = 0u64;
+    while i < ever_cnt {
+        if let Some(h) = storage::get_address(holder_index_key(i).as_slice()) {
+            let bal = storage::get_u64(balance_key(&h).as_slice());
+            if bal > 0 {
+                let target_bal = bal.checked_mul(multiplier).ok_or(-15)?;
+                let delta = target_bal - bal;
+                if delta > 0 {
+                    internal_credit(&h, delta)?;
+                    added_total = added_total.checked_add(delta).ok_or(-15)?;
+                }
+            }
+        }
+        i += 1;
+    }
+    let computed_supply = old_supply.checked_add(added_total).ok_or(-15)?;
+    let final_supply = if computed_supply == new_supply {
+        new_supply
+    } else {
+        computed_supply
+    };
+    storage::set_u64(KEY_SUPPLY, final_supply);
+
+    let mut ev = [0u8; 24];
+    ev[0..8].copy_from_slice(&multiplier.to_be_bytes());
+    ev[8..16].copy_from_slice(&old_supply.to_be_bytes());
+    ev[16..24].copy_from_slice(&final_supply.to_be_bytes());
+    events::emit(&[SHARE_SPLIT_TOPIC, addr_topic(&pinned_con)], &ev);
+
+    ret::write_u64_word(final_supply);
+    Ok(())
+}
+
+/// Reverse Share Split / Consolidation (`1`-for-`divisor`) across ALL holders on this `AssetLedger`,
+/// invoked exclusively by an authorized `CAP_EQUITY_SETTLEMENT` module (`ShareCapital`) or pinned Charter.
+fn handle_charter_module_reverse_split(args: &CalldataReader) -> Result<(), i32> {
+    if storage::get_u64(KEY_INIT) != 1 {
+        return Err(-10);
+    }
+    let pinned_con = storage::get_address(KEY_CONSTITUTION).unwrap_or([0u8; 20]);
+    let sender = context::msg_sender();
+    if pinned_con == [0u8; 20]
+        || (sender != pinned_con
+            && !is_authorized_charter_module(&pinned_con, &sender, &CAP_EQUITY_SETTLEMENT))
+    {
+        return Err(ERR_CONSTITUTION_MISMATCH);
+    }
+    let divisor = args.u64(0).ok_or(-3)?;
+    if divisor < 2 || divisor > 100 {
+        return Err(-14);
+    }
+    let old_supply = storage::get_u64(KEY_SUPPLY);
+    if old_supply < divisor {
+        return Err(-16);
+    }
+
+    let ever_cnt = storage::get_u64(KEY_EVER_HOLDERS);
+    let mut post_supply = 0u64;
+    let mut i = 0u64;
+    while i < ever_cnt {
+        if let Some(h) = storage::get_address(holder_index_key(i).as_slice()) {
+            let bal = storage::get_u64(balance_key(&h).as_slice());
+            post_supply = post_supply.saturating_add(bal / divisor);
+        }
+        i += 1;
+    }
+    if post_supply == 0 {
+        return Err(-16); // Never allow reverse split to wipe out 100% of issued shares!
+    }
+
+    let mut removed_total = 0u64;
+    i = 0;
+    while i < ever_cnt {
+        if let Some(h) = storage::get_address(holder_index_key(i).as_slice()) {
+            let bal = storage::get_u64(balance_key(&h).as_slice());
+            if bal > 0 {
+                let next_bal = bal / divisor;
+                let delta = bal - next_bal;
+                if delta > 0 {
+                    internal_debit(&h, delta)?;
+                    removed_total = removed_total.saturating_add(delta);
+                }
+            }
+        }
+        i += 1;
+    }
+    let final_supply = old_supply.saturating_sub(removed_total);
+    storage::set_u64(KEY_SUPPLY, final_supply);
+
+    let mut ev = [0u8; 24];
+    ev[0..8].copy_from_slice(&divisor.to_be_bytes());
+    ev[8..16].copy_from_slice(&old_supply.to_be_bytes());
+    ev[16..24].copy_from_slice(&final_supply.to_be_bytes());
+    events::emit(&[SHARE_REVERSE_SPLIT_TOPIC, addr_topic(&pinned_con)], &ev);
+
+    ret::write_u64_word(final_supply);
     Ok(())
 }
 
@@ -1435,8 +1584,19 @@ fn execute_issuance_auction_settlement(
         }
     }
 
-    // Constitutional CorporateCharter gate: rejects with `ERR_NO_BIDS_IN_STAGE (-97)` if Stage 0 had 0 bids!
+    // Constitutional CorporateCharter gate: rejects with `ERR_NO_BIDS_IN_STAGE (-97)` if Stage 0 failed!
     validate_charter_capital_auth(&pinned_con, auth_obj)?;
+
+    // Check whether this Authorization is a full multi-class Equity Financing (`isEquityFinancing == 1`)
+    let mut is_equity_financing = false;
+    let eq_cd = CallEncoder::<16>::new(const { selector("equityFinancingTerms()") });
+    if let Ok(eq_raw) = call::call_raw(auth_obj, eq_cd.as_slice()) {
+        if eq_raw.len() >= 32 {
+            let mut w_eq = [0u8; 8];
+            w_eq.copy_from_slice(&eq_raw[24..32]);
+            is_equity_financing = u64::from_be_bytes(w_eq) == 1;
+        }
+    }
 
     let (book, max_new_shares, min_issue_price) = verify_and_consume_issuance_auction_auth(
         registry,
@@ -1452,6 +1612,11 @@ fn execute_issuance_auction_settlement(
 
     let mut buy_orders = [AuctionOrder::default(); MAX_AUCTION_ORDERS];
     let mut buy_count = 0usize;
+    let mut total_at_or_above_offer = 0u64;
+    let mut total_strictly_above_offer = 0u64;
+    let mut min_strictly_above_px = u64::MAX;
+    let mut min_qualifying_px = u64::MAX;
+
     let mut idx = 0usize;
     while idx < book.order_count {
         let ord = book.orders[idx];
@@ -1459,6 +1624,16 @@ fn execute_issuance_auction_settlement(
             require_valid_identity(registry, &ord.trader)?;
             buy_orders[buy_count] = ord;
             buy_count += 1;
+            total_at_or_above_offer = total_at_or_above_offer.saturating_add(ord.quantity);
+            if ord.price < min_qualifying_px {
+                min_qualifying_px = ord.price;
+            }
+            if ord.price > min_issue_price {
+                total_strictly_above_offer = total_strictly_above_offer.saturating_add(ord.quantity);
+                if ord.price < min_strictly_above_px {
+                    min_strictly_above_px = ord.price;
+                }
+            }
         }
         idx += 1;
     }
@@ -1466,69 +1641,88 @@ fn execute_issuance_auction_settlement(
         return Err(ERR_NO_BIDS_IN_STAGE);
     }
 
-    // Unique candidate prices ascending
-    let mut candidates = [0u64; MAX_AUCTION_ORDERS];
-    let mut cand_count = 0usize;
-    let mut i = 0usize;
-    while i < buy_count {
-        let p = buy_orders[i].price;
-        let mut exists = false;
-        let mut k = 0usize;
-        while k < cand_count {
-            if candidates[k] == p {
-                exists = true;
-                break;
+    let (clearing_price, issued_qty, crossing_demand) = if is_equity_financing {
+        // Mandatory Full-Subscription Rule: total subscribed at or above `offerPrice` MUST be >= `targetShares`!
+        if total_at_or_above_offer < max_new_shares {
+            return Err(ERR_NO_BIDS_IN_STAGE);
+        }
+        // Oversubscription Rule: if total quantity of bids strictly higher than `offerPrice` exceeds
+        // `targetShares`, select the lowest bid price among those `> offerPrice` bids and pro-rata
+        // across them so total issued shares NEVER breaches `targetShares`!
+        if total_strictly_above_offer > max_new_shares && min_strictly_above_px < u64::MAX {
+            (min_strictly_above_px, max_new_shares, total_strictly_above_offer)
+        } else {
+            let p_star = if min_qualifying_px < u64::MAX {
+                min_qualifying_px
+            } else {
+                min_issue_price
+            };
+            (p_star, max_new_shares, total_at_or_above_offer)
+        }
+    } else {
+        // Unique candidate prices ascending
+        let mut candidates = [0u64; MAX_AUCTION_ORDERS];
+        let mut cand_count = 0usize;
+        let mut i = 0usize;
+        while i < buy_count {
+            let p = buy_orders[i].price;
+            let mut exists = false;
+            let mut k = 0usize;
+            while k < cand_count {
+                if candidates[k] == p {
+                    exists = true;
+                    break;
+                }
+                k += 1;
             }
-            k += 1;
-        }
-        if !exists {
-            candidates[cand_count] = p;
-            cand_count += 1;
-        }
-        i += 1;
-    }
-    i = 1;
-    while i < cand_count {
-        let key = candidates[i];
-        let mut j = i;
-        while j > 0 && candidates[j - 1] > key {
-            candidates[j] = candidates[j - 1];
-            j -= 1;
-        }
-        candidates[j] = key;
-        i += 1;
-    }
-
-    let mut best_vol = 0u64;
-    let mut best_proceeds = 0u128;
-    let mut clearing_price = min_issue_price;
-    let mut crossing_demand = 0u64;
-    i = 0;
-    while i < cand_count {
-        let p = candidates[i];
-        let mut d = 0u64;
-        let mut b = 0usize;
-        while b < buy_count {
-            if buy_orders[b].price >= p {
-                d = d.saturating_add(buy_orders[b].quantity);
+            if !exists {
+                candidates[cand_count] = p;
+                cand_count += 1;
             }
-            b += 1;
+            i += 1;
         }
-        let vol = if d < max_new_shares { d } else { max_new_shares };
-        let proceeds = (p as u128) * (vol as u128);
-        if vol > best_vol || (vol == best_vol && proceeds >= best_proceeds) {
-            best_vol = vol;
-            best_proceeds = proceeds;
-            clearing_price = p;
-            crossing_demand = d;
+        i = 1;
+        while i < cand_count {
+            let key = candidates[i];
+            let mut j = i;
+            while j > 0 && candidates[j - 1] > key {
+                candidates[j] = candidates[j - 1];
+                j -= 1;
+            }
+            candidates[j] = key;
+            i += 1;
         }
-        i += 1;
-    }
-    if best_vol == 0 {
-        return Err(ERR_NO_CROSSING_ORDERS);
-    }
 
-    let issued_qty = best_vol;
+        let mut best_vol = 0u64;
+        let mut best_proceeds = 0u128;
+        let mut c_px = min_issue_price;
+        let mut c_dem = 0u64;
+        i = 0;
+        while i < cand_count {
+            let p = candidates[i];
+            let mut d = 0u64;
+            let mut b = 0usize;
+            while b < buy_count {
+                if buy_orders[b].price >= p {
+                    d = d.saturating_add(buy_orders[b].quantity);
+                }
+                b += 1;
+            }
+            let vol = if d < max_new_shares { d } else { max_new_shares };
+            let proceeds = (p as u128) * (vol as u128);
+            if vol > best_vol || (vol == best_vol && proceeds >= best_proceeds) {
+                best_vol = vol;
+                best_proceeds = proceeds;
+                c_px = p;
+                c_dem = d;
+            }
+            i += 1;
+        }
+        if best_vol == 0 {
+            return Err(ERR_NO_CROSSING_ORDERS);
+        }
+        (c_px, best_vol, c_dem)
+    };
     let mut buy_fills = [0u64; MAX_AUCTION_ORDERS];
     if crossing_demand > issued_qty {
         let denom = crossing_demand as u128;
@@ -1610,6 +1804,7 @@ fn execute_issuance_auction_settlement(
                 &fill.to_be_bytes(),
             );
 
+            let _ = compute_sha_doc_hash(&pinned_con);
             let mut fill_ev = [0u8; 24];
             fill_ev[0..8].copy_from_slice(&clearing_price.to_be_bytes());
             fill_ev[8..16].copy_from_slice(&buy_orders[b].quantity.to_be_bytes());
@@ -1847,6 +2042,21 @@ fn handle_total_supply(_args: &CalldataReader) -> Result<(), i32> {
 
 fn handle_holder_count(_args: &CalldataReader) -> Result<(), i32> {
     ret::write_u64_word(storage::get_u64(KEY_HOLDER_COUNT));
+    Ok(())
+}
+
+fn handle_registered_holder_count(_args: &CalldataReader) -> Result<(), i32> {
+    ret::write_u64_word(storage::get_u64(KEY_EVER_HOLDERS));
+    Ok(())
+}
+
+fn handle_registered_holder_at(args: &CalldataReader) -> Result<(), i32> {
+    let idx = args.u64(0).ok_or(-3)?;
+    if idx >= storage::get_u64(KEY_EVER_HOLDERS) {
+        return Err(-14);
+    }
+    let addr = storage::get_address(holder_index_key(idx).as_slice()).unwrap_or([0u8; 20]);
+    ret::write_address(&addr);
     Ok(())
 }
 
