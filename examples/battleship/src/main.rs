@@ -80,6 +80,9 @@ const EV_SHIP_COMMISSIONED: [u8; 32] =
 const EV_SHIP_MOVED: [u8; 32] = event_topic(
     "ShipMoved(bytes32,address,uint64,uint64,uint64,uint64,uint64,uint64,uint64,uint64)",
 );
+const EV_VESSEL_COLLISION: [u8; 32] = event_topic(
+    "VesselCollision(bytes32,uint64,uint64,uint64,uint64,uint64,uint64,uint64)",
+);
 const EV_WEAPON_FIRED: [u8; 32] =
     event_topic("WeaponFired(bytes32,uint64,uint64,uint64,uint64,uint64)");
 const EV_SHIP_SUNK: [u8; 32] = event_topic("ShipSunk(bytes32,uint64,uint64,uint64)");
@@ -800,7 +803,7 @@ fn handle_join_battle(args: &CalldataReader) -> Result<i32, i32> {
 }
 
 /// 1-Block Atomic Onboarding: joins battle (if not already joined) and auto-spawns up to 3 starter
-/// ships (`s0, s1, s2`, pass `255` for empty slot) in unobstructed team-side coordinates!
+/// ships (`s0, s1, s2`, pass `255` for empty slot) anywhere across the open ocean!
 fn handle_join_and_deploy(args: &CalldataReader) -> Result<i32, i32> {
     let bid = args.bytes32(0).ok_or(-10)?;
     let preferred_team = args.u64(1).ok_or(-10)?;
@@ -816,7 +819,6 @@ fn handle_join_and_deploy(args: &CalldataReader) -> Result<i32, i32> {
     let mut plr = load_plr(&bid, pid).ok_or(-21)?;
 
     let classes = [s0, s1, s2];
-    let half = hdr.grid_w / 2;
     let mut slot = 0usize;
     while slot < 3 {
         let cid = classes[slot];
@@ -827,19 +829,19 @@ fn handle_join_and_deploy(args: &CalldataReader) -> Result<i32, i32> {
             if existing.alive == 0 && plr.credits >= cost {
                 let l = CLASS_LEN[cid as usize];
                 let w = CLASS_WID[cid as usize];
-                let (x_start, x_end) = if team == TEAM_RED {
-                    (2u8, half.saturating_sub(l + 1))
-                } else {
-                    (half + 2, hdr.grid_w.saturating_sub(l + 1))
-                };
+                let max_x_span = hdr.grid_w.saturating_sub(l + 2).max(1);
+                let max_y_span = hdr.grid_h.saturating_sub(w + 2).max(1);
+
+                let x_seed = (((pid as u16) * 11 + (slot as u16) * 7 + 3) % (max_x_span as u16)) as u8;
+                let y_seed = (((pid as u16) * 7 + (slot as u16) * 5 + 2) % (max_y_span as u16)) as u8;
 
                 let mut placed = false;
-                let y_seed = ((pid as u16 * 5 + slot as u16 * 4 + 2) % (hdr.grid_h.saturating_sub(w + 2).max(1) as u16)) as u8 + 1;
                 let mut dy_off = 0u8;
-                while dy_off < hdr.grid_h && !placed {
-                    let y = 1 + ((y_seed + dy_off) % hdr.grid_h.saturating_sub(w + 1).max(1));
-                    let mut x = x_start;
-                    while x <= x_end {
+                while dy_off < max_y_span && !placed {
+                    let y = 1 + ((y_seed + dy_off) % max_y_span);
+                    let mut dx_off = 0u8;
+                    while dx_off < max_x_span {
+                        let x = 1 + ((x_seed + dx_off) % max_x_span);
                         let cand = ShipRec {
                             alive: 1,
                             owner_pid: pid,
@@ -871,9 +873,9 @@ fn handle_join_and_deploy(args: &CalldataReader) -> Result<i32, i32> {
                             placed = true;
                             break;
                         }
-                        x += 2;
+                        dx_off = dx_off.saturating_add(3);
                     }
-                    dy_off += 2;
+                    dy_off = dy_off.saturating_add(2);
                 }
             }
         }
@@ -929,14 +931,7 @@ fn handle_buy_ship(args: &CalldataReader) -> Result<(), i32> {
         return Err(-24);
     }
 
-    let half = hdr.grid_w / 2;
-    if plr.team == TEAM_RED && (x as u8) >= half {
-        return Err(-25);
-    }
-    if plr.team == TEAM_BLUE && (x as u8) < half {
-        return Err(-25);
-    }
-
+    // Full-board deployment: vessels are free to deploy anywhere across the ocean!
     let cand = ShipRec {
         alive: 1,
         owner_pid: pid,
@@ -975,10 +970,176 @@ fn handle_buy_ship(args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
+fn in_ocean_bounds(grid_w: u8, grid_h: u8, class_id: u8, dir: u8, x: i16, y: i16) -> bool {
+    if x < 0 || y < 0 {
+        return false;
+    }
+    let (w, h) = ship_dims(class_id, dir);
+    (x as u16) + (w as u16) <= (grid_w as u16) && (y as u16) + (h as u16) <= (grid_h as u16)
+}
+
+fn count_breached_cells(ship: &ShipRec) -> u8 {
+    let n_cells = CLASS_CELLS[ship.class_id as usize] as usize;
+    let mut breached = 0u8;
+    let mut k = 0usize;
+    while k < n_cells {
+        if ship.cell_dmg[k] >= 100 {
+            breached += 1;
+        }
+        k += 1;
+    }
+    breached
+}
+
+/// Resolves vessel-to-vessel hull collisions whenever `ship` ends up occupying grid square(s)
+/// overlapping any other alive vessel(s): every overlapping square takes instant `100%` damage on
+/// BOTH vessels, sinking either (or both) if all of its squares are breached!
+fn resolve_vessel_collisions(
+    bid: &[u8; 32],
+    hdr: &mut BattleHeader,
+    mover_pid: u8,
+    mover_gidx: u16,
+    ship: &mut ShipRec,
+) {
+    let (sw, sh) = ship_dims(ship.class_id, ship.dir);
+    let total_slots = (hdr.player_count as u16).min(MAX_PLAYERS as u16) * 3;
+    let mut mover_credits_earned = 0u64;
+    let mut mover_kills = 0u16;
+    let mut last_enemy_collider: Option<(u8, u8)> = None;
+
+    let mut other_gidx = 0u16;
+    while other_gidx < total_slots {
+        if other_gidx != mover_gidx {
+            let mut other = load_ship(bid, other_gidx);
+            if other.alive != 0 && ships_overlap(ship, &other) {
+                let is_enemy = ship.team != other.team;
+                if is_enemy {
+                    last_enemy_collider = Some((other.owner_pid, other.team));
+                }
+
+                let mut overlap_squares = 0u64;
+                let mut other_credits_earned = 0u64;
+
+                let mut ry = 0u8;
+                while ry < sh {
+                    let mut rx = 0u8;
+                    while rx < sw {
+                        let cx = ship.x.saturating_add(rx);
+                        let cy = ship.y.saturating_add(ry);
+                        if let (Some(s_idx), Some(o_idx)) = (
+                            cell_index_on_ship(ship, cx, cy),
+                            cell_index_on_ship(&other, cx, cy),
+                        ) {
+                            overlap_squares += 1;
+                            if ship.cell_dmg[s_idx] < 100 {
+                                ship.cell_dmg[s_idx] = 100;
+                                if is_enemy {
+                                    other_credits_earned += CREDITS_PER_CELL_HIT;
+                                }
+                            }
+                            if other.cell_dmg[o_idx] < 100 {
+                                other.cell_dmg[o_idx] = 100;
+                                if is_enemy {
+                                    mover_credits_earned += CREDITS_PER_CELL_HIT;
+                                }
+                            }
+                        }
+                        rx += 1;
+                    }
+                    ry += 1;
+                }
+
+                if overlap_squares > 0 {
+                    let mut other_sunk = 0u64;
+                    if count_breached_cells(&other) >= CLASS_SINK_CELLS[other.class_id as usize] {
+                        other.alive = 0;
+                        other_sunk = 1;
+                        let bounty = if is_enemy {
+                            let b = CLASS_BOUNTY[other.class_id as usize];
+                            mover_credits_earned += b;
+                            mover_kills += 1;
+                            if ship.team == TEAM_RED {
+                                hdr.red_kills += 1;
+                            } else {
+                                hdr.blue_kills += 1;
+                            }
+                            b
+                        } else {
+                            0
+                        };
+                        let mut sev = [0u8; 24];
+                        sev[0..8].copy_from_slice(&(other_gidx as u64).to_be_bytes());
+                        sev[8..16].copy_from_slice(&(mover_pid as u64).to_be_bytes());
+                        sev[16..24].copy_from_slice(&bounty.to_be_bytes());
+                        events::emit(&[EV_SHIP_SUNK, *bid], &sev);
+                    }
+                    save_ship(bid, other_gidx, &other);
+
+                    if other_credits_earned > 0 {
+                        if let Some(mut oplr) = load_plr(bid, other.owner_pid) {
+                            oplr.credits = oplr.credits.saturating_add(other_credits_earned);
+                            oplr.score = oplr.score.saturating_add(other_credits_earned);
+                            save_plr(bid, other.owner_pid, &oplr);
+                        }
+                    }
+
+                    let mover_will_sink =
+                        count_breached_cells(ship) >= CLASS_SINK_CELLS[ship.class_id as usize];
+                    let mut cev = [0u8; 56];
+                    cev[0..8].copy_from_slice(&(mover_gidx as u64).to_be_bytes());
+                    cev[8..16].copy_from_slice(&(other_gidx as u64).to_be_bytes());
+                    cev[16..24].copy_from_slice(&(ship.x as u64).to_be_bytes());
+                    cev[24..32].copy_from_slice(&(ship.y as u64).to_be_bytes());
+                    cev[32..40].copy_from_slice(&overlap_squares.to_be_bytes());
+                    cev[40..48].copy_from_slice(&(if mover_will_sink { 1u64 } else { 0u64 }).to_be_bytes());
+                    cev[48..56].copy_from_slice(&other_sunk.to_be_bytes());
+                    events::emit(&[EV_VESSEL_COLLISION, *bid], &cev);
+                }
+            }
+        }
+        other_gidx += 1;
+    }
+
+    if count_breached_cells(ship) >= CLASS_SINK_CELLS[ship.class_id as usize] {
+        ship.alive = 0;
+        let (killer_pid, bounty) = if let Some((enemy_pid, enemy_team)) = last_enemy_collider {
+            let b = CLASS_BOUNTY[ship.class_id as usize];
+            if enemy_team == TEAM_RED {
+                hdr.red_kills += 1;
+            } else {
+                hdr.blue_kills += 1;
+            }
+            if let Some(mut eplr) = load_plr(bid, enemy_pid) {
+                eplr.credits = eplr.credits.saturating_add(b);
+                eplr.score = eplr.score.saturating_add(b);
+                eplr.kills = eplr.kills.saturating_add(1);
+                save_plr(bid, enemy_pid, &eplr);
+            }
+            (enemy_pid, b)
+        } else {
+            (mover_pid, 0)
+        };
+        let mut sev = [0u8; 24];
+        sev[0..8].copy_from_slice(&(mover_gidx as u64).to_be_bytes());
+        sev[8..16].copy_from_slice(&(killer_pid as u64).to_be_bytes());
+        sev[16..24].copy_from_slice(&bounty.to_be_bytes());
+        events::emit(&[EV_SHIP_SUNK, *bid], &sev);
+    }
+
+    if mover_credits_earned > 0 || mover_kills > 0 {
+        if let Some(mut mplr) = load_plr(bid, mover_pid) {
+            mplr.credits = mplr.credits.saturating_add(mover_credits_earned);
+            mplr.score = mplr.score.saturating_add(mover_credits_earned);
+            mplr.kills = mplr.kills.saturating_add(mover_kills);
+            save_plr(bid, mover_pid, &mplr);
+        }
+    }
+}
+
 /// 8-Compass-Direction (`dir8`: `0..=7` = N, NE, E, SE, S, SW, W, NW) + Percentage Throttle
 /// (`speed_pct`: `25`, `50`, `75`, or `100`) navigation!
-/// Calculates the destination coordinates on-chain inside the HFS and emits `ShipMoved` so the
-/// client teleports the ship straight to `(final_x, final_y)` from the receipt log!
+/// Bounded only by ocean edges; if the vessel ends up in overlapping grid squares with another
+/// vessel, mutual `100%` square collision damage is applied!
 fn handle_move_ship(args: &CalldataReader) -> Result<i32, i32> {
     let bid = args.bytes32(0).ok_or(-10)?;
     let slot_idx = args.u64(1).ok_or(-10)?;
@@ -1016,7 +1177,6 @@ fn handle_move_ship(args: &CalldataReader) -> Result<i32, i32> {
     let from_x = ship.x;
     let from_y = ship.y;
 
-    // Align hull orientation (`0` = E/W horizontal, `1` = N/S vertical) for pure cardinal headings if free
     let preferred_hull_dir = if dir8 == 0 || dir8 == 4 {
         1u8
     } else if dir8 == 2 || dir8 == 6 {
@@ -1034,29 +1194,18 @@ fn handle_move_ship(args: &CalldataReader) -> Result<i32, i32> {
     while step <= target_steps {
         let nx = (from_x as i16) + dx * step;
         let ny = (from_y as i16) + dy * step;
-        if nx < 0 || ny < 0 || nx >= (hdr.grid_w as i16) || ny >= (hdr.grid_h as i16) {
-            break;
-        }
-        let mut cand = ship;
-        cand.x = nx as u8;
-        cand.y = ny as u8;
-        cand.dir = preferred_hull_dir;
-        if check_ship_placement_free(&bid, hdr.player_count, hdr.grid_w, hdr.grid_h, gidx, &cand) {
+        if in_ocean_bounds(hdr.grid_w, hdr.grid_h, ship.class_id, preferred_hull_dir, nx, ny) {
             best_x = nx as u8;
             best_y = ny as u8;
             best_dir = preferred_hull_dir;
             actual_steps = step as u64;
-        } else if preferred_hull_dir != ship.dir {
-            cand.dir = ship.dir;
-            if check_ship_placement_free(&bid, hdr.player_count, hdr.grid_w, hdr.grid_h, gidx, &cand)
-            {
-                best_x = nx as u8;
-                best_y = ny as u8;
-                best_dir = ship.dir;
-                actual_steps = step as u64;
-            } else {
-                break;
-            }
+        } else if preferred_hull_dir != ship.dir
+            && in_ocean_bounds(hdr.grid_w, hdr.grid_h, ship.class_id, ship.dir, nx, ny)
+        {
+            best_x = nx as u8;
+            best_y = ny as u8;
+            best_dir = ship.dir;
+            actual_steps = step as u64;
         } else {
             break;
         }
@@ -1064,7 +1213,7 @@ fn handle_move_ship(args: &CalldataReader) -> Result<i32, i32> {
     }
 
     if actual_steps == 0 {
-        return Err(-35); // blocked immediately in chosen heading!
+        return Err(-35); // right up against the ocean edge in chosen heading!
     }
 
     ship.x = best_x;
@@ -1073,10 +1222,7 @@ fn handle_move_ship(args: &CalldataReader) -> Result<i32, i32> {
     ship.pad = dir8 as u8;
     ship.last_move_block = blk;
 
-    save_ship(&bid, gidx, &ship);
-    save_hdr(&bid, &hdr);
-
-    // Emit 8-word (64-byte) `ShipMoved` payload so UI teleports directly from the HFS event log!
+    // Emit 8-word (64-byte) `ShipMoved` payload first so UI always teleports to `(best_x, best_y)`!
     let mut ev = [0u8; 64];
     ev[0..8].copy_from_slice(&slot_idx.to_be_bytes());
     ev[8..16].copy_from_slice(&(from_x as u64).to_be_bytes());
@@ -1087,6 +1233,12 @@ fn handle_move_ship(args: &CalldataReader) -> Result<i32, i32> {
     ev[48..56].copy_from_slice(&dir8.to_be_bytes());
     ev[56..64].copy_from_slice(&actual_steps.to_be_bytes());
     events::emit(&[EV_SHIP_MOVED, bid, addr_topic(&caller)], &ev);
+
+    // Resolve vessel-to-vessel hull collisions if 2+ vessels now overlap grid squares!
+    resolve_vessel_collisions(&bid, &mut hdr, pid, gidx, &mut ship);
+
+    save_ship(&bid, gidx, &ship);
+    save_hdr(&bid, &hdr);
 
     let packed = ((best_x as u64) << 8) | (best_y as u64);
     ret::write_u64_word(packed);
@@ -1628,5 +1780,108 @@ mod tests {
             ),
             Err(-32)
         );
+    }
+
+    #[test]
+    fn full_board_placement_and_vessel_ramming_collision() {
+        mock::reset();
+        mock::register_hps(CONTRACT, dispatch_calldata);
+        mock::set_block_number(700);
+
+        let bid = [0x33; 32];
+        let red_p = [0xC1; 20];
+        let blue_p = [0xD2; 20];
+
+        mock::transact_as(
+            red_p,
+            CONTRACT,
+            CallEncoder::<128>::new(selector("createBattle(bytes32)"))
+                .push_bytes32(&bid)
+                .as_slice(),
+        )
+        .unwrap();
+        mock::transact_as(
+            red_p,
+            CONTRACT,
+            CallEncoder::<128>::new(selector("joinBattle(bytes32,uint64)"))
+                .push_bytes32(&bid)
+                .push_u64(0)
+                .as_slice(),
+        )
+        .unwrap();
+        mock::transact_as(
+            blue_p,
+            CONTRACT,
+            CallEncoder::<128>::new(selector("joinBattle(bytes32,uint64)"))
+                .push_bytes32(&bid)
+                .push_u64(1)
+                .as_slice(),
+        )
+        .unwrap();
+
+        // 1. Full-board placement: Red places Cruiser (4x1) on the EAST half (x=28, y=10) & Blue places Gunboat (2x1) at (34, 10)!
+        mock::transact_as(
+            red_p,
+            CONTRACT,
+            CallEncoder::<256>::new(selector("buyShip(bytes32,uint64,uint64,uint64,uint64,uint64)"))
+                .push_bytes32(&bid)
+                .push_u64(0)
+                .push_u64(2) // Cruiser (4x1, max speed 6)
+                .push_u64(28)
+                .push_u64(10)
+                .push_u64(0)
+                .as_slice(),
+        )
+        .unwrap();
+        mock::transact_as(
+            blue_p,
+            CONTRACT,
+            CallEncoder::<256>::new(selector("buyShip(bytes32,uint64,uint64,uint64,uint64,uint64)"))
+                .push_bytes32(&bid)
+                .push_u64(0)
+                .push_u64(0) // Gunboat (2x1)
+                .push_u64(34)
+                .push_u64(10)
+                .push_u64(0)
+                .as_slice(),
+        )
+        .unwrap();
+
+        // 2. Red moves Cruiser East (`dir8 = 2`) at `100%` (`6` sq -> `(34, 10)`), directly overlapping Blue's Gunboat at `(34..36, 10)`!
+        mock::set_block_number(701);
+        mock::transact_as(
+            red_p,
+            CONTRACT,
+            CallEncoder::<256>::new(selector("moveShip(bytes32,uint64,uint64,uint64)"))
+                .push_bytes32(&bid)
+                .push_u64(0)
+                .push_u64(2)
+                .push_u64(100)
+                .as_slice(),
+        )
+        .unwrap();
+
+        let st = mock::transact_as(
+            red_p,
+            CONTRACT,
+            CallEncoder::<128>::new(selector("getBattleState(bytes32)"))
+                .push_bytes32(&bid)
+                .as_slice(),
+        )
+        .unwrap();
+
+        // Blue's Gunboat had both squares crushed (sunk -> alive_n == 1, red_kills == 1)!
+        let alive_n = u16::from_be_bytes([st[32], st[33]]);
+        let red_kills = u32::from_be_bytes([st[8], st[9], st[10], st[11]]);
+        assert_eq!(alive_n, 1);
+        assert_eq!(red_kills, 1);
+
+        // Red's Cruiser survived at (34, 10) with cells 0 & 1 destroyed (100) and cells 2 & 3 intact (0)!
+        assert_eq!(st[38 + 7], 34);
+        assert_eq!(st[38 + 8], 10);
+        assert_eq!(st[38 + 10], 100);
+        assert_eq!(st[38 + 11], 100);
+        assert_eq!(st[38 + 12], 0);
+        assert_eq!(st[38 + 13], 0);
     }
 }
