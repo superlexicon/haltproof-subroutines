@@ -74,6 +74,7 @@ hps_entry! {
     "authorizeModule(address,bytes32,bytes32,bool)"          => handle_authorize_module,
     "isAuthorizedModule(address,bytes32)"                    => handle_is_authorized_module,
     "registerProfile(uint64,uint64,bytes)"                   => handle_register_profile,
+    "syncVerifiedIdentity(address)"                          => handle_sync_verified_identity,
     "attachProductLedger(address)"                           => handle_attach_product_ledger,
     "productLedgerOf(address)"                               => handle_product_ledger_of,
     "pingPresence(uint64,uint64)"                            => handle_ping_presence,
@@ -348,7 +349,7 @@ fn handle_initialize(args: &CalldataReader) -> Result<(), i32> {
     let messaging_hps = args.address(1).ok_or(ERR_SOCIAL_INVALID_ARGS)?;
     let radius_m = args.u64(2).ok_or(ERR_SOCIAL_INVALID_ARGS)?.clamp(300, 5000) as u32;
     let rf_range_m = args.u64(3).ok_or(ERR_SOCIAL_INVALID_ARGS)?.clamp(30, 500) as u32;
-    let lease_blks = args.u64(4).ok_or(ERR_SOCIAL_INVALID_ARGS)?.clamp(3, 200) as u32;
+    let lease_blks = args.u64(4).ok_or(ERR_SOCIAL_INVALID_ARGS)?.clamp(3, 500_000) as u32;
     let founder_meta = args.dynamic_bytes(5).ok_or(ERR_SOCIAL_INVALID_ARGS)?;
     if identity_registry == [0u8; 20]
         || messaging_hps == [0u8; 20]
@@ -527,6 +528,125 @@ fn handle_register_profile(args: &CalldataReader) -> Result<(), i32> {
     ev[20..28].copy_from_slice(&(uid as u64).to_be_bytes());
     ev[28..36].copy_from_slice(&x_m.to_be_bytes());
     ev[36..44].copy_from_slice(&y_m.to_be_bytes());
+    events::emit(&[EV_MEMBER_REGISTERED], &ev);
+    Ok(())
+}
+
+fn decode_abi_bytes_slice(raw: &[u8]) -> &[u8] {
+    if raw.len() < 64 {
+        return &[];
+    }
+    let len = u64::from_be_bytes([
+        raw[56], raw[57], raw[58], raw[59], raw[60], raw[61], raw[62], raw[63],
+    ]) as usize;
+    let avail = raw.len() - 64;
+    let take = len.min(avail);
+    &raw[64..64 + take]
+}
+
+fn push_capped(dst: &mut [u8], pos: &mut usize, src: &[u8]) {
+    let rem = dst.len().saturating_sub(*pos);
+    let n = src.len().min(rem);
+    if n > 0 {
+        dst[*pos..*pos + n].copy_from_slice(&src[..n]);
+        *pos += n;
+    }
+}
+
+/// Permissionlessly onboard or refresh any verified `Identity` HFS (`IdentityRegistry.isValidIdentity`)
+/// using its canonical on-chain `nickname()` and `handle()` so peers can initiate connection handshakes
+/// even before that Captain opens the Comms sidebar!
+fn handle_sync_verified_identity(args: &CalldataReader) -> Result<(), i32> {
+    let mut hdr = CharterHeader::load()?;
+    let target_identity = args.address(0).ok_or(ERR_SOCIAL_INVALID_ARGS)?;
+    if target_identity == [0u8; 20] {
+        return Err(ERR_SOCIAL_INVALID_ARGS);
+    }
+
+    require_valid_identity(&hdr.identity_registry, &target_identity)?;
+    let blk = context::block_number();
+
+    if let Some(uid) = lookup_uid(&target_identity) {
+        let mut m = MemberRecord::load(uid).ok_or(ERR_SOCIAL_NOT_REGISTERED)?;
+        if m.sanctioned != 0 {
+            return Err(ERR_SOCIAL_SANCTIONED);
+        }
+        if !is_active_now(&m, &hdr, blk) {
+            if !inside_subnet(m.x_m as u64, m.y_m as u64, hdr.subnet_radius_m) {
+                m.x_m = SUBNET_CENTER_X as u16;
+                m.y_m = SUBNET_CENTER_Y as u16;
+            }
+            m.last_heartbeat_block = blk;
+            m.save();
+        }
+        return Ok(());
+    }
+
+    if (hdr.member_count as usize) >= MAX_MEMBERS {
+        return Err(ERR_SOCIAL_CAPACITY_FULL);
+    }
+
+    let nick_cd = CallEncoder::<16>::new(const { selector("nickname()") });
+    let handle_cd = CallEncoder::<16>::new(const { selector("handle()") });
+
+    let mut meta = [0u8; MAX_META_LEN];
+    let mut pos = 0usize;
+
+    if let Ok(n_raw) = call::call_raw(&target_identity, nick_cd.as_slice()) {
+        let n_bytes = decode_abi_bytes_slice(n_raw);
+        if !n_bytes.is_empty() {
+            push_capped(&mut meta, &mut pos, n_bytes);
+        }
+    }
+    if pos == 0 {
+        push_capped(&mut meta, &mut pos, b"Captain");
+    }
+    push_capped(&mut meta, &mut pos, b"|@");
+    let after_at = pos;
+    if let Ok(h_raw) = call::call_raw(&target_identity, handle_cd.as_slice()) {
+        let mut h_bytes = decode_abi_bytes_slice(h_raw);
+        if !h_bytes.is_empty() && h_bytes[0] == b'@' {
+            h_bytes = &h_bytes[1..];
+        }
+        if !h_bytes.is_empty() {
+            push_capped(&mut meta, &mut pos, h_bytes);
+        }
+    }
+    if pos == after_at {
+        push_capped(&mut meta, &mut pos, b"captain");
+    }
+    push_capped(&mut meta, &mut pos, b"|Fleet Captain|Naval VHF");
+
+    let uid = hdr.member_count;
+    hdr.member_count += 1;
+    hdr.save();
+
+    let m = MemberRecord {
+        identity: target_identity,
+        product_ledger: [0u8; 20],
+        uid,
+        trust_score: NEWCOMER_INITIAL_TRUST,
+        sanctioned: 0,
+        voucher_count: 0,
+        vouchers: [0u8; 4],
+        vouchers_slashed: 0,
+        slash_count: 0,
+        last_flag_reason: 0,
+        x_m: SUBNET_CENTER_X as u16,
+        y_m: SUBNET_CENTER_Y as u16,
+        last_heartbeat_block: blk,
+        flagged_by_mask: 0,
+        meta_len: pos as u8,
+        meta,
+    };
+    m.save();
+    storage::set_u64(key_uid(&target_identity).as_slice(), (uid as u64) + 1);
+
+    let mut ev = [0u8; 44];
+    ev[0..20].copy_from_slice(&target_identity);
+    ev[20..28].copy_from_slice(&(uid as u64).to_be_bytes());
+    ev[28..36].copy_from_slice(&(SUBNET_CENTER_X as u64).to_be_bytes());
+    ev[36..44].copy_from_slice(&(SUBNET_CENTER_Y as u64).to_be_bytes());
     events::emit(&[EV_MEMBER_REGISTERED], &ev);
     Ok(())
 }
