@@ -44,7 +44,9 @@ Complete ABI function signatures, WASM artifact sizes, and canonical error codes
   - `revokeRole(bytes32 roleId, address account, address authObj) -> uint64`
   - `hasRole(bytes32 roleId, address account) -> bool`, `roleMemberCount(bytes32 roleId) -> uint64`, `roleMemberAt(bytes32 roleId, uint64 idx) -> address`
   - `addDirector(address director, address authObj) -> uint64`, `removeDirector(address director, address authObj) -> uint64`
-  - `isDirector(address candidate) -> bool`, `directorCount() -> uint64`
+  - `consentToDirectorship() -> bool`, `hasDirectorConsented(address candidate) -> bool`, `allDirectorsConsented() -> bool`, `unconsentedDirectorCount() -> uint64`
+  - `isDirector(address candidate) -> bool`, `directorCount() -> uint64`, `directorAt(uint64 idx) -> address`
+  - `isPendingDirector(address candidate) -> bool`, `pendingDirectorCount() -> uint64`, `pendingDirectorAt(uint64 idx) -> address`
 - **Policies & Share Capital Structure**:
   - `setPolicy(address targetHps, bytes32 policyId, bytes rawSpec, address authObj) -> bool`
   - `deactivatePolicy(address targetHps, bytes32 policyId, address authObj) -> bool`
@@ -157,3 +159,4 @@ Complete ABI function signatures, WASM artifact sizes, and canonical error codes
 | `-93` | `ERR_ROLE_NOT_DEFINED` | `PolicySpec` or `grantRole` references an undefined `roleId` in `CorporateCharter` |
 | `-94` | `ERR_FUNCTION_AUTH_NOT_SET` | No authorization policy mapped for the target function selector |
 | `-95` | `ERR_UNAUTHORIZED_MODULE` | Sibling module lacks the required capability in `CorporateCharter` |
+| `-96` | `ERR_DIRECTOR_CONSENT_REQUIRED` | `activateCharter` blocked because one or more named Initial Directors have not signed `consentToDirectorship()` |

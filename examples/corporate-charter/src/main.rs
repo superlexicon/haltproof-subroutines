@@ -32,11 +32,12 @@ use hps_sdk::governance::{
     ACTION_REGISTER_SHARE_CLASS, ACTION_REMOVE_DIRECTOR, ACTION_REVOKE_ROLE,
     ACTION_SET_FUNCTION_AUTH, CHARTER_STATE_ACTIVE, CHARTER_STATE_PENDING_RATIFICATION,
     CHARTER_STATE_UNINITIALIZED, ERR_CHARTER_ALREADY_ACTIVE, ERR_CHARTER_NOT_ACTIVE,
-    ERR_FUNCTION_AUTH_NOT_SET, ERR_POLICY_INVALID, ERR_ROLE_NOT_DEFINED, MAX_AUTHORIZED_MODULES,
-    MAX_DEFINED_ROLES, MAX_ENCODED_POLICY_BYTES, MAX_MEMBERS_PER_STAGE, MAX_SHARE_CLASSES,
-    POLICY_BANK_ORACLE, POLICY_BOARD_RESOLUTION, POLICY_FIRST_SHAREHOLDER_RESOLUTION,
-    POLICY_PRODUCT_MANAGEMENT, POLICY_SHAREHOLDER_SUPERMAJORITY, POLICY_SUPER_GOVERNANCE,
-    ROLE_BANK_ORACLE, ROLE_DIRECTOR, ROLE_PRODUCT_MANAGER, ROLE_SHAREHOLDER, ROLE_TREASURY_MANAGER,
+    ERR_DIRECTOR_CONSENT_REQUIRED, ERR_FUNCTION_AUTH_NOT_SET, ERR_POLICY_INVALID,
+    ERR_ROLE_NOT_DEFINED, MAX_AUTHORIZED_MODULES, MAX_DEFINED_ROLES, MAX_ENCODED_POLICY_BYTES,
+    MAX_MEMBERS_PER_STAGE, MAX_SHARE_CLASSES, POLICY_BANK_ORACLE, POLICY_BOARD_RESOLUTION,
+    POLICY_FIRST_SHAREHOLDER_RESOLUTION, POLICY_PRODUCT_MANAGEMENT,
+    POLICY_SHAREHOLDER_SUPERMAJORITY, POLICY_SUPER_GOVERNANCE, ROLE_BANK_ORACLE, ROLE_DIRECTOR,
+    ROLE_PRODUCT_MANAGER, ROLE_SHAREHOLDER, ROLE_TREASURY_MANAGER,
 };
 use hps_sdk::keccak::keccak256;
 use hps_sdk::storage::KeyBuilder;
@@ -48,6 +49,9 @@ const POLICY_SET: [u8; 32] = event_topic("PolicySet(address,bytes32,uint64,uint6
 const POLICY_DEACTIVATED: [u8; 32] = event_topic("PolicyDeactivated(address,bytes32)");
 const DIRECTOR_ADDED: [u8; 32] = event_topic("DirectorAdded(address,uint64,address)");
 const DIRECTOR_REMOVED: [u8; 32] = event_topic("DirectorRemoved(address,uint64,address)");
+const DIRECTOR_CONSENTED: [u8; 32] = event_topic("DirectorConsented(address,uint64)");
+const DIRECTOR_PENDING_CONSENT: [u8; 32] =
+    event_topic("DirectorPendingConsent(address,address,uint64)");
 const ROLE_DEFINED: [u8; 32] = event_topic("RoleDefined(bytes32,address,uint64)");
 const ROLE_GRANTED: [u8; 32] = event_topic("RoleGranted(bytes32,address,address,uint64)");
 const ROLE_REVOKED: [u8; 32] = event_topic("RoleRevoked(bytes32,address,address,uint64)");
@@ -83,6 +87,7 @@ const KEY_DEFINED_ROLES_COUNT: &[u8] = b"chr:role_cnt";
 const KEY_REGISTRY: &[u8] = b"chr:reg";
 const KEY_INITIALIZER: &[u8] = b"chr:init_by";
 const KEY_DIRECTORS_BLOB: &[u8] = b"chr:directors";
+const KEY_PENDING_DIRECTORS_BLOB: &[u8] = b"chr:dpend_list";
 const KEY_BOARD_EXPIRY: &[u8] = b"chr:board_exp";
 const KEY_SHARE_CLASSES_BLOB: &[u8] = b"chr:sh_classes";
 
@@ -107,8 +112,16 @@ hps_entry! {
     "deactivatePolicy(address,bytes32,address)"                                 => handle_deactivate_policy,
     "addDirector(address,address)"                                              => handle_add_director,
     "removeDirector(address,address)"                                           => handle_remove_director,
+    "consentToDirectorship()"                                                   => handle_consent_to_directorship,
+    "hasDirectorConsented(address)"                                             => handle_has_director_consented,
+    "allDirectorsConsented()"                                                   => handle_all_directors_consented,
+    "unconsentedDirectorCount()"                                                => handle_unconsented_director_count,
     "isDirector(address)"                                                       => handle_is_director,
     "directorCount()"                                                           => handle_director_count,
+    "directorAt(uint64)"                                                        => handle_director_at,
+    "isPendingDirector(address)"                                                => handle_is_pending_director,
+    "pendingDirectorCount()"                                                    => handle_pending_director_count,
+    "pendingDirectorAt(uint64)"                                                 => handle_pending_director_at,
     "grantRole(bytes32,address,address)"                                        => handle_grant_role,
     "revokeRole(bytes32,address,address)"                                       => handle_revoke_role,
     "hasRole(bytes32,address)"                                                  => handle_has_role,
@@ -610,6 +623,121 @@ fn load_directors(out: &mut [[u8; 20]; MAX_MEMBERS_PER_STAGE]) -> usize {
     count
 }
 
+fn director_consent_key(account: &[u8; 20]) -> KeyBuilder<32> {
+    KeyBuilder::<32>::new().push(b"chr:dcon:").push(account)
+}
+
+fn director_pending_key(account: &[u8; 20]) -> KeyBuilder<32> {
+    KeyBuilder::<32>::new().push(b"chr:dpend:").push(account)
+}
+
+fn director_pending_auth_key(account: &[u8; 20]) -> KeyBuilder<32> {
+    KeyBuilder::<32>::new().push(b"chr:dpaut:").push(account)
+}
+
+fn has_director_consented(account: &[u8; 20]) -> bool {
+    *account != [0u8; 20] && storage::get_u64(director_consent_key(account).as_slice()) == 1
+}
+
+fn set_director_consented(account: &[u8; 20], consented: bool) {
+    storage::set_u64(
+        director_consent_key(account).as_slice(),
+        u64::from(consented),
+    );
+}
+
+fn load_pending_directors(out: &mut [[u8; 20]; MAX_MEMBERS_PER_STAGE]) -> usize {
+    let mut raw = [0u8; MAX_MEMBERS_PER_STAGE * 20];
+    let Some(n) = storage::get_into(KEY_PENDING_DIRECTORS_BLOB, &mut raw) else {
+        return 0;
+    };
+    let count = (n / 20).min(MAX_MEMBERS_PER_STAGE);
+    let mut i = 0;
+    while i < count {
+        out[i].copy_from_slice(&raw[i * 20..(i + 1) * 20]);
+        i += 1;
+    }
+    count
+}
+
+fn save_pending_directors(pending: &[[u8; 20]; MAX_MEMBERS_PER_STAGE], count: usize) {
+    if count == 0 {
+        storage::set(KEY_PENDING_DIRECTORS_BLOB, &[]);
+    } else {
+        let mut raw = [0u8; MAX_MEMBERS_PER_STAGE * 20];
+        let mut i = 0;
+        while i < count {
+            raw[i * 20..(i + 1) * 20].copy_from_slice(&pending[i]);
+            i += 1;
+        }
+        storage::set(KEY_PENDING_DIRECTORS_BLOB, &raw[..count * 20]);
+    }
+}
+
+fn remove_pending_director(account: &[u8; 20]) -> bool {
+    storage::set_u64(director_pending_key(account).as_slice(), 0);
+    let mut pending = [[0u8; 20]; MAX_MEMBERS_PER_STAGE];
+    let count = load_pending_directors(&mut pending);
+    let mut found: Option<usize> = None;
+    let mut i = 0;
+    while i < count {
+        if &pending[i] == account {
+            found = Some(i);
+            break;
+        }
+        i += 1;
+    }
+    if let Some(idx) = found {
+        let mut j = idx;
+        while j + 1 < count {
+            pending[j] = pending[j + 1];
+            j += 1;
+        }
+        pending[count - 1] = [0u8; 20];
+        save_pending_directors(&pending, count - 1);
+        true
+    } else {
+        false
+    }
+}
+
+fn seed_initial_director_consents(caller: &[u8; 20]) {
+    let mut dirs = [[0u8; 20]; MAX_MEMBERS_PER_STAGE];
+    let count = load_directors(&mut dirs);
+    let now = context::block_number();
+    let mut i = 0;
+    while i < count {
+        if &dirs[i] == caller {
+            set_director_consented(caller, true);
+            events::emit(&[DIRECTOR_CONSENTED, addr_topic(caller)], &now.to_be_bytes());
+        } else {
+            events::emit(
+                &[
+                    DIRECTOR_PENDING_CONSENT,
+                    addr_topic(&dirs[i]),
+                    addr_topic(&[0u8; 20]),
+                ],
+                &now.to_be_bytes(),
+            );
+        }
+        i += 1;
+    }
+}
+
+fn count_unconsented_directors() -> usize {
+    let mut dirs = [[0u8; 20]; MAX_MEMBERS_PER_STAGE];
+    let count = load_directors(&mut dirs);
+    let mut missing = 0usize;
+    let mut i = 0;
+    while i < count {
+        if !has_director_consented(&dirs[i]) {
+            missing += 1;
+        }
+        i += 1;
+    }
+    missing
+}
+
 fn sync_director_role_members(
     directors: &[[u8; 20]; MAX_MEMBERS_PER_STAGE],
     count: usize,
@@ -871,6 +999,7 @@ fn handle_initialize(args: &CalldataReader) -> Result<(), i32> {
     storage::set_address(KEY_INITIALIZER, &caller);
     storage::set_u64(KEY_INIT, 1);
     storage::set_u64(KEY_STATE, CHARTER_STATE_PENDING_RATIFICATION);
+    seed_initial_director_consents(&caller);
 
     events::emit(
         &[CHARTER_INITIALIZED, addr_topic(&registry)],
@@ -1140,6 +1269,7 @@ fn execute_initialize_with_governance(
     storage::set_address(KEY_INITIALIZER, &caller);
     storage::set_u64(KEY_INIT, 1);
     storage::set_u64(KEY_STATE, CHARTER_STATE_PENDING_RATIFICATION);
+    seed_initial_director_consents(&caller);
 
     events::emit(
         &[CHARTER_INITIALIZED, addr_topic(registry)],
@@ -1150,6 +1280,11 @@ fn execute_initialize_with_governance(
 
 /// Pass the **First Shareholder Resolution** to ratify and activate a newly created `CorporateCharter`,
 /// transitioning its state from `CHARTER_STATE_PENDING_RATIFICATION (1)` to `CHARTER_STATE_ACTIVE (2)`.
+///
+/// Constitutional Rule: In addition to the required Shareholder Super-Majority (`shareholder_auth`),
+/// **every named Initial Director** must have signed `consentToDirectorship()` (the incorporating
+/// `caller` is auto-consented at construction; any additional Initial Directors must consent on-chain).
+/// Minority non-director shareholders do not block activation once `>= 75%` shareholders ratify.
 fn handle_activate_charter(args: &CalldataReader) -> Result<(), i32> {
     let (registry, caller) = ensure_initialized_any_state_caller()?;
     let st = storage::get_u64(KEY_STATE);
@@ -1158,6 +1293,25 @@ fn handle_activate_charter(args: &CalldataReader) -> Result<(), i32> {
     }
     if st != CHARTER_STATE_PENDING_RATIFICATION {
         return Err(ERR_CHARTER_NOT_ACTIVE);
+    }
+
+    // If caller happens to be an initial director invoking activateCharter directly, count their signature as consent too
+    let mut init_dirs = [[0u8; 20]; MAX_MEMBERS_PER_STAGE];
+    let init_dir_cnt = load_directors(&mut init_dirs);
+    let mut d = 0;
+    while d < init_dir_cnt {
+        if init_dirs[d] == caller && !has_director_consented(&caller) {
+            set_director_consented(&caller, true);
+            events::emit(
+                &[DIRECTOR_CONSENTED, addr_topic(&caller)],
+                &context::block_number().to_be_bytes(),
+            );
+        }
+        d += 1;
+    }
+
+    if count_unconsented_directors() > 0 {
+        return Err(ERR_DIRECTOR_CONSENT_REQUIRED);
     }
 
     let shareholder_auth = args.address(0).ok_or(-3)?;
@@ -1459,22 +1613,57 @@ fn handle_add_director(args: &CalldataReader) -> Result<(), i32> {
         }
         i += 1;
     }
+    if storage::get_u64(director_pending_key(&new_director).as_slice()) == 1 {
+        return Err(-61);
+    }
 
     let req_pol = require_charter_function_auth(&SEL_ADD_DIRECTOR)?;
     let action_hash = compute_add_director_hash(&new_director);
     let me = context::self_address();
     verify_and_consume_auth(&registry, &super_auth, &me, &req_pol, &action_hash, &caller)?;
 
-    dirs[count] = new_director;
-    let new_count = count + 1;
-    let exp = storage::get_u64(KEY_BOARD_EXPIRY);
-    save_directors_and_sync_board_policy(&dirs, new_count, if exp == 0 { 50 } else { exp })?;
+    let now = context::block_number();
+    if new_director == caller {
+        set_director_consented(&new_director, true);
+        events::emit(
+            &[DIRECTOR_CONSENTED, addr_topic(&new_director)],
+            &now.to_be_bytes(),
+        );
+    }
 
-    events::emit(
-        &[DIRECTOR_ADDED, addr_topic(&new_director), addr_topic(&super_auth)],
-        &(new_count as u64).to_be_bytes(),
-    );
-    ret::write_u64_word(new_count as u64);
+    if has_director_consented(&new_director) {
+        dirs[count] = new_director;
+        let new_count = count + 1;
+        let exp = storage::get_u64(KEY_BOARD_EXPIRY);
+        save_directors_and_sync_board_policy(&dirs, new_count, if exp == 0 { 50 } else { exp })?;
+
+        events::emit(
+            &[DIRECTOR_ADDED, addr_topic(&new_director), addr_topic(&super_auth)],
+            &(new_count as u64).to_be_bytes(),
+        );
+        ret::write_u64_word(new_count as u64);
+    } else {
+        // Nominee has NOT consented yet — record pending appointment until `consentToDirectorship()` is signed by `new_director`!
+        let mut pending = [[0u8; 20]; MAX_MEMBERS_PER_STAGE];
+        let p_cnt = load_pending_directors(&mut pending);
+        if p_cnt >= MAX_MEMBERS_PER_STAGE {
+            return Err(-61);
+        }
+        pending[p_cnt] = new_director;
+        save_pending_directors(&pending, p_cnt + 1);
+        storage::set_u64(director_pending_key(&new_director).as_slice(), 1);
+        storage::set_address(director_pending_auth_key(&new_director).as_slice(), &super_auth);
+
+        events::emit(
+            &[
+                DIRECTOR_PENDING_CONSENT,
+                addr_topic(&new_director),
+                addr_topic(&super_auth),
+            ],
+            &now.to_be_bytes(),
+        );
+        ret::write_u64_word(count as u64);
+    }
     Ok(())
 }
 
@@ -1485,9 +1674,7 @@ fn handle_remove_director(args: &CalldataReader) -> Result<(), i32> {
 
     let mut dirs = [[0u8; 20]; MAX_MEMBERS_PER_STAGE];
     let count = load_directors(&mut dirs);
-    if count <= 1 {
-        return Err(-61);
-    }
+
     let mut found_idx: Option<usize> = None;
     let mut i = 0;
     while i < count {
@@ -1497,28 +1684,111 @@ fn handle_remove_director(args: &CalldataReader) -> Result<(), i32> {
         }
         i += 1;
     }
-    let idx = found_idx.ok_or(-62)?;
+
+    let is_pending = storage::get_u64(director_pending_key(&director).as_slice()) == 1;
+    if found_idx.is_none() && !is_pending {
+        return Err(-62);
+    }
+    if found_idx.is_some() && count <= 1 {
+        return Err(-61);
+    }
 
     let req_pol = require_charter_function_auth(&SEL_REMOVE_DIRECTOR)?;
     let action_hash = compute_remove_director_hash(&director);
     let me = context::self_address();
     verify_and_consume_auth(&registry, &super_auth, &me, &req_pol, &action_hash, &caller)?;
 
-    let mut j = idx;
-    while j + 1 < count {
-        dirs[j] = dirs[j + 1];
-        j += 1;
-    }
-    let new_count = count - 1;
-    dirs[new_count] = [0u8; 20];
-    let exp = storage::get_u64(KEY_BOARD_EXPIRY);
-    save_directors_and_sync_board_policy(&dirs, new_count, if exp == 0 { 50 } else { exp })?;
+    set_director_consented(&director, false);
+    let _ = remove_pending_director(&director);
+
+    let out_count = if let Some(idx) = found_idx {
+        let mut j = idx;
+        while j + 1 < count {
+            dirs[j] = dirs[j + 1];
+            j += 1;
+        }
+        let new_count = count - 1;
+        dirs[new_count] = [0u8; 20];
+        let exp = storage::get_u64(KEY_BOARD_EXPIRY);
+        save_directors_and_sync_board_policy(&dirs, new_count, if exp == 0 { 50 } else { exp })?;
+        new_count
+    } else {
+        count
+    };
 
     events::emit(
         &[DIRECTOR_REMOVED, addr_topic(&director), addr_topic(&super_auth)],
-        &(new_count as u64).to_be_bytes(),
+        &(out_count as u64).to_be_bytes(),
     );
-    ret::write_u64_word(new_count as u64);
+    ret::write_u64_word(out_count as u64);
+    Ok(())
+}
+
+/// Sign personal **Consent to Act as Director** from the calling `Identity` HPS:
+/// 1. While `PENDING_RATIFICATION`, records consent so `activateCharter` can transition the
+///    `CorporateCharter` to `ACTIVE` once all named Initial Directors have consented and `>= 75%`
+///    Shareholders ratify.
+/// 2. While `ACTIVE`, if `caller` has an approved `addDirector` appointment awaiting consent
+///    (`isPendingDirector(caller) == true`), immediately seats `caller` onto the Board of Directors
+///    and emits `DirectorAdded`!
+fn handle_consent_to_directorship(_args: &CalldataReader) -> Result<(), i32> {
+    let (_registry, caller) = ensure_initialized_any_state_caller()?;
+    let now = context::block_number();
+
+    set_director_consented(&caller, true);
+    events::emit(&[DIRECTOR_CONSENTED, addr_topic(&caller)], &now.to_be_bytes());
+
+    if storage::get_u64(KEY_STATE) == CHARTER_STATE_ACTIVE
+        && storage::get_u64(director_pending_key(&caller).as_slice()) == 1
+    {
+        let super_auth =
+            storage::get_address(director_pending_auth_key(&caller).as_slice()).unwrap_or([0u8; 20]);
+        let _ = remove_pending_director(&caller);
+
+        let mut dirs = [[0u8; 20]; MAX_MEMBERS_PER_STAGE];
+        let count = load_directors(&mut dirs);
+        let mut already = false;
+        let mut i = 0;
+        while i < count {
+            if dirs[i] == caller {
+                already = true;
+                break;
+            }
+            i += 1;
+        }
+        if !already && count < MAX_MEMBERS_PER_STAGE {
+            dirs[count] = caller;
+            let new_count = count + 1;
+            let exp = storage::get_u64(KEY_BOARD_EXPIRY);
+            save_directors_and_sync_board_policy(
+                &dirs,
+                new_count,
+                if exp == 0 { 50 } else { exp },
+            )?;
+            events::emit(
+                &[DIRECTOR_ADDED, addr_topic(&caller), addr_topic(&super_auth)],
+                &(new_count as u64).to_be_bytes(),
+            );
+        }
+    }
+
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_has_director_consented(args: &CalldataReader) -> Result<(), i32> {
+    let candidate = args.address(0).ok_or(-3)?;
+    ret::write_bool(has_director_consented(&candidate));
+    Ok(())
+}
+
+fn handle_all_directors_consented(_args: &CalldataReader) -> Result<(), i32> {
+    ret::write_bool(count_unconsented_directors() == 0);
+    Ok(())
+}
+
+fn handle_unconsented_director_count(_args: &CalldataReader) -> Result<(), i32> {
+    ret::write_u64_word(count_unconsented_directors() as u64);
     Ok(())
 }
 
@@ -1543,6 +1813,43 @@ fn handle_director_count(_args: &CalldataReader) -> Result<(), i32> {
     let mut dirs = [[0u8; 20]; MAX_MEMBERS_PER_STAGE];
     let count = load_directors(&mut dirs);
     ret::write_u64_word(count as u64);
+    Ok(())
+}
+
+fn handle_director_at(args: &CalldataReader) -> Result<(), i32> {
+    let idx = args.u64(0).ok_or(-3)? as usize;
+    let mut dirs = [[0u8; 20]; MAX_MEMBERS_PER_STAGE];
+    let count = load_directors(&mut dirs);
+    if idx >= count {
+        return Err(-62);
+    }
+    ret::write_address(&dirs[idx]);
+    Ok(())
+}
+
+fn handle_is_pending_director(args: &CalldataReader) -> Result<(), i32> {
+    let candidate = args.address(0).ok_or(-3)?;
+    let pending = candidate != [0u8; 20]
+        && storage::get_u64(director_pending_key(&candidate).as_slice()) == 1;
+    ret::write_bool(pending);
+    Ok(())
+}
+
+fn handle_pending_director_count(_args: &CalldataReader) -> Result<(), i32> {
+    let mut pending = [[0u8; 20]; MAX_MEMBERS_PER_STAGE];
+    let count = load_pending_directors(&mut pending);
+    ret::write_u64_word(count as u64);
+    Ok(())
+}
+
+fn handle_pending_director_at(args: &CalldataReader) -> Result<(), i32> {
+    let idx = args.u64(0).ok_or(-3)? as usize;
+    let mut pending = [[0u8; 20]; MAX_MEMBERS_PER_STAGE];
+    let count = load_pending_directors(&mut pending);
+    if idx >= count {
+        return Err(-62);
+    }
+    ret::write_address(&pending[idx]);
     Ok(())
 }
 
@@ -2222,9 +2529,77 @@ mod tests {
         mock::set_self_address(charter_addr);
         mock::set_sender(founder);
         let act_cd = CallEncoder::<64>::new(SEL_ACTIVATE_CHARTER).push_address(&auth_act);
+        // `dir_2` was named as an Initial Director by `founder`, so `activateCharter` MUST revert
+        // with `ERR_DIRECTOR_CONSENT_REQUIRED (-96)` until `dir_2` signs `consentToDirectorship()`!
+        assert_eq!(
+            dispatch_calldata(act_cd.as_slice()),
+            ERR_DIRECTOR_CONSENT_REQUIRED
+        );
+        assert_eq!(dispatch_calldata(&selector("unconsentedDirectorCount()")), 0);
+        assert_eq!(
+            u64::from_be_bytes(mock::take_return_data()[24..32].try_into().unwrap()),
+            1
+        );
+
+        // `dir_2` signs personal `consentToDirectorship()`
+        mock::set_sender(dir_2);
+        assert_eq!(dispatch_calldata(&selector("consentToDirectorship()")), 0);
+        assert_eq!(mock::take_return_data()[31], 1);
+        assert_eq!(dispatch_calldata(&selector("allDirectorsConsented()")), 0);
+        assert_eq!(mock::take_return_data()[31], 1);
+
+        // Now `activateCharter` succeeds (even without minority non-director shareholders blocking!)
+        mock::set_sender(founder);
         assert_eq!(dispatch_calldata(act_cd.as_slice()), 0);
         assert_eq!(dispatch_calldata(&selector("isActive()")), 0);
         assert_eq!(mock::take_return_data()[31], 1);
+
+        // Post-activation `addDirector` for an external nominee (`dir_3`) MUST await `dir_3`'s consent!
+        let dir_3 = [0x04; 20];
+        let h_add_cd =
+            CallEncoder::<64>::new(selector("hashAddDirector(address)")).push_address(&dir_3);
+        assert_eq!(dispatch_calldata(h_add_cd.as_slice()), 0);
+        let add_hash: [u8; 32] = mock::take_return_data().try_into().unwrap();
+        let auth_add = [0xA0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3];
+        mock::register_hps(auth_add, auth_stub::dispatch);
+        mock::set_self_address(auth_add);
+        storage::set_address(b"target", &charter_addr);
+        storage::set(b"pol", &POLICY_SUPER_GOVERNANCE);
+        storage::set(b"hash", &add_hash);
+
+        mock::set_self_address(charter_addr);
+        mock::set_sender(founder);
+        let add_dir_cd = CallEncoder::<96>::new(SEL_ADD_DIRECTOR)
+            .push_address(&dir_3)
+            .push_address(&auth_add);
+        assert_eq!(dispatch_calldata(add_dir_cd.as_slice()), 0);
+        // Active directorCount is still 2 while `dir_3` is pending consent!
+        assert_eq!(
+            u64::from_be_bytes(mock::take_return_data()[24..32].try_into().unwrap()),
+            2
+        );
+        let chk_dir3 =
+            CallEncoder::<64>::new(selector("isDirector(address)")).push_address(&dir_3);
+        assert_eq!(dispatch_calldata(chk_dir3.as_slice()), 0);
+        assert_eq!(mock::take_return_data()[31], 0);
+        let chk_pend3 =
+            CallEncoder::<64>::new(selector("isPendingDirector(address)")).push_address(&dir_3);
+        assert_eq!(dispatch_calldata(chk_pend3.as_slice()), 0);
+        assert_eq!(mock::take_return_data()[31], 1);
+
+        // Once `dir_3` signs `consentToDirectorship()`, they immediately join the active Board!
+        mock::set_sender(dir_3);
+        assert_eq!(dispatch_calldata(&selector("consentToDirectorship()")), 0);
+        assert_eq!(dispatch_calldata(chk_dir3.as_slice()), 0);
+        assert_eq!(mock::take_return_data()[31], 1);
+        assert_eq!(dispatch_calldata(chk_pend3.as_slice()), 0);
+        assert_eq!(mock::take_return_data()[31], 0);
+        assert_eq!(dispatch_calldata(&selector("directorCount()")), 0);
+        assert_eq!(
+            u64::from_be_bytes(mock::take_return_data()[24..32].try_into().unwrap()),
+            3
+        );
+        mock::set_sender(founder);
 
         // Modules pre-registered at construction are now active!
         assert_eq!(dispatch_calldata(mod_chk_cd.as_slice()), 0);
