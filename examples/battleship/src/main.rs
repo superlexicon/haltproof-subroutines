@@ -1244,6 +1244,8 @@ fn handle_upgrade_engine(args: &CalldataReader) -> Result<(), i32> {
 }
 
 /// Repairs destroyed hull squares (`100` -> `0`) at `100 CR` per square restored!
+/// Uses its own per-block cooldown (`ship.pad2`) so a captain can Move, Fire, Heal, and Upgrade
+/// all in the same round/block (`<= 1` pending tx per action type)!
 fn handle_repair_ship(args: &CalldataReader) -> Result<i32, i32> {
     let bid = args.bytes32(0).ok_or(-10)?;
     let slot_idx = args.u64(1).ok_or(-10)?;
@@ -1264,8 +1266,9 @@ fn handle_repair_ship(args: &CalldataReader) -> Result<i32, i32> {
         return Err(-71);
     }
 
-    let blk32 = context::block_number() as u32;
-    if ship.last_move_block == blk32 || ship.last_fire_block == blk32 {
+    let blk_tag = ((context::block_number() % 65535) as u16) + 1;
+    let last_rep_tag = u16::from_be_bytes(ship.pad2);
+    if last_rep_tag == blk_tag {
         return Err(-72);
     }
 
@@ -1285,8 +1288,7 @@ fn handle_repair_ship(args: &CalldataReader) -> Result<i32, i32> {
         return Err(-73);
     }
 
-    ship.last_move_block = blk32;
-    ship.last_fire_block = blk32;
+    ship.pad2 = blk_tag.to_be_bytes();
     save_plr(&bid, pid, &plr);
     save_ship(&bid, gidx, &ship);
     save_hdr(&bid, &hdr);
@@ -1568,5 +1570,63 @@ mod tests {
         .unwrap();
         // Second alive ship starts at 36 + 34 = 70; ship record starts at 72; cell_dmg[0] is at 72 + 10 = 82
         assert_eq!(st[82], 100);
+
+        // Blue can Upgrade Engine + Move + Fire + Repair ALL in the SAME block (603), while a 2nd Move or 2nd Repair in block 603 is rejected!
+        mock::set_block_number(603);
+        mock::transact_as(
+            blue_p,
+            CONTRACT,
+            CallEncoder::<256>::new(selector("upgradeArmor(bytes32,uint64)"))
+                .push_bytes32(&bid)
+                .push_u64(0)
+                .as_slice(),
+        )
+        .unwrap();
+        mock::transact_as(
+            blue_p,
+            CONTRACT,
+            CallEncoder::<256>::new(selector("moveShip(bytes32,uint64,uint64,uint64)"))
+                .push_bytes32(&bid)
+                .push_u64(0)
+                .push_u64(6)  // West
+                .push_u64(50) // 50% of (6 + 2) = 4 squares -> (16, 12)
+                .as_slice(),
+        )
+        .unwrap();
+        mock::transact_as(
+            blue_p,
+            CONTRACT,
+            CallEncoder::<256>::new(selector("fireWeapon(bytes32,uint64,uint64,uint64)"))
+                .push_bytes32(&bid)
+                .push_u64(0)
+                .push_u64(12)
+                .push_u64(12)
+                .as_slice(),
+        )
+        .unwrap();
+        mock::transact_as(
+            blue_p,
+            CONTRACT,
+            CallEncoder::<256>::new(selector("repairShip(bytes32,uint64)"))
+                .push_bytes32(&bid)
+                .push_u64(0)
+                .as_slice(),
+        )
+        .unwrap();
+
+        // Verify a 2nd moveShip in the same block 603 is rejected (-32)
+        assert_eq!(
+            mock::transact_as(
+                blue_p,
+                CONTRACT,
+                CallEncoder::<256>::new(selector("moveShip(bytes32,uint64,uint64,uint64)"))
+                    .push_bytes32(&bid)
+                    .push_u64(0)
+                    .push_u64(6)
+                    .push_u64(25)
+                    .as_slice(),
+            ),
+            Err(-32)
+        );
     }
 }
