@@ -21,9 +21,10 @@ use hps_sdk::abi::CalldataReader;
 use hps_sdk::call::{self, CallEncoder};
 use hps_sdk::governance::{
     query_charter_function_auth, require_active_charter, require_valid_identity,
-    verify_and_consume_auth, ActionHasher, ACTION_AUTHORIZE_FUTURES_UNDERWRITING,
-    ACTION_SET_SHARE_ESCROW, ERR_CHARTER_MISMATCH, ERR_FUTURES_CAP_EXCEEDED,
-    ERR_INVALID_FUTURES_CONFIG, POLICY_BOARD_RESOLUTION, POLICY_SHAREHOLDER_SUPERMAJORITY,
+    validate_charter_capital_auth, verify_and_consume_auth, ActionHasher, AuctionBook,
+    ACTION_AUTHORIZE_FUTURES_UNDERWRITING, ACTION_SET_SHARE_ESCROW, ERR_CHARTER_MISMATCH,
+    ERR_FUTURES_CAP_EXCEEDED, ERR_INVALID_FUTURES_CONFIG, ERR_POLICY_INVALID,
+    MAX_ENCODED_AUCTION_BOOK_BYTES, POLICY_BOARD_RESOLUTION, POLICY_SHAREHOLDER_SUPERMAJORITY,
     POLICY_SUPER_GOVERNANCE,
 };
 use hps_sdk::storage::KeyBuilder;
@@ -66,6 +67,7 @@ hps_entry! {
     "identityRegistry()"                                                        => handle_identity_registry,
     "bankLedger()"                                                              => handle_bank_ledger,
     "shareEscrowAccount()"                                                      => handle_share_escrow_account,
+    "treasuryRecipient()"                                                       => handle_treasury_recipient,
     "authorizeFuturesUnderwriting(address,uint64,address)"                      => handle_authorize_futures_underwriting,
     "underwriteFutures(uint64)"                                                 => handle_underwrite_futures,
     "closeUnderwrittenFutures(uint64)"                                          => handle_close_underwritten_futures,
@@ -77,6 +79,8 @@ hps_entry! {
     "cancelBuyOrder(address,uint64)"                                            => handle_cancel_buy_order,
     "placeSellOrder(address,uint64,uint64)"                                     => handle_place_sell_order,
     "settleShareTransferAuction(address,address)"                               => handle_settle_share_transfer_auction,
+    "settleShareIssuance(address,address)"                                      => handle_settle_share_issuance,
+    "refundFailedAuction(address)"                                              => handle_refund_failed_auction,
     "hasEscrowedAuction(address)"                                               => handle_has_escrowed_auction,
     "escrowedCashOf(address)"                                                   => handle_escrowed_cash_of,
     "disburseAuctionCash(address,address,uint64,bool)"                          => handle_disburse_auction_cash,
@@ -262,6 +266,11 @@ fn handle_bank_ledger(_args: &CalldataReader) -> Result<(), i32> {
 
 fn handle_share_escrow_account(_args: &CalldataReader) -> Result<(), i32> {
     ret::write_address(&storage::get_address(KEY_SHARE_ESCROW_ACCT).unwrap_or([0u8; 20]));
+    Ok(())
+}
+
+fn handle_treasury_recipient(_args: &CalldataReader) -> Result<(), i32> {
+    ret::write_address(&storage::get_address(KEY_INITIALIZER).unwrap_or([0u8; 20]));
     Ok(())
 }
 
@@ -618,14 +627,85 @@ fn handle_place_sell_order(args: &CalldataReader) -> Result<(), i32> {
 }
 
 fn handle_settle_share_transfer_auction(args: &CalldataReader) -> Result<(), i32> {
-    let (_registry, _charter, _caller) = ensure_active_and_valid_caller()?;
+    let (_registry, charter, _caller) = ensure_active_and_valid_caller()?;
     let share_ledger = args.address(0).ok_or(-3)?;
     let auth_obj = args.address(1).ok_or(-3)?;
+
+    validate_charter_capital_auth(&charter, &auth_obj)?;
 
     let settle_cd = CallEncoder::<64>::new(const { selector("settleTransferAuction(address)") })
         .push_address(&auth_obj);
     let out = call::call_raw(&share_ledger, settle_cd.as_slice())?;
     ret::write(out);
+    Ok(())
+}
+
+fn handle_settle_share_issuance(args: &CalldataReader) -> Result<(), i32> {
+    let (_registry, charter, _caller) = ensure_active_and_valid_caller()?;
+    let share_ledger = args.address(0).ok_or(-3)?;
+    let auth_obj = args.address(1).ok_or(-3)?;
+
+    validate_charter_capital_auth(&charter, &auth_obj)?;
+
+    let settle_cd = CallEncoder::<64>::new(const { selector("settleIssuanceAuction(address)") })
+        .push_address(&auth_obj);
+    let out = call::call_raw(&share_ledger, settle_cd.as_slice())?;
+    ret::write(out);
+    Ok(())
+}
+
+fn handle_refund_failed_auction(args: &CalldataReader) -> Result<(), i32> {
+    let (_registry, _charter, _caller) = ensure_active_and_valid_caller()?;
+    let auth_obj = args.address(0).ok_or(-3)?;
+
+    let ek = auc_escrow_key(&auth_obj);
+    let cur_escrow = storage::get_u64(ek.as_slice());
+    if cur_escrow == 0 {
+        ret::write_u64_word(0);
+        return Ok(());
+    }
+
+    let st_cd = CallEncoder::<16>::new(const { selector("status()") });
+    let st = call::call_u64(&auth_obj, st_cd.as_slice())?;
+    // Only refund an expired/failed (`3`) unconsumed auction!
+    if st != 3 {
+        return Err(-62);
+    }
+
+    let bank_ledger = storage::get_address(KEY_BANK_LEDGER).ok_or(-63)?;
+    let escrow_acct = storage::get_address(KEY_SHARE_ESCROW_ACCT).ok_or(-63)?;
+
+    let ord_cd = CallEncoder::<16>::new(const { selector("getOrdersRaw()") });
+    let mut raw_book = [0u8; MAX_ENCODED_AUCTION_BOOK_BYTES];
+    let n = call::call_abi_bytes_into(&auth_obj, ord_cd.as_slice(), &mut raw_book)?;
+    let book = AuctionBook::decode(&raw_book[..n]).ok_or(ERR_POLICY_INVALID)?;
+
+    let mut total_refunded = 0u64;
+    let mut i = 0usize;
+    while i < book.order_count {
+        let ord = book.orders[i];
+        if !ord.is_cancelled() && ord.is_buy() && ord.quantity > 0 {
+            let refund = ord.price.checked_mul(ord.quantity).ok_or(-15)?;
+            if refund > 0 {
+                let xfer_cd = CallEncoder::<128>::new(const {
+                    selector("charterModuleClearTransfer(address,address,uint64)")
+                })
+                .push_address(&escrow_acct)
+                .push_address(&ord.trader)
+                .push_u64(refund);
+                let ok = call::call_bool(&bank_ledger, xfer_cd.as_slice())?;
+                if !ok {
+                    return Err(-16);
+                }
+                total_refunded = total_refunded.saturating_add(refund);
+            }
+        }
+        i += 1;
+    }
+
+    storage::set_u64(ek.as_slice(), cur_escrow.saturating_sub(total_refunded));
+    storage::set_u64(auc_escrow_active_key(&auth_obj).as_slice(), 0);
+    ret::write_u64_word(total_refunded);
     Ok(())
 }
 

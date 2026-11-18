@@ -26,17 +26,18 @@
 use hps_sdk::abi::CalldataReader;
 use hps_sdk::call::{self, CallEncoder};
 use hps_sdk::governance::{
-    require_valid_identity, verify_and_consume_auth, ActionHasher, AuthorizedModuleSpec,
-    FunctionAuthRule, PolicySpec, ShareClassSpec, StageSpec, ACTION_ACTIVATE_CHARTER,
-    ACTION_ADD_DIRECTOR, ACTION_AUTHORIZE_MODULE, ACTION_DEFINE_ROLE, ACTION_GRANT_ROLE,
-    ACTION_REGISTER_SHARE_CLASS, ACTION_REMOVE_DIRECTOR, ACTION_REVOKE_ROLE,
+    require_valid_authorization_hps, require_valid_identity, verify_and_consume_auth, ActionHasher,
+    AuthorizedModuleSpec, FunctionAuthRule, PolicySpec, ShareClassSpec, StageSpec,
+    ACTION_ACTIVATE_CHARTER, ACTION_ADD_DIRECTOR, ACTION_AUTHORIZE_MODULE, ACTION_DEFINE_ROLE,
+    ACTION_GRANT_ROLE, ACTION_REGISTER_SHARE_CLASS, ACTION_REMOVE_DIRECTOR, ACTION_REVOKE_ROLE,
     ACTION_SET_FUNCTION_AUTH, CHARTER_STATE_ACTIVE, CHARTER_STATE_PENDING_RATIFICATION,
     CHARTER_STATE_UNINITIALIZED, ERR_CHARTER_ALREADY_ACTIVE, ERR_CHARTER_NOT_ACTIVE,
-    ERR_DIRECTOR_CONSENT_REQUIRED, ERR_FUNCTION_AUTH_NOT_SET, ERR_POLICY_INVALID,
-    ERR_ROLE_NOT_DEFINED, MAX_AUTHORIZED_MODULES, MAX_DEFINED_ROLES, MAX_ENCODED_POLICY_BYTES,
-    MAX_MEMBERS_PER_STAGE, MAX_SHARE_CLASSES, POLICY_BANK_ORACLE, POLICY_BOARD_RESOLUTION,
-    POLICY_FIRST_SHAREHOLDER_RESOLUTION, POLICY_PRODUCT_MANAGEMENT,
-    POLICY_SHAREHOLDER_SUPERMAJORITY, POLICY_SUPER_GOVERNANCE, ROLE_BANK_ORACLE, ROLE_DIRECTOR,
+    ERR_DIRECTOR_CONSENT_REQUIRED, ERR_FUNCTION_AUTH_NOT_SET, ERR_NO_BIDS_IN_STAGE,
+    ERR_POLICY_INVALID, ERR_ROLE_NOT_DEFINED, MAX_AUTHORIZED_MODULES, MAX_DEFINED_ROLES,
+    MAX_ENCODED_POLICY_BYTES, MAX_MEMBERS_PER_STAGE, MAX_SHARE_CLASSES, POLICY_BANK_ORACLE,
+    POLICY_BOARD_RESOLUTION, POLICY_FIRST_SHAREHOLDER_RESOLUTION, POLICY_PRODUCT_MANAGEMENT,
+    POLICY_SHAREHOLDER_SUPERMAJORITY, POLICY_SHARE_ISSUANCE_AUCTION,
+    POLICY_SHARE_TRANSFER_AUCTION, POLICY_SUPER_GOVERNANCE, ROLE_BANK_ORACLE, ROLE_DIRECTOR,
     ROLE_PRODUCT_MANAGER, ROLE_SHAREHOLDER, ROLE_TREASURY_MANAGER,
 };
 use hps_sdk::keccak::keccak256;
@@ -134,6 +135,7 @@ hps_entry! {
     "convertedCommonTotals(address)"                                            => handle_converted_common_totals,
     "getPolicyRaw(address,bytes32)"                                             => handle_get_policy_raw,
     "hasPolicy(address,bytes32)"                                                => handle_has_policy,
+    "validateCapitalProcessAuth(address)"                                       => handle_validate_capital_process_auth,
     "identityRegistry()"                                                        => handle_identity_registry,
     "hashActivateCharter()"                                                     => handle_hash_activate_charter,
     "hashSetFunctionAuth(address,bytes4,bytes32)"                               => handle_hash_set_function_auth,
@@ -2170,6 +2172,54 @@ fn handle_get_policy_raw(args: &CalldataReader) -> Result<(), i32> {
     let mut buf = [0u8; MAX_ENCODED_POLICY_BYTES];
     let n = resolve_policy_into(&target_hps, &policy_id, &mut buf).ok_or(-62)?;
     ret::write_abi_bytes(&buf[..n]);
+    Ok(())
+}
+
+/// Constitutional validation gate invoked before enacting any Share Transfer (`POLICY_SHARE_TRANSFER_AUCTION`)
+/// or New Share Issuance (`POLICY_SHARE_ISSUANCE_AUCTION`) `Authorization` (`authObj`):
+/// - Rejects with `ERR_CHARTER_NOT_ACTIVE (-91)` if this `CorporateCharter` is not `ACTIVE`.
+/// - Rejects with `ERR_NO_BIDS_IN_STAGE (-97)` if the Bids Stage expired without `>= 1` active bid!
+fn handle_validate_capital_process_auth(args: &CalldataReader) -> Result<(), i32> {
+    if storage::get_u64(KEY_INIT) != 1 || storage::get_u64(KEY_STATE) != CHARTER_STATE_ACTIVE {
+        return Err(ERR_CHARTER_NOT_ACTIVE);
+    }
+    let auth_obj = args.address(0).ok_or(-3)?;
+    let registry = storage::get_address(KEY_REGISTRY).ok_or(-57)?;
+    require_valid_authorization_hps(&registry, &auth_obj)?;
+
+    let chr_cd = CallEncoder::<16>::new(const { selector("charter()") });
+    let raw_chr = call::call_raw(&auth_obj, chr_cd.as_slice())?;
+    if raw_chr.len() < 32 || raw_chr[12..32] != context::self_address() {
+        return Err(-19);
+    }
+
+    let pol_cd = CallEncoder::<16>::new(const { selector("policyId()") });
+    let raw_pol = call::call_raw(&auth_obj, pol_cd.as_slice())?;
+    if raw_pol.len() < 32 {
+        return Err(ERR_POLICY_INVALID);
+    }
+    let mut pid = [0u8; 32];
+    pid.copy_from_slice(&raw_pol[0..32]);
+    if pid != POLICY_SHARE_TRANSFER_AUCTION && pid != POLICY_SHARE_ISSUANCE_AUCTION {
+        return Err(ERR_POLICY_INVALID);
+    }
+
+    let failed_cd = CallEncoder::<16>::new(const { selector("hasFailedBidsStage()") });
+    if matches!(call::call_bool(&auth_obj, failed_cd.as_slice()), Ok(true)) {
+        return Err(ERR_NO_BIDS_IN_STAGE);
+    }
+
+    let bids_cd = CallEncoder::<16>::new(const { selector("activeStep1BidCount()") });
+    if call::call_u64(&auth_obj, bids_cd.as_slice()).unwrap_or(0) == 0 {
+        return Err(ERR_NO_BIDS_IN_STAGE);
+    }
+
+    let ready_cd = CallEncoder::<16>::new(const { selector("isReadyToConsume()") });
+    if !matches!(call::call_bool(&auth_obj, ready_cd.as_slice()), Ok(true)) {
+        return Err(-62);
+    }
+
+    ret::write_bool(true);
     Ok(())
 }
 

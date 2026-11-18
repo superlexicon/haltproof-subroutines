@@ -38,6 +38,7 @@ hps_entry! {
     "initConstitutionAuth(address,address,address,address,bytes32,bytes32)"           => handle_init_constitution_auth,
     "initOracleAuth(address,address,address,address,bytes32,uint64)"                  => handle_init_oracle_auth,
     "initTransferAuction(address,address,address,address)"                            => handle_init_transfer_auction,
+    "initShareIssuance(address,address,address,address,uint64,uint64)"                => handle_init_share_issuance,
     "approveAuth(address)"                                                            => handle_approve_auth,
     "approveAndFinalizeAuth(address)"                                                 => handle_approve_and_finalize_auth,
     "finalizeAuth(address)"                                                           => handle_finalize_auth,
@@ -49,6 +50,8 @@ hps_entry! {
     "cancelBuyOrderViaShareCapital(address,address,uint64)"                           => handle_cancel_buy_order_via_sc,
     "placeSellOrderViaShareCapital(address,address,uint64,uint64)"                    => handle_place_sell_order_via_sc,
     "settleAuctionViaShareCapital(address,address,address)"                           => handle_settle_auction_via_sc,
+    "settleIssuanceViaShareCapital(address,address,address)"                          => handle_settle_issuance_via_sc,
+    "refundFailedAuctionViaShareCapital(address,address)"                             => handle_refund_failed_auction_via_sc,
     "transferBankBalance(address,address,uint64)"                                     => handle_transfer_bank_balance,
     "setShareEscrowAccount(address,address,address,address)"                          => handle_set_share_escrow_account,
     "setOperatingAccount(address,address,address,address)"                            => handle_set_operating_account,
@@ -470,6 +473,59 @@ fn handle_settle_auction_via_sc(args: &CalldataReader) -> Result<(), i32> {
     .push_address(&auth_obj);
     let out = call::call_raw(&share_capital, sub_cd.as_slice())?;
     ret::write(out);
+    Ok(())
+}
+
+fn handle_init_share_issuance(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let auth_obj = args.address(0).ok_or(-3)?;
+    let registry = args.address(1).ok_or(-3)?;
+    let charter = args.address(2).ok_or(-3)?;
+    let share_ledger = args.address(3).ok_or(-3)?;
+    let max_new_shares = args.u64(4).ok_or(-3)?;
+    let min_issue_price = args.u64(5).ok_or(-3)?;
+
+    let sub_cd = CallEncoder::<192>::new(const {
+        selector("initializeShareIssuance(address,address,address,uint64,uint64)")
+    })
+    .push_address(&registry)
+    .push_address(&charter)
+    .push_address(&share_ledger)
+    .push_u64(max_new_shares)
+    .push_u64(min_issue_price);
+    let ok = call::call_bool(&auth_obj, sub_cd.as_slice())?;
+    if !ok {
+        return Err(-24);
+    }
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_settle_issuance_via_sc(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let share_capital = args.address(0).ok_or(-3)?;
+    let share_ledger = args.address(1).ok_or(-3)?;
+    let auth_obj = args.address(2).ok_or(-3)?;
+
+    let sub_cd =
+        CallEncoder::<96>::new(const { selector("settleShareIssuance(address,address)") })
+            .push_address(&share_ledger)
+            .push_address(&auth_obj);
+    let out = call::call_raw(&share_capital, sub_cd.as_slice())?;
+    ret::write(out);
+    Ok(())
+}
+
+fn handle_refund_failed_auction_via_sc(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let share_capital = args.address(0).ok_or(-3)?;
+    let auth_obj = args.address(1).ok_or(-3)?;
+
+    let sub_cd =
+        CallEncoder::<64>::new(const { selector("refundFailedAuction(address)") })
+            .push_address(&auth_obj);
+    let refunded = call::call_u64(&share_capital, sub_cd.as_slice())?;
+    ret::write_u64_word(refunded);
     Ok(())
 }
 

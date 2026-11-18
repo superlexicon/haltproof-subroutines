@@ -24,11 +24,12 @@ use hps_sdk::abi::CalldataReader;
 use hps_sdk::call::{self, CallEncoder};
 use hps_sdk::governance::{
     is_authorized_charter_module, oracle_policy_id, require_valid_identity,
-    verify_and_consume_auction_auth, verify_and_consume_auth, ActionHasher, AuctionOrder,
-    ACTION_APPROVE, ACTION_CANCEL, ACTION_ISSUE, ACTION_SET_ATTACHED_DEX, ACTION_SUPER,
-    ACTION_TRANSFER, CAP_EQUITY_SETTLEMENT, CAP_MERCHANT_PAYMENT, ERR_CONSTITUTION_MISMATCH,
-    ERR_DEX_NOT_ATTACHED, ERR_NO_CROSSING_ORDERS, MAX_AUCTION_ORDERS, POLICY_HOLDER_SELF,
-    POLICY_SHARE_TRANSFER_AUCTION,
+    validate_charter_capital_auth, verify_and_consume_auction_auth, verify_and_consume_auth,
+    verify_and_consume_issuance_auction_auth, ActionHasher, AuctionOrder, ACTION_APPROVE,
+    ACTION_CANCEL, ACTION_ISSUE, ACTION_SET_ATTACHED_DEX, ACTION_SUPER, ACTION_TRANSFER,
+    CAP_EQUITY_SETTLEMENT, CAP_MERCHANT_PAYMENT, ERR_CONSTITUTION_MISMATCH, ERR_DEX_NOT_ATTACHED,
+    ERR_NO_BIDS_IN_STAGE, ERR_NO_CROSSING_ORDERS, MAX_AUCTION_ORDERS, POLICY_HOLDER_SELF,
+    POLICY_SHARE_ISSUANCE_AUCTION, POLICY_SHARE_TRANSFER_AUCTION,
 };
 use hps_sdk::storage::KeyBuilder;
 use hps_sdk::{context, event_topic, events, hps_entry, ret, selector, storage};
@@ -79,6 +80,7 @@ hps_entry! {
     "setAttachedDex(address,address)"                       => handle_set_attached_dex,
     "dexTransfer(address,address,uint64)"                   => handle_dex_transfer,
     "settleTransferAuction(address)"                        => handle_settle_transfer_auction,
+    "settleIssuanceAuction(address)"                        => handle_settle_issuance_auction,
     "approve(address,uint64,address)"                       => handle_approve,
     "transferFrom(address,address,uint64)"                  => handle_transfer_from,
     "setPermission(bytes32,address,bytes32,address)"        => handle_set_permission,
@@ -452,6 +454,16 @@ fn handle_issue(args: &CalldataReader) -> Result<(), i32> {
     let to_identity = args.address(0).ok_or(-3)?;
     let amount = args.u64(1).ok_or(-3)?;
     let auth_obj = args.address(2).ok_or(-3)?;
+    if let Some(rule) = load_permission(&ACTION_ISSUE) {
+        if rule.policy_id == POLICY_SHARE_ISSUANCE_AUCTION {
+            // When `ACTION_ISSUE` is governed by `POLICY_SHARE_ISSUANCE_AUCTION`, share issuance
+            // MUST pass through the Bids-Gated Share Issuance process (`settleIssuanceAuction`)!
+            let (_px, issued_qty, _dem, _proc) =
+                execute_issuance_auction_settlement(&registry, &caller, &auth_obj)?;
+            ret::write_u64_word(issued_qty);
+            return Ok(());
+        }
+    }
     if amount == 0 {
         return Err(-14);
     }
@@ -870,6 +882,9 @@ fn execute_transfer_auction_settlement(
     if pinned_con != [0u8; 20] && rule.constitution != pinned_con {
         return Err(ERR_CONSTITUTION_MISMATCH);
     }
+
+    // Constitutional CorporateCharter gate: rejects with `ERR_NO_BIDS_IN_STAGE (-97)` if Stage 0 had 0 bids!
+    validate_charter_capital_auth(&rule.constitution, auth_obj)?;
 
     let book = verify_and_consume_auction_auth(
         registry,
@@ -1381,6 +1396,312 @@ fn execute_transfer_auction_settlement(
         crossing_buy_qty,
         crossing_sell_qty,
     ))
+}
+
+fn handle_settle_issuance_auction(args: &CalldataReader) -> Result<(), i32> {
+    let (registry, caller) = ensure_initialized_and_valid_caller()?;
+    let auth_obj = args.address(0).ok_or(-3)?;
+    let (clearing_price, issued_qty, total_demand, gross_proceeds) =
+        execute_issuance_auction_settlement(&registry, &caller, &auth_obj)?;
+    let mut out = [0u8; 128];
+    out[24..32].copy_from_slice(&clearing_price.to_be_bytes());
+    out[56..64].copy_from_slice(&issued_qty.to_be_bytes());
+    out[88..96].copy_from_slice(&total_demand.to_be_bytes());
+    out[120..128].copy_from_slice(&gross_proceeds.to_be_bytes());
+    ret::write(&out);
+    Ok(())
+}
+
+/// Settle a finalized Bids-Gated New Share Issuance `Authorization` (`POLICY_SHARE_ISSUANCE_AUCTION`):
+/// 1. Validates via `CorporateCharter.validateCapitalProcessAuth(authObj)` that Stage 0 received `>= 1`
+///    active bid before its deadline expired (`ERR_NO_BIDS_IN_STAGE = -97` otherwise).
+/// 2. Consumes `authObj` via `verify_and_consume_issuance_auction_auth` -> `(book, max_new_shares, min_issue_price)`.
+/// 3. Computes the single clearing issue price `P* >= min_issue_price` maximizing `issued_qty = min(D(P), max_new_shares)`
+///    (and maximizing gross raised proceeds `P * issued_qty` on ties).
+/// 4. Allocates newly issued shares pro-rata by bid quantity if oversubscribed, mints them via `internal_credit`,
+///    sweeps `clearing_price * issued_qty` into corporate treasury (`treasuryRecipient()`), and refunds excess escrow!
+fn execute_issuance_auction_settlement(
+    registry: &[u8; 20],
+    caller: &[u8; 20],
+    auth_obj: &[u8; 20],
+) -> Result<(u64, u64, u64, u64), i32> {
+    let pinned_con = storage::get_address(KEY_CONSTITUTION).unwrap_or([0u8; 20]);
+    if pinned_con == [0u8; 20] {
+        return Err(-12);
+    }
+    if let Some(rule) = load_permission(&ACTION_ISSUE) {
+        if rule.constitution != [0u8; 20] && rule.constitution != pinned_con {
+            return Err(ERR_CONSTITUTION_MISMATCH);
+        }
+    }
+
+    // Constitutional CorporateCharter gate: rejects with `ERR_NO_BIDS_IN_STAGE (-97)` if Stage 0 had 0 bids!
+    validate_charter_capital_auth(&pinned_con, auth_obj)?;
+
+    let (book, max_new_shares, min_issue_price) = verify_and_consume_issuance_auction_auth(
+        registry,
+        auth_obj,
+        &pinned_con,
+        &POLICY_SHARE_ISSUANCE_AUCTION,
+        caller,
+    )?;
+
+    if book.active_step1_bid_count() == 0 || max_new_shares == 0 || min_issue_price == 0 {
+        return Err(ERR_NO_BIDS_IN_STAGE);
+    }
+
+    let mut buy_orders = [AuctionOrder::default(); MAX_AUCTION_ORDERS];
+    let mut buy_count = 0usize;
+    let mut idx = 0usize;
+    while idx < book.order_count {
+        let ord = book.orders[idx];
+        if !ord.is_cancelled() && ord.is_buy() && ord.price >= min_issue_price && ord.quantity > 0 {
+            require_valid_identity(registry, &ord.trader)?;
+            buy_orders[buy_count] = ord;
+            buy_count += 1;
+        }
+        idx += 1;
+    }
+    if buy_count == 0 {
+        return Err(ERR_NO_BIDS_IN_STAGE);
+    }
+
+    // Unique candidate prices ascending
+    let mut candidates = [0u64; MAX_AUCTION_ORDERS];
+    let mut cand_count = 0usize;
+    let mut i = 0usize;
+    while i < buy_count {
+        let p = buy_orders[i].price;
+        let mut exists = false;
+        let mut k = 0usize;
+        while k < cand_count {
+            if candidates[k] == p {
+                exists = true;
+                break;
+            }
+            k += 1;
+        }
+        if !exists {
+            candidates[cand_count] = p;
+            cand_count += 1;
+        }
+        i += 1;
+    }
+    i = 1;
+    while i < cand_count {
+        let key = candidates[i];
+        let mut j = i;
+        while j > 0 && candidates[j - 1] > key {
+            candidates[j] = candidates[j - 1];
+            j -= 1;
+        }
+        candidates[j] = key;
+        i += 1;
+    }
+
+    let mut best_vol = 0u64;
+    let mut best_proceeds = 0u128;
+    let mut clearing_price = min_issue_price;
+    let mut crossing_demand = 0u64;
+    i = 0;
+    while i < cand_count {
+        let p = candidates[i];
+        let mut d = 0u64;
+        let mut b = 0usize;
+        while b < buy_count {
+            if buy_orders[b].price >= p {
+                d = d.saturating_add(buy_orders[b].quantity);
+            }
+            b += 1;
+        }
+        let vol = if d < max_new_shares { d } else { max_new_shares };
+        let proceeds = (p as u128) * (vol as u128);
+        if vol > best_vol || (vol == best_vol && proceeds >= best_proceeds) {
+            best_vol = vol;
+            best_proceeds = proceeds;
+            clearing_price = p;
+            crossing_demand = d;
+        }
+        i += 1;
+    }
+    if best_vol == 0 {
+        return Err(ERR_NO_CROSSING_ORDERS);
+    }
+
+    let issued_qty = best_vol;
+    let mut buy_fills = [0u64; MAX_AUCTION_ORDERS];
+    if crossing_demand > issued_qty {
+        let denom = crossing_demand as u128;
+        let mut allocated = 0u64;
+        let mut remainders = [0u128; MAX_AUCTION_ORDERS];
+        let mut b = 0usize;
+        while b < buy_count {
+            if buy_orders[b].price >= clearing_price {
+                let num = (issued_qty as u128) * (buy_orders[b].quantity as u128);
+                let share = (num / denom) as u64;
+                buy_fills[b] = share;
+                remainders[b] = num % denom;
+                allocated = allocated.saturating_add(share);
+            }
+            b += 1;
+        }
+        let mut rem = issued_qty.saturating_sub(allocated);
+        while rem > 0 {
+            let mut best_b = usize::MAX;
+            let mut best_r = 0u128;
+            b = 0;
+            while b < buy_count {
+                if buy_orders[b].price >= clearing_price
+                    && buy_fills[b] < buy_orders[b].quantity
+                    && (best_b == usize::MAX || remainders[b] > best_r)
+                {
+                    best_b = b;
+                    best_r = remainders[b];
+                }
+                b += 1;
+            }
+            if best_b == usize::MAX {
+                break;
+            }
+            buy_fills[best_b] += 1;
+            remainders[best_b] = 0;
+            rem -= 1;
+        }
+    } else {
+        let mut b = 0usize;
+        while b < buy_count {
+            if buy_orders[b].price >= clearing_price {
+                buy_fills[b] = buy_orders[b].quantity;
+            }
+            b += 1;
+        }
+    }
+
+    // Mint newly issued shares to winning subscribers
+    let mut filled_buyer_count = 0u64;
+    let mut cur_supply = storage::get_u64(KEY_SUPPLY);
+    let mut b = 0usize;
+    while b < buy_count {
+        let fill = buy_fills[b];
+        if fill > 0 {
+            cur_supply = cur_supply.checked_add(fill).ok_or(-15)?;
+            let new_bal = internal_credit(&buy_orders[b].trader, fill)?;
+            storage::set_u64(KEY_SUPPLY, cur_supply);
+            filled_buyer_count += 1;
+
+            let mut iss_ev = [0u8; 24];
+            iss_ev[0..8].copy_from_slice(&fill.to_be_bytes());
+            iss_ev[8..16].copy_from_slice(&cur_supply.to_be_bytes());
+            iss_ev[16..24].copy_from_slice(&new_bal.to_be_bytes());
+            events::emit(
+                &[
+                    ISSUED_TOPIC,
+                    addr_topic(&buy_orders[b].trader),
+                    addr_topic(auth_obj),
+                ],
+                &iss_ev,
+            );
+            events::emit(
+                &[
+                    TRANSFER_TOPIC,
+                    addr_topic(&[0u8; 20]),
+                    addr_topic(&buy_orders[b].trader),
+                ],
+                &fill.to_be_bytes(),
+            );
+
+            let mut fill_ev = [0u8; 24];
+            fill_ev[0..8].copy_from_slice(&clearing_price.to_be_bytes());
+            fill_ev[8..16].copy_from_slice(&buy_orders[b].quantity.to_be_bytes());
+            fill_ev[16..24].copy_from_slice(&fill.to_be_bytes());
+            events::emit(
+                &[
+                    AUCTION_BUYER_FILLED,
+                    addr_topic(&buy_orders[b].trader),
+                    addr_topic(auth_obj),
+                ],
+                &fill_ev,
+            );
+        }
+        b += 1;
+    }
+
+    let gross_proceeds = clearing_price.checked_mul(issued_qty).ok_or(-15)?;
+
+    // Disburse subscription proceeds to Corporate Treasury (`treasuryRecipient()`) & refund unspent escrow!
+    let escrow_hps = if is_authorized_charter_module(&pinned_con, caller, &CAP_EQUITY_SETTLEMENT) {
+        *caller
+    } else {
+        pinned_con
+    };
+    let q_cd =
+        CallEncoder::<64>::new(const { selector("hasEscrowedAuction(address)") }).push_address(auth_obj);
+    if let Ok(true) = call::call_bool(&escrow_hps, q_cd.as_slice()) {
+        if gross_proceeds > 0 {
+            let tr_cd = CallEncoder::<16>::new(const { selector("treasuryRecipient()") });
+            let treasury_acct = call::call_raw(&escrow_hps, tr_cd.as_slice())
+                .ok()
+                .filter(|r| r.len() >= 32)
+                .map(|r| {
+                    let mut a = [0u8; 20];
+                    a.copy_from_slice(&r[12..32]);
+                    a
+                })
+                .unwrap_or([0u8; 20]);
+            if treasury_acct != [0u8; 20] {
+                let pay_cd = CallEncoder::<160>::new(const {
+                    selector("disburseAuctionCash(address,address,uint64,bool)")
+                })
+                .push_address(auth_obj)
+                .push_address(&treasury_acct)
+                .push_u64(gross_proceeds)
+                .push_bool(true);
+                let ok = call::call_bool(&escrow_hps, pay_cd.as_slice())?;
+                if !ok {
+                    return Err(-16);
+                }
+            }
+        }
+        b = 0;
+        while b < buy_count {
+            let escrowed = buy_orders[b]
+                .price
+                .checked_mul(buy_orders[b].quantity)
+                .ok_or(-15)?;
+            let spent = clearing_price.checked_mul(buy_fills[b]).ok_or(-15)?;
+            let refund = escrowed.saturating_sub(spent);
+            if refund > 0 {
+                let ref_cd = CallEncoder::<160>::new(const {
+                    selector("disburseAuctionCash(address,address,uint64,bool)")
+                })
+                .push_address(auth_obj)
+                .push_address(&buy_orders[b].trader)
+                .push_u64(refund)
+                .push_bool(false);
+                let ok = call::call_bool(&escrow_hps, ref_cd.as_slice())?;
+                if !ok {
+                    return Err(-16);
+                }
+            }
+            b += 1;
+        }
+    }
+
+    storage::set_u64(KEY_LAST_AUC_PRICE, clearing_price);
+    storage::set_u64(KEY_LAST_AUC_QTY, issued_qty);
+    storage::set_u64(KEY_LAST_AUC_BUY_DEMAND, crossing_demand);
+    storage::set_u64(KEY_LAST_AUC_SELL_SUPPLY, max_new_shares);
+
+    let mut summary = [0u8; 48];
+    summary[0..8].copy_from_slice(&clearing_price.to_be_bytes());
+    summary[8..16].copy_from_slice(&issued_qty.to_be_bytes());
+    summary[16..24].copy_from_slice(&crossing_demand.to_be_bytes());
+    summary[24..32].copy_from_slice(&max_new_shares.to_be_bytes());
+    summary[32..40].copy_from_slice(&filled_buyer_count.to_be_bytes());
+    summary[40..48].copy_from_slice(&0u64.to_be_bytes());
+    events::emit(&[AUCTION_SETTLED_TOPIC, addr_topic(auth_obj)], &summary);
+
+    Ok((clearing_price, issued_qty, crossing_demand, gross_proceeds))
 }
 
 /// Authorize a settlement contract `spender` (such as `AssetPair_OTC`) to debit up to `amount`

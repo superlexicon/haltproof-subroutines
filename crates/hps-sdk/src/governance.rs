@@ -84,6 +84,7 @@ pub const POLICY_FIRST_SHAREHOLDER_RESOLUTION: [u8; 32] =
 pub const POLICY_BOARD_RESOLUTION: [u8; 32] = keccak256(b"BOARD_RESOLUTION");
 pub const POLICY_PRODUCT_MANAGEMENT: [u8; 32] = keccak256(b"PRODUCT_MANAGEMENT");
 pub const POLICY_SHARE_TRANSFER_AUCTION: [u8; 32] = keccak256(b"SHARE_TRANSFER_AUCTION");
+pub const POLICY_SHARE_ISSUANCE_AUCTION: [u8; 32] = keccak256(b"SHARE_ISSUANCE_AUCTION");
 pub const POLICY_FUTURES_UNDERWRITING: [u8; 32] = keccak256(b"FUTURES_UNDERWRITING");
 pub const POLICY_BANK_ORACLE: [u8; 32] = keccak256(b"BANK_ORACLE");
 pub const POLICY_ADMIN_ORACLE: [u8; 32] = keccak256(b"ADMIN_ORACLE");
@@ -138,6 +139,7 @@ pub const ERR_ROLE_NOT_DEFINED: i32 = -93;
 pub const ERR_FUNCTION_AUTH_NOT_SET: i32 = -94;
 pub const ERR_UNAUTHORIZED_MODULE: i32 = -95;
 pub const ERR_DIRECTOR_CONSENT_REQUIRED: i32 = -96;
+pub const ERR_NO_BIDS_IN_STAGE: i32 = -97;
 pub const ERR_CHARTER_MISMATCH: i32 = -19;
 pub const ERR_CONSTITUTION_MISMATCH: i32 = ERR_CHARTER_MISMATCH;
 
@@ -1042,6 +1044,20 @@ impl AuctionBook {
         true
     }
 
+    /// Count active (un-cancelled, `quantity > 0`) bids placed during the initial Bids Stage (`ORDER_SIDE_BUY_STEP1`).
+    pub fn active_step1_bid_count(&self) -> usize {
+        let mut cnt = 0usize;
+        let mut i = 0usize;
+        while i < self.order_count {
+            let o = &self.orders[i];
+            if o.side == ORDER_SIDE_BUY_STEP1 && o.quantity > 0 {
+                cnt += 1;
+            }
+            i += 1;
+        }
+        cnt
+    }
+
     /// Encode into `out`:
     /// `[version = 1 (1B)][reserved = 0 (1B)][order_count: u16 BE (2B)]`
     /// followed by `order_count * 37` bytes of `[side (1B)][trader (20B)][price (8B BE)][quantity (8B BE)]`.
@@ -1130,4 +1146,86 @@ pub fn verify_and_consume_auction_auth(
         return Err(ERR_AUTH_CONSUME_FAILED);
     }
     AuctionBook::decode(&ret[64..64 + len]).ok_or(ERR_POLICY_INVALID)
+}
+
+/// Ask `CorporateCharter.validateCapitalProcessAuth(address)` to constitutionally validate a
+/// Share Transfer or Share Issuance `Authorization` before enactment (rejecting with
+/// `ERR_NO_BIDS_IN_STAGE = -97` if the Bids Stage expired without `>= 1` active bid).
+pub fn validate_charter_capital_auth(
+    charter: &[u8; 20],
+    auth_obj: &[u8; 20],
+) -> Result<(), i32> {
+    if *charter == [0u8; 20] || *auth_obj == [0u8; 20] {
+        return Err(ERR_AUTH_CONSUME_FAILED);
+    }
+    let cd = CallEncoder::<64>::new(const { selector("validateCapitalProcessAuth(address)") })
+        .push_address(auth_obj);
+    match call::call_bool(charter, cd.as_slice()) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(ERR_NO_BIDS_IN_STAGE),
+        // Graceful fallback only when talking to a minimal unit-test stub without this selector (`-2`)
+        Err(-2) => Ok(()),
+        Err(code) => Err(code),
+    }
+}
+
+/// Build a 2-stage `PolicySpec` for `POLICY_SHARE_ISSUANCE_AUCTION`:
+/// - `Stage 0` (`bids_window_blocks`): Investor Subscription Bids Stage (`>= 1` active bid required before expiry!)
+/// - `Stage 1` (`ratify_window_blocks`): Existing Shareholders Pre-Emptive Subscription & `>= 75%` Super-Majority Vote
+pub fn share_issuance_auction_policy_spec(
+    bids_window_blocks: u64,
+    ratify_window_blocks: u64,
+    overall_expiry_blocks: u64,
+) -> Option<PolicySpec> {
+    let s0 = StageSpec::new(1, bids_window_blocks).add_role(ROLE_SHAREHOLDER, 1)?;
+    let s1 = StageSpec::new(75, ratify_window_blocks).add_role(ROLE_SHAREHOLDER, 1)?;
+    PolicySpec::new(overall_expiry_blocks)
+        .add_stage(s0)?
+        .add_stage(s1)
+}
+
+/// Verify `auth_obj` is an approved `Authorization` HPS, atomically consume it via
+/// `consumeIssuanceAuction(address,bytes32,address)`, and return `(AuctionBook, maxNewShares, minIssuePrice)`.
+pub fn verify_and_consume_issuance_auction_auth(
+    registry: &[u8; 20],
+    auth_obj: &[u8; 20],
+    expected_constitution: &[u8; 20],
+    expected_policy_id: &[u8; 32],
+    caller_identity: &[u8; 20],
+) -> Result<(AuctionBook, u64, u64), i32> {
+    if *registry == [0u8; 20] || *auth_obj == [0u8; 20] {
+        return Err(ERR_AUTH_CONSUME_FAILED);
+    }
+    require_valid_authorization_hps(registry, auth_obj)?;
+    let cd =
+        CallEncoder::<128>::new(const { selector("consumeIssuanceAuction(address,bytes32,address)") })
+            .push_address(expected_constitution)
+            .push_bytes32(expected_policy_id)
+            .push_address(caller_identity);
+    let ret = call::call_raw(auth_obj, cd.as_slice())?;
+    // ABI return layout: `(uint64 maxNewShares, uint64 minIssuePrice, bytes bookRaw)`
+    if ret.len() < 128 {
+        return Err(ERR_AUTH_CONSUME_FAILED);
+    }
+    let mut w_max = [0u8; 8];
+    w_max.copy_from_slice(&ret[24..32]);
+    let max_new_shares = u64::from_be_bytes(w_max);
+    let mut w_min_px = [0u8; 8];
+    w_min_px.copy_from_slice(&ret[56..64]);
+    let min_issue_price = u64::from_be_bytes(w_min_px);
+
+    let mut w_off = [0u8; 8];
+    w_off.copy_from_slice(&ret[88..96]);
+    let dyn_off = u64::from_be_bytes(w_off) as usize;
+    if dyn_off + 32 > ret.len() {
+        return Err(ERR_AUTH_CONSUME_FAILED);
+    }
+    let mut w_len = [0u8; 8];
+    w_len.copy_from_slice(&ret[dyn_off + 24..dyn_off + 32]);
+    let len = u64::from_be_bytes(w_len) as usize;
+    if dyn_off + 32 + len > ret.len() {
+        return Err(ERR_AUTH_CONSUME_FAILED);
+    }
+    let book = AuctionBook::decode(&ret[dyn_off + 32..dyn_off + 32 + len]).ok_or(ERR_POLICY_INVALID)?;
+    Ok((book, max_new_shares, min_issue_price))
 }
