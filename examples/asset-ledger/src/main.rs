@@ -23,13 +23,16 @@
 use hps_sdk::abi::CalldataReader;
 use hps_sdk::call::{self, CallEncoder};
 use hps_sdk::governance::{
-    compute_sha_doc_hash, is_authorized_charter_module, oracle_policy_id, require_valid_identity,
-    validate_charter_capital_auth, verify_and_consume_auction_auth, verify_and_consume_auth,
+    compute_sha_doc_hash, is_authorized_charter_module, oracle_policy_id,
+    query_charter_equity_module, require_valid_identity, validate_charter_capital_auth,
+    verify_and_consume_auction_auth, verify_and_consume_auth,
     verify_and_consume_issuance_auction_auth, ActionHasher, AuctionOrder, ACTION_APPROVE,
     ACTION_CANCEL, ACTION_ISSUE, ACTION_SET_ATTACHED_DEX, ACTION_SUPER, ACTION_TRANSFER,
-    CAP_EQUITY_SETTLEMENT, CAP_MERCHANT_PAYMENT, ERR_CONSTITUTION_MISMATCH, ERR_DEX_NOT_ATTACHED,
-    ERR_NO_BIDS_IN_STAGE, ERR_NO_CROSSING_ORDERS, MAX_AUCTION_ORDERS, POLICY_HOLDER_SELF,
-    POLICY_SHARE_ISSUANCE_AUCTION, POLICY_SHARE_TRANSFER_AUCTION,
+    CAP_EQUITY_SETTLEMENT, CAP_MERCHANT_PAYMENT, ERR_CONSTITUTION_MISMATCH,
+    ERR_DEX_FORBIDDEN_ON_SHARES, ERR_DEX_NOT_ATTACHED, ERR_FRACTIONAL_SHARE_WIPEOUT,
+    ERR_NO_BIDS_IN_STAGE, ERR_NO_CROSSING_ORDERS, ERR_UNAUTHORIZED_MODULE, ERR_WRONG_AUCTION_STEP,
+    MAX_AUCTION_ORDERS, POLICY_HOLDER_SELF, POLICY_SHARE_ISSUANCE_AUCTION,
+    POLICY_SHARE_TRANSFER_AUCTION,
 };
 use hps_sdk::storage::KeyBuilder;
 use hps_sdk::{context, event_topic, events, hps_entry, ret, selector, storage};
@@ -56,6 +59,7 @@ const SHARE_REVERSE_SPLIT_TOPIC: [u8; 32] =
     event_topic("ShareReverseSplitApplied(uint64,uint64,uint64)");
 
 const KEY_INIT: &[u8] = b"meta:init";
+const KEY_CREATOR: &[u8] = b"meta:creator";
 const KEY_REGISTRY: &[u8] = b"meta:registry";
 const KEY_CONSTITUTION: &[u8] = b"meta:constitution";
 const KEY_ATTACHED_DEX: &[u8] = b"meta:dex";
@@ -449,6 +453,7 @@ fn handle_initialize(args: &CalldataReader) -> Result<(), i32> {
     }
 
     storage::set_address(KEY_REGISTRY, &registry);
+    storage::set_address(KEY_CREATOR, &caller);
     storage::set_address(KEY_CONSTITUTION, &pinned_constitution);
     storage::set(KEY_SYMBOL, symbol);
     storage::set_u64(KEY_DECIMALS, decimals);
@@ -874,7 +879,13 @@ fn handle_charter_module_reverse_split(args: &CalldataReader) -> Result<(), i32>
     while i < ever_cnt {
         if let Some(h) = storage::get_address(holder_index_key(i).as_slice()) {
             let bal = storage::get_u64(balance_key(&h).as_slice());
-            post_supply = post_supply.saturating_add(bal / divisor);
+            if bal > 0 {
+                // Prevent minority squeeze-out or uncompensated fractional-share confiscation!
+                if bal < divisor || bal % divisor != 0 {
+                    return Err(ERR_FRACTIONAL_SHARE_WIPEOUT);
+                }
+                post_supply = post_supply.saturating_add(bal / divisor);
+            }
         }
         i += 1;
     }
@@ -920,12 +931,27 @@ fn handle_set_attached_dex(args: &CalldataReader) -> Result<(), i32> {
     let (registry, caller) = ensure_initialized_and_valid_caller()?;
     let dex_hps = args.address(0).ok_or(-3)?;
     let auth_obj = args.address(1).ok_or(-3)?;
-    if dex_hps == [0u8; 20] {
+    if dex_hps == [0u8; 20] || dex_hps == caller {
         return Err(-14);
     }
 
+    // Restricted corporate share ledgers (`POLICY_SHARE_TRANSFER_AUCTION`) MUST NEVER attach a DEX
+    // (shares can only transfer via the 3-step ROFR call auction)!
+    if let Some(tr_rule) = load_permission(&ACTION_TRANSFER) {
+        if tr_rule.policy_id == POLICY_SHARE_TRANSFER_AUCTION {
+            return Err(ERR_DEX_FORBIDDEN_ON_SHARES);
+        }
+    }
+
     let current_dex = storage::get_address(KEY_ATTACHED_DEX).unwrap_or([0u8; 20]);
-    if !(current_dex == [0u8; 20] && auth_obj == [0u8; 20]) {
+    let creator = storage::get_address(KEY_CREATOR).unwrap_or([0u8; 20]);
+    let pinned_con = storage::get_address(KEY_CONSTITUTION).unwrap_or([0u8; 20]);
+    let can_creator_bootstrap = current_dex == [0u8; 20]
+        && auth_obj == [0u8; 20]
+        && caller == creator
+        && (storage::get_u64(KEY_SUPPLY) == 0 || query_charter_equity_module(&pinned_con) == [0u8; 20]);
+
+    if !can_creator_bootstrap {
         let action_hash = compute_set_attached_dex_hash(&dex_hps);
         require_and_consume_permission(
             &registry,
@@ -1030,6 +1056,13 @@ fn execute_transfer_auction_settlement(
     let pinned_con = storage::get_address(KEY_CONSTITUTION).unwrap_or([0u8; 20]);
     if pinned_con != [0u8; 20] && rule.constitution != pinned_con {
         return Err(ERR_CONSTITUTION_MISMATCH);
+    }
+
+    // Enforce `ShareCapital` escrow broker exclusivity when `CorporateCharter` has an active
+    // `CAP_EQUITY_SETTLEMENT` module (preventing direct `AssetLedger` settlement from bypassing seller cash disbursement)!
+    let eq_mod = query_charter_equity_module(&rule.constitution);
+    if eq_mod != [0u8; 20] && *caller != eq_mod {
+        return Err(ERR_UNAUTHORIZED_MODULE);
     }
 
     // Constitutional CorporateCharter gate: rejects with `ERR_NO_BIDS_IN_STAGE (-97)` if Stage 0 had 0 bids!
@@ -1270,42 +1303,100 @@ fn execute_transfer_auction_settlement(
             sl += 1;
         }
 
-        // 2. Fill crossing buy orders pro-rated to their original buy order quantities.
-        let mut allocated = 0u64;
-        let mut remainders = [0u128; MAX_AUCTION_ORDERS];
+        // 2. Aggregate crossing demand per unique buyer Identity first (eliminating single-buyer
+        //    order-splitting remainder gaming!), then distribute each unique buyer's allotted shares
+        //    across their crossing buy orders (highest bid price first).
+        let mut uniq_buyers = [[0u8; 20]; MAX_AUCTION_ORDERS];
+        let mut uniq_buy_qty = [0u64; MAX_AUCTION_ORDERS];
+        let mut uniq_buy_max_px = [0u64; MAX_AUCTION_ORDERS];
+        let mut uniq_buy_alloc = [0u64; MAX_AUCTION_ORDERS];
+        let mut uniq_buy_cnt = 0usize;
         b = 0;
         while b < buy_count {
             if buy_orders[b].price >= clearing_price {
-                let num = (matched_qty as u128) * (buy_orders[b].quantity as u128);
-                let den = crossing_buy_qty as u128;
-                let share = (num / den) as u64;
-                buy_fills[b] = share;
-                remainders[b] = num % den;
-                allocated = allocated.saturating_add(share);
+                let mut u = 0usize;
+                while u < uniq_buy_cnt {
+                    if uniq_buyers[u] == buy_orders[b].trader {
+                        break;
+                    }
+                    u += 1;
+                }
+                if u == uniq_buy_cnt {
+                    uniq_buyers[u] = buy_orders[b].trader;
+                    uniq_buy_cnt += 1;
+                }
+                uniq_buy_qty[u] = uniq_buy_qty[u].saturating_add(buy_orders[b].quantity);
+                if buy_orders[b].price > uniq_buy_max_px[u] {
+                    uniq_buy_max_px[u] = buy_orders[b].price;
+                }
             }
             b += 1;
         }
+
+        let mut allocated = 0u64;
+        let mut remainders = [0u128; MAX_AUCTION_ORDERS];
+        let mut rem_used = [false; MAX_AUCTION_ORDERS];
+        let den = crossing_buy_qty as u128;
+        let mut u = 0usize;
+        while u < uniq_buy_cnt {
+            let num = (matched_qty as u128) * (uniq_buy_qty[u] as u128);
+            let share = (num / den) as u64;
+            uniq_buy_alloc[u] = share;
+            remainders[u] = num % den;
+            allocated = allocated.saturating_add(share);
+            u += 1;
+        }
         let mut rem_shares = matched_qty.saturating_sub(allocated);
         while rem_shares > 0 {
-            let mut best_b = usize::MAX;
-            let mut best_rem = 0u128;
-            b = 0;
-            while b < buy_count {
-                if buy_orders[b].price >= clearing_price
-                    && buy_fills[b] < buy_orders[b].quantity
-                    && (best_b == usize::MAX || remainders[b] > best_rem)
-                {
-                    best_b = b;
-                    best_rem = remainders[b];
+            let mut best_u = usize::MAX;
+            u = 0;
+            while u < uniq_buy_cnt {
+                if !rem_used[u] && uniq_buy_alloc[u] < uniq_buy_qty[u] {
+                    if best_u == usize::MAX
+                        || remainders[u] > remainders[best_u]
+                        || (remainders[u] == remainders[best_u]
+                            && uniq_buy_max_px[u] > uniq_buy_max_px[best_u])
+                    {
+                        best_u = u;
+                    }
                 }
-                b += 1;
+                u += 1;
             }
-            if best_b == usize::MAX {
+            if best_u == usize::MAX {
                 break;
             }
-            buy_fills[best_b] += 1;
-            remainders[best_b] = 0;
+            uniq_buy_alloc[best_u] += 1;
+            rem_used[best_u] = true;
             rem_shares -= 1;
+        }
+
+        // Distribute each unique buyer's total fill across their crossing buy orders (highest bid first)
+        u = 0;
+        while u < uniq_buy_cnt {
+            let mut rem_u = uniq_buy_alloc[u];
+            while rem_u > 0 {
+                let mut best_b = usize::MAX;
+                b = 0;
+                while b < buy_count {
+                    if buy_orders[b].trader == uniq_buyers[u]
+                        && buy_orders[b].price >= clearing_price
+                        && buy_fills[b] < buy_orders[b].quantity
+                        && (best_b == usize::MAX
+                            || buy_orders[b].price > buy_orders[best_b].price)
+                    {
+                        best_b = b;
+                    }
+                    b += 1;
+                }
+                if best_b == usize::MAX {
+                    break;
+                }
+                let room = buy_orders[best_b].quantity - buy_fills[best_b];
+                let take = if rem_u < room { rem_u } else { room };
+                buy_fills[best_b] += take;
+                rem_u -= take;
+            }
+            u += 1;
         }
     } else if crossing_sell_qty > crossing_buy_qty {
         // Total selling quantity > total buying quantity:
@@ -1318,14 +1409,26 @@ fn execute_transfer_auction_settlement(
             b += 1;
         }
 
-        // 2. Fill crossing sell orders pro-rated to the percentage of existing holding
-        //    (`sell_holdings[sl] == balanceOf(seller)`) of that particular shareholder
-        //    (NOT the sell order quantity!), capped at each seller's offered quantity.
+        // 2. Water-fill pro-rata across UNIQUE sellers weighted ONCE by each shareholder's pre-round
+        //    existing holding (`unique_init_bal[u]`), capped at each unique seller's crossing offered
+        //    quantity (completely eliminating the K-order weight-multiplication exploit!), then
+        //    distribute each seller's allotted fill across their crossing sell orders (lowest ask first).
+        let mut seller_cross_qty = [0u64; MAX_AUCTION_ORDERS];
+        let mut seller_target_fill = [0u64; MAX_AUCTION_ORDERS];
         let mut uncapped = [false; MAX_AUCTION_ORDERS];
         sl = 0;
         while sl < sell_count {
             if sell_orders[sl].price <= clearing_price {
-                uncapped[sl] = true;
+                let mut u = 0usize;
+                while u < unique_seller_count {
+                    if unique_sellers[u] == sell_orders[sl].trader {
+                        seller_cross_qty[u] =
+                            seller_cross_qty[u].saturating_add(sell_orders[sl].quantity);
+                        uncapped[u] = true;
+                        break;
+                    }
+                    u += 1;
+                }
             }
             sl += 1;
         }
@@ -1333,71 +1436,102 @@ fn execute_transfer_auction_settlement(
         let mut rem_to_fill = matched_qty;
         loop {
             let mut weight_sum = 0u128;
-            sl = 0;
-            while sl < sell_count {
-                if uncapped[sl] {
-                    weight_sum += sell_holdings[sl] as u128;
+            let mut u = 0usize;
+            while u < unique_seller_count {
+                if uncapped[u] {
+                    weight_sum += unique_init_bal[u] as u128;
                 }
-                sl += 1;
+                u += 1;
             }
             if weight_sum == 0 || rem_to_fill == 0 {
                 break;
             }
 
             let mut any_capped = false;
-            sl = 0;
-            while sl < sell_count {
-                if uncapped[sl] {
+            u = 0;
+            while u < unique_seller_count {
+                if uncapped[u] {
                     let provisional =
-                        ((rem_to_fill as u128) * (sell_holdings[sl] as u128)) / weight_sum;
-                    if provisional >= (sell_orders[sl].quantity as u128) {
-                        sell_fills[sl] = sell_orders[sl].quantity;
-                        rem_to_fill = rem_to_fill.saturating_sub(sell_orders[sl].quantity);
-                        uncapped[sl] = false;
+                        ((rem_to_fill as u128) * (unique_init_bal[u] as u128)) / weight_sum;
+                    if provisional >= (seller_cross_qty[u] as u128) {
+                        seller_target_fill[u] = seller_cross_qty[u];
+                        rem_to_fill = rem_to_fill.saturating_sub(seller_cross_qty[u]);
+                        uncapped[u] = false;
                         any_capped = true;
                     }
                 }
-                sl += 1;
+                u += 1;
             }
 
             if !any_capped {
                 let mut allocated = 0u64;
                 let mut remainders = [0u128; MAX_AUCTION_ORDERS];
-                sl = 0;
-                while sl < sell_count {
-                    if uncapped[sl] {
-                        let num = (rem_to_fill as u128) * (sell_holdings[sl] as u128);
+                let mut rem_used = [false; MAX_AUCTION_ORDERS];
+                u = 0;
+                while u < unique_seller_count {
+                    if uncapped[u] {
+                        let num = (rem_to_fill as u128) * (unique_init_bal[u] as u128);
                         let share = (num / weight_sum) as u64;
-                        sell_fills[sl] = share;
-                        remainders[sl] = num % weight_sum;
+                        seller_target_fill[u] = share;
+                        remainders[u] = num % weight_sum;
                         allocated = allocated.saturating_add(share);
                     }
-                    sl += 1;
+                    u += 1;
                 }
                 let mut rem_shares = rem_to_fill.saturating_sub(allocated);
                 while rem_shares > 0 {
-                    let mut best_sl = usize::MAX;
+                    let mut best_u = usize::MAX;
                     let mut best_rem = 0u128;
-                    sl = 0;
-                    while sl < sell_count {
-                        if uncapped[sl]
-                            && sell_fills[sl] < sell_orders[sl].quantity
-                            && (best_sl == usize::MAX || remainders[sl] > best_rem)
+                    u = 0;
+                    while u < unique_seller_count {
+                        if uncapped[u]
+                            && !rem_used[u]
+                            && seller_target_fill[u] < seller_cross_qty[u]
+                            && (best_u == usize::MAX || remainders[u] > best_rem)
                         {
-                            best_sl = sl;
-                            best_rem = remainders[sl];
+                            best_u = u;
+                            best_rem = remainders[u];
                         }
-                        sl += 1;
+                        u += 1;
                     }
-                    if best_sl == usize::MAX {
+                    if best_u == usize::MAX {
                         break;
                     }
-                    sell_fills[best_sl] += 1;
-                    remainders[best_sl] = 0;
+                    seller_target_fill[best_u] += 1;
+                    rem_used[best_u] = true;
                     rem_shares -= 1;
                 }
                 break;
             }
+        }
+
+        // Distribute each unique seller's `seller_target_fill[u]` across their crossing sell orders (lowest ask first)
+        let mut u = 0usize;
+        while u < unique_seller_count {
+            let mut rem_u = seller_target_fill[u];
+            while rem_u > 0 {
+                let mut best_sl = usize::MAX;
+                sl = 0;
+                while sl < sell_count {
+                    if sell_orders[sl].trader == unique_sellers[u]
+                        && sell_orders[sl].price <= clearing_price
+                        && sell_fills[sl] < sell_orders[sl].quantity
+                        && (best_sl == usize::MAX
+                            || sell_orders[sl].price < sell_orders[best_sl].price)
+                    {
+                        best_sl = sl;
+                    }
+                    sl += 1;
+                }
+                if best_sl == usize::MAX {
+                    break;
+                }
+                let room = sell_orders[best_sl].quantity - sell_fills[best_sl];
+                let take = if rem_u < room { rem_u } else { room };
+                sell_fills[best_sl] += take;
+                rem_u -= take;
+            }
+            u += 1;
         }
     } else {
         // Exact match (`crossing_buy_qty == crossing_sell_qty`): fill all crossing orders 100%.
@@ -1582,6 +1716,18 @@ fn execute_issuance_auction_settlement(
         if rule.constitution != [0u8; 20] && rule.constitution != pinned_con {
             return Err(ERR_CONSTITUTION_MISMATCH);
         }
+    }
+
+    let eq_mod = query_charter_equity_module(&pinned_con);
+    if eq_mod != [0u8; 20] && *caller != eq_mod {
+        return Err(ERR_UNAUTHORIZED_MODULE);
+    }
+
+    // Multi-step 5-Step Share Issuance MUST run through `ShareCapital.determineIssuanceAllocation`
+    // (preserving 100% ROFR priority & Step 5 SHA claim) and can NEVER be settled inside `AssetLedger`!
+    let ms_cd = CallEncoder::<16>::new(const { selector("isMultiStepIssuance()") });
+    if matches!(call::call_bool(auth_obj, ms_cd.as_slice()), Ok(true)) && eq_mod != [0u8; 20] {
+        return Err(ERR_WRONG_AUCTION_STEP);
     }
 
     // Constitutional CorporateCharter gate: rejects with `ERR_NO_BIDS_IN_STAGE (-97)` if Stage 0 failed!
@@ -4000,5 +4146,215 @@ mod tests {
         assert_eq!(bal_of(bank_ledger, buyer_1), 510_000);
         assert_eq!(bal_of(bank_ledger, sh_2), 300_000);
         assert_eq!(bal_of(bank_ledger, clearing_acct), 0);
+    }
+
+    #[test]
+    fn security_audit_blocks_dex_drain_multi_order_seller_exploit_and_fractional_wipeout() {
+        use hps_sdk::governance::{
+            AuctionBook, AuctionOrder, ORDER_SIDE_BUY_STEP1, ORDER_SIDE_SELL_STEP2,
+            POLICY_SHAREHOLDER_SUPERMAJORITY, POLICY_SUPER_GOVERNANCE,
+        };
+        mock::reset();
+        let reg = [0x10; 20];
+        let con = [0x20; 20];
+        let sc_mod = [0x5C; 20];
+        let fake_dex = [0xDE; 20];
+        let share_led = [0x31; 20];
+        let cash_led = [0x32; 20];
+        let auc_auth = [0x41; 20];
+
+        let alice = [0xA1; 20]; // 1,000 shares (attempts 10x multi-order sell exploit!)
+        let bob = [0xB1; 20];   // 1,000 shares (honest single sell order)
+        let minor = [0xC1; 20]; // 7 shares (protected against fractional reverse-split wipeout!)
+        let buyer = [0xD1; 20];
+        let attacker = [0xE1; 20];
+
+        mock::register_hps(reg, |raw| {
+            let Some((sel, args)) = CalldataReader::parse(raw) else { return -1; };
+            if sel == const { selector("isValidIdentity(address)") }
+                || sel == const { selector("isValidAuthorizationHps(address)") }
+            {
+                ret::write_bool(args.address(0).unwrap() != [0u8; 20]);
+                return 0;
+            }
+            -2
+        });
+        mock::register_hps(con, |raw| {
+            let Some((sel, _args)) = CalldataReader::parse(raw) else { return -1; };
+            if sel == const { selector("state()") } {
+                ret::write_u64_word(2);
+                return 0;
+            }
+            if sel == const { selector("equitySettlementModule()") } {
+                ret::write_address(&[0x5C; 20]);
+                return 0;
+            }
+            if sel == const { selector("isAuthorizedModule(address,bytes32)") } {
+                ret::write_bool(true);
+                return 0;
+            }
+            if sel == const { selector("validateCapitalProcessAuth(address,address,bytes32)") } {
+                ret::write_bool(true);
+                return 0;
+            }
+            -2
+        });
+        mock::register_hps(share_led, dispatch_calldata);
+        mock::register_hps(cash_led, dispatch_calldata);
+        mock::register_hps(auc_auth, |raw| {
+            let Some((sel, _args)) = CalldataReader::parse(raw) else { return -1; };
+            if sel == const { selector("consumeAuction(address,bytes32,address)") } {
+                if storage::get_u64(b"used") == 1 {
+                    return -68;
+                }
+                storage::set_u64(b"used", 1);
+                let mut book = AuctionBook::new();
+                // Buyer bids 1,000 shares @ 50 SGD
+                assert!(book.push(AuctionOrder {
+                    side: ORDER_SIDE_BUY_STEP1,
+                    trader: [0xD1; 20],
+                    price: 50,
+                    quantity: 1_000,
+                }));
+                // Alice splits her 1,000 shares into TEN 1,000-share sell orders (attempting 10x weight!)
+                for _ in 0..10 {
+                    assert!(book.push(AuctionOrder {
+                        side: ORDER_SIDE_SELL_STEP2,
+                        trader: [0xA1; 20],
+                        price: 50,
+                        quantity: 1_000,
+                    }));
+                }
+                // Bob submits ONE 1,000-share sell order
+                assert!(book.push(AuctionOrder {
+                    side: ORDER_SIDE_SELL_STEP2,
+                    trader: [0xB1; 20],
+                    price: 50,
+                    quantity: 1_000,
+                }));
+                let mut enc = [0u8; 1024];
+                let n = book.encode(&mut enc).unwrap();
+                ret::write_abi_bytes(&enc[..n]);
+                return 0;
+            }
+            -2
+        });
+
+        let init_shares = encode_ledger_init(
+            reg,
+            b"AUDIT-SH",
+            0,
+            &[(alice, 1_000), (bob, 1_000), (minor, 7)],
+            &[
+                (ACTION_SUPER, con, POLICY_SUPER_GOVERNANCE),
+                (ACTION_ISSUE, con, POLICY_SHAREHOLDER_SUPERMAJORITY),
+                (ACTION_CANCEL, con, POLICY_SHAREHOLDER_SUPERMAJORITY),
+                (ACTION_TRANSFER, con, POLICY_SHARE_TRANSFER_AUCTION),
+                (ACTION_APPROVE, [0u8; 20], POLICY_HOLDER_SELF),
+            ],
+        );
+        mock::transact_as(alice, share_led, &init_shares).unwrap();
+
+        let init_cash = encode_ledger_init(
+            reg,
+            b"SGD-CASH",
+            0,
+            &[(alice, 500_000)],
+            &[
+                (ACTION_SUPER, con, POLICY_SUPER_GOVERNANCE),
+                (ACTION_ISSUE, con, POLICY_SUPER_GOVERNANCE),
+                (ACTION_CANCEL, con, POLICY_SUPER_GOVERNANCE),
+                (ACTION_TRANSFER, [0u8; 20], POLICY_HOLDER_SELF),
+                (ACTION_APPROVE, [0u8; 20], POLICY_HOLDER_SELF),
+            ],
+        );
+        mock::transact_as(alice, cash_led, &init_cash).unwrap();
+
+        // 1. CRITICAL-01: `setAttachedDex` is completely forbidden on restricted share ledgers (-109),
+        //    and zero-auth `setAttachedDex(..., 0x0)` on non-zero-supply cash ledgers MUST REVERT!
+        assert_eq!(
+            mock::transact_as(
+                alice,
+                share_led,
+                CallEncoder::<96>::new(const { selector("setAttachedDex(address,address)") })
+                    .push_address(&fake_dex)
+                    .push_address(&[0u8; 20])
+                    .as_slice(),
+            ),
+            Err(ERR_DEX_FORBIDDEN_ON_SHARES)
+        );
+        assert!(
+            mock::transact_as(
+                attacker,
+                cash_led,
+                CallEncoder::<96>::new(const { selector("setAttachedDex(address,address)") })
+                    .push_address(&fake_dex)
+                    .push_address(&[0u8; 20])
+                    .as_slice(),
+            )
+            .is_err()
+        );
+        assert!(
+            mock::transact_as(
+                alice,
+                cash_led,
+                CallEncoder::<96>::new(const { selector("setAttachedDex(address,address)") })
+                    .push_address(&fake_dex)
+                    .push_address(&[0u8; 20])
+                    .as_slice(),
+            )
+            .is_err()
+        );
+
+        // 2. CRITICAL-03: Direct `settleTransferAuction` bypassing `ShareCapital` (`sc_mod`) MUST REVERT (-95)!
+        assert_eq!(
+            mock::transact_as(
+                buyer,
+                share_led,
+                CallEncoder::<64>::new(const { selector("settleTransferAuction(address)") })
+                    .push_address(&auc_auth)
+                    .as_slice(),
+            ),
+            Err(ERR_UNAUTHORIZED_MODULE)
+        );
+
+        // 3. HIGH-06: Settling via `sc_mod` neutralizes Alice's 10x multi-order sell exploit -> exact 500 / 500 split!
+        let settle_res = mock::transact_as(
+            sc_mod,
+            share_led,
+            CallEncoder::<64>::new(const { selector("settleTransferAuction(address)") })
+                .push_address(&auc_auth)
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(u64::from_be_bytes(settle_res[24..32].try_into().unwrap()), 50);
+        assert_eq!(u64::from_be_bytes(settle_res[56..64].try_into().unwrap()), 1_000);
+
+        let bal_of = |who: [u8; 20]| -> u64 {
+            let b = mock::transact_as(
+                alice,
+                share_led,
+                CallEncoder::<64>::new(const { selector("balanceOf(address)") })
+                    .push_address(&who)
+                    .as_slice(),
+            )
+            .unwrap();
+            u64::from_be_bytes(b[24..32].try_into().unwrap())
+        };
+        assert_eq!(bal_of(alice), 500);
+        assert_eq!(bal_of(bob), 500);
+        assert_eq!(bal_of(buyer), 1_000);
+
+        // 4. HIGH-07: Reverse split that would wipe out `minor` (`7 < 10`) MUST REVERT with `ERR_FRACTIONAL_SHARE_WIPEOUT (-105)`!
+        assert_eq!(
+            mock::transact_as(
+                sc_mod,
+                share_led,
+                CallEncoder::<64>::new(const { selector("charterModuleReverseSplit(uint64)") })
+                    .push_u64(10)
+                    .as_slice(),
+            ),
+            Err(ERR_FRACTIONAL_SHARE_WIPEOUT)
+        );
     }
 }

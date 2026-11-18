@@ -19,17 +19,19 @@ use hps_sdk::abi::CalldataReader;
 use hps_sdk::call::{self, CallEncoder};
 use hps_sdk::governance::{
     compute_sha_doc_hash, compute_ssa_doc_hash, is_authorized_charter_module, oracle_policy_id,
-    require_valid_identity, share_issuance_auction_policy_spec, ActionHasher, AuctionBook,
-    AuctionOrder, PolicySpec, StageSpec, ACTION_ISSUE, ACTION_TRANSFER, CAP_EQUITY_SETTLEMENT,
-    CONSTITUTION_STATE_ACTIVE, CONSTITUTION_STATE_PENDING_RATIFICATION, ERR_CONSTITUTION_NOT_ACTIVE,
+    query_charter_equity_module, query_charter_share_class_spec, require_valid_identity,
+    share_issuance_auction_policy_spec, ActionHasher, AuctionBook, AuctionOrder, PolicySpec,
+    StageSpec, ACTION_ISSUE, ACTION_TRANSFER, CAP_EQUITY_SETTLEMENT, CONSTITUTION_STATE_ACTIVE,
+    CONSTITUTION_STATE_PENDING_RATIFICATION, ERR_CHARTER_MISMATCH, ERR_CONSTITUTION_NOT_ACTIVE,
     ERR_NO_BIDS_IN_STAGE, ERR_NOT_EXISTING_SHAREHOLDER, ERR_NOT_ORDER_OWNER,
     ERR_ORDER_ALREADY_CANCELLED, ERR_ORDER_NOT_FOUND, ERR_POLICY_INVALID,
     ERR_SHA_SIGNATURE_REQUIRED, ERR_SSA_SIGNATURE_REQUIRED, ERR_STEP2_SELLER_INELIGIBLE_STEP3,
     ERR_WRONG_AUCTION_STEP, MAX_ENCODED_AUCTION_BOOK_BYTES, MAX_ENCODED_POLICY_BYTES,
-    ORDER_SIDE_BUY_STEP1, ORDER_SIDE_BUY_STEP3, ORDER_SIDE_CANCELLED, ORDER_SIDE_SELL_STEP2,
-    POLICY_FIRST_SHAREHOLDER_RESOLUTION, POLICY_SHAREHOLDER_SUPERMAJORITY,
-    POLICY_SHARE_ISSUANCE_AUCTION, POLICY_SHARE_TRANSFER_AUCTION, POLICY_SUPER_GOVERNANCE,
-    ROLE_ALL_MEMBERS_WEIGHT, ROLE_SHAREHOLDER,
+    MAX_MEMBERS_PER_STAGE, ORDER_SIDE_BUY_STEP1, ORDER_SIDE_BUY_STEP3, ORDER_SIDE_CANCELLED,
+    ORDER_SIDE_SELL_STEP2, POLICY_BOARD_RESOLUTION, POLICY_FIRST_SHAREHOLDER_RESOLUTION,
+    POLICY_SHAREHOLDER_SUPERMAJORITY, POLICY_SHARE_ISSUANCE_AUCTION,
+    POLICY_SHARE_TRANSFER_AUCTION, POLICY_SUPER_GOVERNANCE, ROLE_ALL_MEMBERS_WEIGHT,
+    ROLE_SHAREHOLDER,
 };
 use hps_sdk::storage::KeyBuilder;
 use hps_sdk::{context, event_topic, events, hps_entry, ret, selector, storage};
@@ -143,6 +145,8 @@ hps_entry! {
     "shaTemplateHash()"                                                            => handle_sha_template_hash,
     "hasSignedSubscriptionAgreement(address)"                                      => handle_has_signed_ssa,
     "hasSignedShareholdersAgreement(address)"                                      => handle_has_signed_sha,
+    "hasSigned(uint64,address)"                                                    => handle_has_signed,
+    "isMultiStepIssuance()"                                                        => handle_is_multistep_issuance,
     "getOrdersRaw()"                                                               => handle_get_orders_raw,
     "isReadyToConsume()"                                                           => handle_is_ready_to_consume,
     "targetHps()"                                                                  => handle_target_hps,
@@ -167,6 +171,59 @@ fn signed_key(stage: u64, identity: &[u8; 20]) -> KeyBuilder<40> {
         .push(b"au:s:")
         .push_u64_le(stage)
         .push(identity)
+}
+
+fn stage_signers_key(stage: u64) -> KeyBuilder<24> {
+    KeyBuilder::<24>::new().push(b"au:slist:").push_u64_le(stage)
+}
+
+fn load_stage_signers(stage: u64, out: &mut [[u8; 20]; MAX_MEMBERS_PER_STAGE]) -> usize {
+    let mut raw = [0u8; MAX_MEMBERS_PER_STAGE * 20];
+    let Some(n) = storage::get_into(stage_signers_key(stage).as_slice(), &mut raw) else {
+        return 0;
+    };
+    let count = (n / 20).min(MAX_MEMBERS_PER_STAGE);
+    let mut i = 0;
+    while i < count {
+        out[i].copy_from_slice(&raw[i * 20..(i + 1) * 20]);
+        i += 1;
+    }
+    count
+}
+
+fn append_stage_signer(stage: u64, signer: &[u8; 20]) {
+    let mut signers = [[0u8; 20]; MAX_MEMBERS_PER_STAGE];
+    let count = load_stage_signers(stage, &mut signers);
+    let mut i = 0;
+    while i < count {
+        if &signers[i] == signer {
+            return;
+        }
+        i += 1;
+    }
+    if count < MAX_MEMBERS_PER_STAGE {
+        let mut raw = [0u8; MAX_MEMBERS_PER_STAGE * 20];
+        let mut k = 0;
+        while k < count {
+            raw[k * 20..(k + 1) * 20].copy_from_slice(&signers[k]);
+            k += 1;
+        }
+        raw[count * 20..(count + 1) * 20].copy_from_slice(signer);
+        storage::set(stage_signers_key(stage).as_slice(), &raw[..(count + 1) * 20]);
+    }
+}
+
+fn verify_target_pinned_to_charter(constitution: &[u8; 20], target_hps: &[u8; 20]) -> Result<(), i32> {
+    if *constitution == [0u8; 20] || *target_hps == *constitution {
+        return Ok(());
+    }
+    let cd = CallEncoder::<16>::new(const { selector("associatedCharter()") });
+    if let Ok(raw) = call::call_raw(target_hps, cd.as_slice()) {
+        if raw.len() < 32 || &raw[12..32] != constitution {
+            return Err(ERR_CHARTER_MISMATCH);
+        }
+    }
+    Ok(())
 }
 
 fn step2_seller_key(identity: &[u8; 20]) -> KeyBuilder<36> {
@@ -466,6 +523,7 @@ fn handle_init_transfer_auction(args: &CalldataReader) -> Result<(), i32> {
             return Err(ERR_CONSTITUTION_NOT_ACTIVE);
         }
     }
+    verify_target_pinned_to_charter(&constitution, &target_hps)?;
 
     let q = CallEncoder::<96>::new(const { selector("getPolicyRaw(address,bytes32)") })
         .push_address(&target_hps)
@@ -506,6 +564,7 @@ fn handle_init_share_issuance(args: &CalldataReader) -> Result<(), i32> {
             return Err(ERR_CONSTITUTION_NOT_ACTIVE);
         }
     }
+    verify_target_pinned_to_charter(&constitution, &target_hps)?;
 
     let mut raw_spec = [0u8; MAX_ENCODED_POLICY_BYTES];
     let q_iss = CallEncoder::<96>::new(const { selector("getPolicyRaw(address,bytes32)") })
@@ -615,6 +674,24 @@ fn init_multistep_issuance_inner(
     if let Ok(st) = call::call_u64(&constitution, st_cd.as_slice()) {
         if st != CONSTITUTION_STATE_ACTIVE {
             return Err(ERR_CONSTITUTION_NOT_ACTIVE);
+        }
+    }
+    verify_target_pinned_to_charter(&constitution, &target_hps)?;
+
+    verify_target_pinned_to_charter(&constitution, &target_hps)?;
+
+    // Authoritative Charter Share-Class Verification: if `target_hps` is ALREADY registered on
+    // `CorporateCharter`, enforce its exact conversion & voting multiplier from `CorporateCharter`
+    // (preventing conversion-rate spoofing on an existing high-vote Preferred class)!
+    if let Some((chr_votes, chr_num, chr_den)) =
+        query_charter_share_class_spec(&constitution, &target_hps)
+    {
+        if chr_den == 0 || chr_num == 0 || chr_num % chr_den != 0 {
+            return Err(-61);
+        }
+        let chr_conv = chr_num / chr_den;
+        if chr_conv != conversion_rate || chr_votes != conversion_rate {
+            return Err(-61);
         }
     }
 
@@ -844,6 +921,134 @@ fn query_dynamic_shareholder_power(
     Some((voter_power, total_power, req_power))
 }
 
+fn query_live_board_status(bound_con: &[u8; 20], candidate: &[u8; 20]) -> Option<(bool, u64)> {
+    if *bound_con == [0u8; 20] {
+        return None;
+    }
+    let cnt_cd = CallEncoder::<16>::new(const { selector("directorCount()") });
+    let Ok(dir_cnt) = call::call_u64(bound_con, cnt_cd.as_slice()) else {
+        return None;
+    };
+    if dir_cnt == 0 {
+        return None;
+    }
+    if *candidate == [0u8; 20] {
+        return Some((false, dir_cnt));
+    }
+    let is_cd =
+        CallEncoder::<64>::new(const { selector("isDirector(address)") }).push_address(candidate);
+    let is_dir = matches!(call::call_bool(bound_con, is_cd.as_slice()), Ok(true));
+    let con_cd = CallEncoder::<64>::new(const { selector("hasDirectorConsented(address)") })
+        .push_address(candidate);
+    let consented = match call::call_bool(bound_con, con_cd.as_slice()) {
+        Ok(b) => b,
+        Err(_) => true,
+    };
+    Some((is_dir && consented, dir_cnt))
+}
+
+fn is_dynamic_shareholder_stage(stage: &StageSpec, cur_stage: usize, bound_pol: &[u8; 32]) -> bool {
+    stage.has_role(&ROLE_SHAREHOLDER)
+        || (cur_stage == 0
+            && (*bound_pol == POLICY_SHAREHOLDER_SUPERMAJORITY
+                || *bound_pol == POLICY_SUPER_GOVERNANCE
+                || *bound_pol == POLICY_FIRST_SHAREHOLDER_RESOLUTION
+                || storage::get_u64(KEY_IS_MULTISTEP_ISSUANCE) == 1))
+}
+
+fn compute_shareholder_req_weight(
+    stage: &StageSpec,
+    total_power: u64,
+    default_super_req: u64,
+) -> u64 {
+    let req = if storage::get_u64(KEY_IS_MULTISTEP_ISSUANCE) == 1 {
+        default_super_req
+    } else if stage.has_role(&ROLE_SHAREHOLDER)
+        && stage.required_weight >= 1
+        && stage.required_weight <= 100
+    {
+        (total_power
+            .saturating_mul(stage.required_weight)
+            .saturating_add(99))
+            / 100
+    } else {
+        default_super_req
+    };
+    req.max(1)
+}
+
+/// Re-tabulate live voting weight across all unique recorded signers of `stage_idx` from `bound_con`
+/// so share-transfer wash-voting (`A -> B` vote cloning) and post-removal director votes are impossible!
+fn recompute_live_stage_tally(
+    stage: &StageSpec,
+    stage_idx: usize,
+    bound_con: &[u8; 20],
+    bound_pol: &[u8; 32],
+) -> Option<(u64, u64)> {
+    if *bound_con == [0u8; 20] {
+        return None;
+    }
+    let mut signers = [[0u8; 20]; MAX_MEMBERS_PER_STAGE];
+    let s_cnt = load_stage_signers(stage_idx as u64, &mut signers);
+
+    if is_dynamic_shareholder_stage(stage, stage_idx, bound_pol) {
+        let (_, total_power, default_super_req) =
+            query_dynamic_shareholder_power(bound_con, &[0u8; 20])?;
+        let req = compute_shareholder_req_weight(stage, total_power, default_super_req);
+        let mut sum = 0u64;
+        let mut i = 0;
+        while i < s_cnt {
+            if let Some((vp, _, _)) = query_dynamic_shareholder_power(bound_con, &signers[i]) {
+                sum = sum.saturating_add(vp);
+            }
+            i += 1;
+        }
+        return Some((sum, req));
+    }
+
+    if *bound_pol == POLICY_BOARD_RESOLUTION {
+        let (_, dir_cnt) = query_live_board_status(bound_con, &[0u8; 20])?;
+        let req = if stage.required_weight == ROLE_ALL_MEMBERS_WEIGHT
+            || (stage.member_count > 0 && (stage.required_weight as usize) >= stage.member_count)
+        {
+            dir_cnt
+        } else {
+            stage.required_weight.min(dir_cnt).max(1)
+        };
+        let mut sum = 0u64;
+        let mut i = 0;
+        while i < s_cnt {
+            if let Some((active_dir, _)) = query_live_board_status(bound_con, &signers[i]) {
+                if active_dir {
+                    sum = sum.saturating_add(1);
+                }
+            }
+            i += 1;
+        }
+        return Some((sum, req));
+    }
+
+    None
+}
+
+fn verify_all_stages_hold_live_quorum(spec: &PolicySpec, bound_con: &[u8; 20], bound_pol: &[u8; 32]) -> Result<(), i32> {
+    if *bound_con == [0u8; 20] {
+        return Ok(());
+    }
+    let mut s = 0usize;
+    while s < spec.stage_count {
+        if let Some((live_w, live_req)) =
+            recompute_live_stage_tally(&spec.stages[s], s, bound_con, bound_pol)
+        {
+            if live_w < live_req {
+                return Err(-62);
+            }
+        }
+        s += 1;
+    }
+    Ok(())
+}
+
 /// Resolve `(caller_weight, required_stage_weight)` for `caller` on `stage` (supporting explicit
 /// weighted members, dynamic role-backed stages defined even with 0 initial role holders,
 /// unanimous `ROLE_ALL_MEMBERS_WEIGHT`, and multi-class shareholder voting).
@@ -854,34 +1059,31 @@ fn resolve_stage_authorizer_weight(
     bound_pol: &[u8; 32],
     caller: &[u8; 20],
 ) -> Result<(u64, u64), i32> {
-    let is_shareholder_stage = stage.has_role(&ROLE_SHAREHOLDER)
-        || (cur_stage == 0
-            && (*bound_pol == POLICY_SHAREHOLDER_SUPERMAJORITY
-                || *bound_pol == POLICY_SUPER_GOVERNANCE
-                || *bound_pol == POLICY_FIRST_SHAREHOLDER_RESOLUTION
-                || storage::get_u64(KEY_IS_MULTISTEP_ISSUANCE) == 1));
-
-    if *bound_con != [0u8; 20] && is_shareholder_stage {
+    if *bound_con != [0u8; 20] && is_dynamic_shareholder_stage(stage, cur_stage, bound_pol) {
         if let Some((dyn_weight, total_power, default_super_req)) =
             query_dynamic_shareholder_power(bound_con, caller)
         {
             if dyn_weight == 0 {
                 return Err(ERR_NOT_STAGE_AUTHORIZER);
             }
-            let dyn_req = if storage::get_u64(KEY_IS_MULTISTEP_ISSUANCE) == 1 {
-                default_super_req
-            } else if stage.has_role(&ROLE_SHAREHOLDER)
-                && stage.required_weight >= 1
-                && stage.required_weight <= 100
+            let dyn_req = compute_shareholder_req_weight(stage, total_power, default_super_req);
+            return Ok((dyn_weight, dyn_req));
+        }
+    }
+
+    if *bound_con != [0u8; 20] && *bound_pol == POLICY_BOARD_RESOLUTION {
+        if let Some((active_dir, dir_cnt)) = query_live_board_status(bound_con, caller) {
+            if !active_dir {
+                return Err(ERR_NOT_STAGE_AUTHORIZER);
+            }
+            let req = if stage.required_weight == ROLE_ALL_MEMBERS_WEIGHT
+                || (stage.member_count > 0 && (stage.required_weight as usize) >= stage.member_count)
             {
-                (total_power
-                    .saturating_mul(stage.required_weight)
-                    .saturating_add(99))
-                    / 100
+                dir_cnt
             } else {
-                default_super_req
+                stage.required_weight.min(dir_cnt).max(1)
             };
-            return Ok((dyn_weight, dyn_req.max(1)));
+            return Ok((1, req));
         }
     }
 
@@ -990,9 +1192,18 @@ fn execute_approve_step() -> Result<[u8; 20], i32> {
         return Err(ERR_ALREADY_SIGNED);
     }
     storage::set_u64(sk.as_slice(), 1);
+    append_stage_signer(cur_stage as u64, &caller);
 
     let wk = stage_weight_key(cur_stage as u64);
-    let accum = storage::get_u64(wk.as_slice()).saturating_add(weight);
+    let static_accum = storage::get_u64(wk.as_slice()).saturating_add(weight);
+    let (accum, effective_required) =
+        if let Some((live_sum, live_req)) =
+            recompute_live_stage_tally(stage, cur_stage, &bound_con, &bound_pol)
+        {
+            (live_sum, live_req)
+        } else {
+            (static_accum, required_weight)
+        };
     storage::set_u64(wk.as_slice(), accum);
 
     let mut ev = [0u8; 24];
@@ -1001,11 +1212,11 @@ fn execute_approve_step() -> Result<[u8; 20], i32> {
     ev[16..24].copy_from_slice(&accum.to_be_bytes());
     events::emit(&[STAGE_APPROVED, addr_topic(&caller)], &ev);
 
-    if accum >= required_weight {
+    if accum >= effective_required {
         let mut thr = [0u8; 24];
         thr[0..8].copy_from_slice(&(cur_stage as u64).to_be_bytes());
         thr[8..16].copy_from_slice(&accum.to_be_bytes());
-        thr[16..24].copy_from_slice(&required_weight.to_be_bytes());
+        thr[16..24].copy_from_slice(&effective_required.to_be_bytes());
         events::emit(&[STAGE_THRESHOLD_REACHED], &thr);
 
         if is_ms_iss {
@@ -1101,6 +1312,12 @@ fn execute_finalize_step(caller: &[u8; 20]) -> Result<(), i32> {
     let now = context::block_number();
     if now > storage::get_u64(KEY_OVERALL_DEADLINE) {
         return Err(ERR_AUTH_EXPIRED);
+    }
+    if storage::get_u64(KEY_IS_ISSUANCE) == 0 {
+        let spec = load_spec()?;
+        let bound_con = storage::get_address(KEY_CONSTITUTION).unwrap_or([0u8; 20]);
+        let bound_pol = storage::get_bytes32(KEY_POLICY_ID).unwrap_or([0u8; 32]);
+        verify_all_stages_hold_live_quorum(&spec, &bound_con, &bound_pol)?;
     }
     storage::set_u64(KEY_STATE, STATE_FINALIZED);
     events::emit(
@@ -1321,6 +1538,11 @@ fn execute_place_buy_order(buyer: &[u8; 20], price: u64, quantity: u64) -> Resul
 }
 
 fn handle_place_buy_order(args: &CalldataReader) -> Result<(), i32> {
+    let bound_con = storage::get_address(KEY_CONSTITUTION).unwrap_or([0u8; 20]);
+    if query_charter_equity_module(&bound_con) != [0u8; 20] {
+        // Charter has an active `ShareCapital` escrow module — unescrowed direct buy orders are forbidden!
+        return Err(ERR_WRONG_TARGET);
+    }
     let price = args.u64(0).ok_or(-3)?;
     let quantity = args.u64(1).ok_or(-3)?;
     let caller = context::msg_sender();
@@ -1438,6 +1660,10 @@ fn execute_cancel_buy_order(buyer: &[u8; 20], order_index: u64) -> Result<(u64, 
 }
 
 fn handle_cancel_buy_order(args: &CalldataReader) -> Result<(), i32> {
+    let bound_con = storage::get_address(KEY_CONSTITUTION).unwrap_or([0u8; 20]);
+    if query_charter_equity_module(&bound_con) != [0u8; 20] {
+        return Err(ERR_WRONG_TARGET);
+    }
     let order_index = args.u64(0).ok_or(-3)?;
     let caller = context::msg_sender();
     let (price, qty) = execute_cancel_buy_order(&caller, order_index)?;
@@ -1533,6 +1759,10 @@ fn execute_place_sell_order(seller: &[u8; 20], price: u64, quantity: u64) -> Res
 }
 
 fn handle_place_sell_order(args: &CalldataReader) -> Result<(), i32> {
+    let bound_con = storage::get_address(KEY_CONSTITUTION).unwrap_or([0u8; 20]);
+    if query_charter_equity_module(&bound_con) != [0u8; 20] {
+        return Err(ERR_WRONG_TARGET);
+    }
     let price = args.u64(0).ok_or(-3)?;
     let quantity = args.u64(1).ok_or(-3)?;
     let caller = context::msg_sender();
@@ -1651,6 +1881,13 @@ fn handle_consume(args: &CalldataReader) -> Result<(), i32> {
     let bound_pol = storage::get_bytes32(KEY_POLICY_ID).ok_or(-62)?;
     if bound_con != expected_constitution || bound_pol != expected_policy_id {
         return Err(ERR_POLICY_MISMATCH);
+    }
+
+    // Re-verify live voting power / active director status at consumption time so pre-signed
+    // resolutions cannot be enacted after the signing shareholders sold out or directors were removed!
+    if storage::get_u64(KEY_IS_AUCTION) == 0 && storage::get_u64(KEY_IS_ISSUANCE) == 0 {
+        let spec = load_spec()?;
+        verify_all_stages_hold_live_quorum(&spec, &bound_con, &bound_pol)?;
     }
 
     let bound_hash = storage::get_bytes32(KEY_ACTION_HASH).ok_or(-62)?;
@@ -1834,7 +2071,14 @@ fn handle_consume_issuance_auction(args: &CalldataReader) -> Result<(), i32> {
 
     let caller_target = context::msg_sender();
     let bound_target = storage::get_address(KEY_TARGET).ok_or(-62)?;
-    if caller_target != bound_target && !is_authorized_auction_broker(&bound_con, &caller_target) {
+    let eq_mod = query_charter_equity_module(&bound_con);
+    if is_ms_iss && eq_mod != [0u8; 20] {
+        // Multi-step 5-Step Share Issuance MUST be consumed exclusively by `ShareCapital`
+        // (`determineIssuanceAllocation`) so ROFR 100% priority & Step 5 SHA are enforced!
+        if caller_target != eq_mod {
+            return Err(ERR_WRONG_TARGET);
+        }
+    } else if caller_target != bound_target && !is_authorized_auction_broker(&bound_con, &caller_target) {
         return Err(ERR_WRONG_TARGET);
     }
 
@@ -2137,6 +2381,18 @@ fn handle_has_signed_sha(args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
+fn handle_has_signed(args: &CalldataReader) -> Result<(), i32> {
+    let stage = args.u64(0).ok_or(-3)?;
+    let who = args.address(1).ok_or(-3)?;
+    ret::write_bool(storage::get_u64(signed_key(stage, &who).as_slice()) != 0);
+    Ok(())
+}
+
+fn handle_is_multistep_issuance(_args: &CalldataReader) -> Result<(), i32> {
+    ret::write_bool(storage::get_u64(KEY_IS_MULTISTEP_ISSUANCE) == 1);
+    Ok(())
+}
+
 fn handle_stage_count(_args: &CalldataReader) -> Result<(), i32> {
     let cnt = load_spec().map(|s| s.stage_count as u64).unwrap_or(0);
     ret::write_u64_word(cnt);
@@ -2145,6 +2401,27 @@ fn handle_stage_count(_args: &CalldataReader) -> Result<(), i32> {
 
 fn handle_stage_weight(args: &CalldataReader) -> Result<(), i32> {
     let stage = args.u64(0).ok_or(-3)?;
+    let st = storage::get_u64(KEY_STATE);
+    if st != STATE_CONSUMED
+        && !(storage::get_u64(KEY_IS_MULTISTEP_ISSUANCE) == 1
+            && storage::get_u64(KEY_AUCTION_STARTED) == 1)
+    {
+        if let Ok(spec) = load_spec() {
+            if (stage as usize) < spec.stage_count {
+                let bound_con = storage::get_address(KEY_CONSTITUTION).unwrap_or([0u8; 20]);
+                let bound_pol = storage::get_bytes32(KEY_POLICY_ID).unwrap_or([0u8; 32]);
+                if let Some((live_w, _)) = recompute_live_stage_tally(
+                    &spec.stages[stage as usize],
+                    stage as usize,
+                    &bound_con,
+                    &bound_pol,
+                ) {
+                    ret::write_u64_word(live_w);
+                    return Ok(());
+                }
+            }
+        }
+    }
     let wk = stage_weight_key(stage);
     ret::write_u64_word(storage::get_u64(wk.as_slice()));
     Ok(())
@@ -3546,5 +3823,257 @@ mod tests {
             ),
             Err(ERR_NO_BIDS_IN_STAGE)
         );
+    }
+
+    #[test]
+    fn security_audit_blocks_wash_voting_fired_directors_and_unescrowed_direct_orders() {
+        mock::reset();
+        let reg = [0x10; 20];
+        let con = [0x20; 20];
+        let sc_mod = [0x5C; 20];
+        let common_led = [0x31; 20];
+        let auth_wash = [0x71; 20];
+        let auth_board = [0x72; 20];
+        let auth_auc = [0x73; 20];
+
+        let sh_a = [0xA1; 20]; // Starts with 40,000 / 100,000 (40%)
+        let sh_b = [0xA2; 20]; // Starts with 0 -> receives A's 40,000 mid-vote!
+        let sh_honest = [0xA3; 20]; // Holds 60,000 / 100,000 (60%)
+        let dir_fired = [0xD1; 20];
+        let dir_active = [0xD2; 20];
+        let dir_third = [0xD3; 20];
+
+        mock::register_hps(reg, reg_and_con_sim::reg_dispatch);
+        mock::register_hps(common_led, |raw| {
+            let Some((sel, _args)) = CalldataReader::parse(raw) else {
+                return -1;
+            };
+            if sel == const { selector("associatedCharter()") } {
+                ret::write_address(&[0x20; 20]);
+                return 0;
+            }
+            if sel == const { selector("totalOutstanding()") } {
+                ret::write_u64_word(100_000);
+                return 0;
+            }
+            if sel == const { selector("balanceOf(address)") } {
+                ret::write_u64_word(0);
+                return 0;
+            }
+            -2
+        });
+        mock::register_hps(con, |raw| {
+            let Some((sel, args)) = CalldataReader::parse(raw) else {
+                return -1;
+            };
+            if sel == const { selector("state()") } {
+                ret::write_u64_word(2);
+                return 0;
+            }
+            if sel == const { selector("isRoleDefined(bytes32)") } {
+                ret::write_bool(true);
+                return 0;
+            }
+            if sel == const { selector("equitySettlementModule()") } {
+                ret::write_address(&[0x5C; 20]);
+                return 0;
+            }
+            if sel == const { selector("isAuthorizedModule(address,bytes32)") } {
+                ret::write_bool(args.address(0).unwrap() == [0x5C; 20]);
+                return 0;
+            }
+            if sel == const { selector("votingPowerOf(address)") } {
+                let who = args.address(0).unwrap();
+                let mut out = [0u8; 64];
+                out[24..32].copy_from_slice(&storage::get_u64(&who).to_be_bytes());
+                out[56..64].copy_from_slice(&100_000u64.to_be_bytes());
+                ret::write(&out);
+                return 0;
+            }
+            if sel == const { selector("shareholderVotingPower(address)") } {
+                let who = args.address(0).unwrap();
+                let vp = storage::get_u64(&who);
+                let mut out = [0u8; 128];
+                out[24..32].copy_from_slice(&vp.to_be_bytes());
+                out[56..64].copy_from_slice(&100_000u64.to_be_bytes());
+                out[88..96].copy_from_slice(&75_000u64.to_be_bytes());
+                out[120..128].copy_from_slice(&vp.to_be_bytes());
+                ret::write(&out);
+                return 0;
+            }
+            if sel == const { selector("isDirector(address)") } {
+                let who = args.address(0).unwrap();
+                ret::write_bool(storage::get_u64(&who) == 1);
+                return 0;
+            }
+            if sel == const { selector("directorCount()") } {
+                ret::write_u64_word(storage::get_u64(b"dir_cnt"));
+                return 0;
+            }
+            if sel == const { selector("getPolicyRaw(address,bytes32)") } {
+                let pol = args.bytes32(1).unwrap();
+                let spec = if pol == POLICY_SUPER_GOVERNANCE {
+                    PolicySpec::new(50)
+                        .add_stage(
+                            StageSpec::new(7_500, 30)
+                                .add_role(ROLE_SHAREHOLDER, 1)
+                                .unwrap(),
+                        )
+                        .unwrap()
+                } else if pol == POLICY_BOARD_RESOLUTION {
+                    PolicySpec::new(50)
+                        .add_stage(
+                            StageSpec::new(2, 30)
+                                .add_member([0xD1; 20], 1)
+                                .unwrap()
+                                .add_member([0xD2; 20], 1)
+                                .unwrap()
+                                .add_member([0xD3; 20], 1)
+                                .unwrap(),
+                        )
+                        .unwrap()
+                } else {
+                    hps_sdk::governance::share_transfer_auction_policy_spec([0xA3; 20], 10, 10, 10, 50)
+                        .unwrap()
+                };
+                let mut buf = [0u8; 512];
+                let n = spec.encode(&mut buf).unwrap();
+                ret::write_abi_bytes(&buf[..n]);
+                return 0;
+            }
+            -2
+        });
+
+        mock::register_hps(auth_wash, dispatch_calldata);
+        mock::register_hps(auth_board, dispatch_calldata);
+        mock::register_hps(auth_auc, dispatch_calldata);
+
+        mock::set_block_number(10);
+        mock::set_self_address(con);
+        storage::set_u64(&sh_a, 40_000);
+        storage::set_u64(&sh_b, 0);
+        storage::set_u64(&sh_honest, 60_000);
+        storage::set_u64(&dir_fired, 1);
+        storage::set_u64(&dir_active, 1);
+        storage::set_u64(&dir_third, 1);
+        storage::set_u64(b"dir_cnt", 3);
+
+        // 1. CRITICAL-04 (Wash-Voting): `sh_a` (40%) signs, transfers 40,000 shares to `sh_b`, `sh_b` (40%) signs!
+        //    Live re-tabulation computes `0 + 4,000 = 4,000 < 7,500`, blocking `finalize()`!
+        let init_wash = CallEncoder::<192>::new(const {
+            selector("initializeFromCharter(address,address,address,bytes32,bytes32)")
+        })
+        .push_address(&reg)
+        .push_address(&con)
+        .push_address(&con)
+        .push_bytes32(&POLICY_SUPER_GOVERNANCE)
+        .push_bytes32(&[0xAA; 32]);
+        mock::transact_as(sh_a, auth_wash, init_wash.as_slice()).unwrap();
+        mock::transact_as(
+            sh_a,
+            auth_wash,
+            CallEncoder::<16>::new(const { selector("approve()") }).as_slice(),
+        )
+        .unwrap();
+
+        // Simulate mid-vote share transfer `sh_a -> sh_b`
+        mock::set_self_address(con);
+        storage::set_u64(&sh_a, 0);
+        storage::set_u64(&sh_b, 40_000);
+
+        mock::transact_as(
+            sh_b,
+            auth_wash,
+            CallEncoder::<16>::new(const { selector("approve()") }).as_slice(),
+        )
+        .unwrap();
+        // Live stageWeight MUST be 40,000 votes (NOT 80,000 votes!), and `finalize()` MUST REVERT!
+        let live_w_raw = mock::transact_as(
+            sh_b,
+            auth_wash,
+            CallEncoder::<64>::new(const { selector("stageWeight(uint64)") })
+                .push_u64(0)
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(
+            u64::from_be_bytes(live_w_raw[24..32].try_into().unwrap()),
+            40_000
+        );
+        assert!(
+            mock::transact_as(
+                sh_b,
+                auth_wash,
+                CallEncoder::<16>::new(const { selector("finalize()") }).as_slice(),
+            )
+            .is_err()
+        );
+
+        // 2. CRITICAL-04 (Fired Director): `dir_fired` signs, then is removed from Board before `dir_active` signs!
+        let init_board = CallEncoder::<192>::new(const {
+            selector("initializeFromCharter(address,address,address,bytes32,bytes32)")
+        })
+        .push_address(&reg)
+        .push_address(&con)
+        .push_address(&con)
+        .push_bytes32(&POLICY_BOARD_RESOLUTION)
+        .push_bytes32(&[0xBB; 32]);
+        mock::transact_as(dir_fired, auth_board, init_board.as_slice()).unwrap();
+        mock::transact_as(
+            dir_fired,
+            auth_board,
+            CallEncoder::<16>::new(const { selector("approve()") }).as_slice(),
+        )
+        .unwrap();
+        // Remove `dir_fired` on CorporateCharter (`directorCount` drops from 3 -> 2, req = 2)
+        mock::set_self_address(con);
+        storage::set_u64(&dir_fired, 0);
+        storage::set_u64(b"dir_cnt", 2);
+
+        mock::transact_as(
+            dir_active,
+            auth_board,
+            CallEncoder::<16>::new(const { selector("approve()") }).as_slice(),
+        )
+        .unwrap();
+        assert!(
+            mock::transact_as(
+                dir_active,
+                auth_board,
+                CallEncoder::<16>::new(const { selector("finalize()") }).as_slice(),
+            )
+            .is_err()
+        );
+
+        // 3. CRITICAL-03 (Unescrowed Direct Order Bypass): When `equitySettlementModule() == sc_mod`,
+        //    direct `placeBuyOrder` from an investor REVERTS (-95), while `placeBuyOrderFor` from `sc_mod` succeeds!
+        let init_auc = CallEncoder::<128>::new(const {
+            selector("initializeTransferAuction(address,address,address)")
+        })
+        .push_address(&reg)
+        .push_address(&con)
+        .push_address(&common_led);
+        mock::transact_as(sh_honest, auth_auc, init_auc.as_slice()).unwrap();
+        assert_eq!(
+            mock::transact_as(
+                sh_b,
+                auth_auc,
+                CallEncoder::<96>::new(const { selector("placeBuyOrder(uint64,uint64)") })
+                    .push_u64(50)
+                    .push_u64(1_000)
+                    .as_slice(),
+            ),
+            Err(ERR_WRONG_TARGET)
+        );
+        mock::transact_as(
+            sc_mod,
+            auth_auc,
+            CallEncoder::<128>::new(const { selector("placeBuyOrderFor(address,uint64,uint64)") })
+                .push_address(&sh_b)
+                .push_u64(50)
+                .push_u64(1_000)
+                .as_slice(),
+        )
+        .unwrap();
     }
 }

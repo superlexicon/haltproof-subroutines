@@ -30,13 +30,16 @@ use hps_sdk::governance::{
     verify_and_consume_auth, ActionHasher, AuthorizedModuleSpec, FunctionAuthRule, PolicySpec,
     ShareClassSpec, StageSpec, ACTION_ACTIVATE_CHARTER, ACTION_ADD_DIRECTOR,
     ACTION_AUTHORIZE_MODULE, ACTION_DEFINE_ROLE, ACTION_GRANT_ROLE, ACTION_REGISTER_SHARE_CLASS,
-    ACTION_REMOVE_DIRECTOR, ACTION_REVOKE_ROLE, ACTION_SET_FUNCTION_AUTH, CAP_EQUITY_SETTLEMENT,
-    CHARTER_STATE_ACTIVE, CHARTER_STATE_PENDING_RATIFICATION, CHARTER_STATE_UNINITIALIZED,
-    ERR_CHARTER_ALREADY_ACTIVE, ERR_CHARTER_NOT_ACTIVE, ERR_DIRECTOR_CONSENT_REQUIRED,
-    ERR_FUNCTION_AUTH_NOT_SET, ERR_NO_BIDS_IN_STAGE, ERR_POLICY_INVALID, ERR_ROLE_NOT_DEFINED,
-    ERR_SHA_SIGNATURE_REQUIRED, ERR_UNAUTHORIZED_MODULE, MAX_AUTHORIZED_MODULES, MAX_DEFINED_ROLES,
-    MAX_ENCODED_POLICY_BYTES, MAX_MEMBERS_PER_STAGE, MAX_SHARE_CLASSES, POLICY_BANK_ORACLE,
-    POLICY_BOARD_RESOLUTION, POLICY_FIRST_SHAREHOLDER_RESOLUTION, POLICY_PRODUCT_MANAGEMENT,
+    ACTION_REMOVE_DIRECTOR, ACTION_REVOKE_ROLE, ACTION_SET_FUNCTION_AUTH, ACTION_SET_TREASURY,
+    CAP_EQUITY_SETTLEMENT, CHARTER_STATE_ACTIVE, CHARTER_STATE_PENDING_RATIFICATION,
+    CHARTER_STATE_UNINITIALIZED, ERR_CHARTER_ALREADY_ACTIVE, ERR_CHARTER_MISMATCH,
+    ERR_CHARTER_NOT_ACTIVE, ERR_DIRECTOR_CONSENT_REQUIRED, ERR_FUNCTION_AUTH_NOT_SET,
+    ERR_GOVERNANCE_DOWNGRADE, ERR_NOT_EXISTING_SHAREHOLDER, ERR_NO_BIDS_IN_STAGE,
+    ERR_POLICY_INVALID, ERR_RESERVED_GOVERNANCE_ROLE, ERR_ROLE_NOT_DEFINED,
+    ERR_SHA_SIGNATURE_REQUIRED, ERR_STALE_CAPITAL_SNAPSHOT, ERR_UNAUTHORIZED_MODULE,
+    MAX_AUTHORIZED_MODULES, MAX_DEFINED_ROLES, MAX_ENCODED_POLICY_BYTES, MAX_MEMBERS_PER_STAGE,
+    MAX_SHARE_CLASSES, POLICY_BANK_ORACLE, POLICY_BOARD_RESOLUTION,
+    POLICY_FIRST_SHAREHOLDER_RESOLUTION, POLICY_PRODUCT_MANAGEMENT,
     POLICY_SHAREHOLDER_SUPERMAJORITY, POLICY_SHARE_ISSUANCE_AUCTION,
     POLICY_SHARE_TRANSFER_AUCTION, POLICY_SUPER_GOVERNANCE, ROLE_BANK_ORACLE, ROLE_DIRECTOR,
     ROLE_PRODUCT_MANAGER, ROLE_SHAREHOLDER, ROLE_TREASURY_MANAGER,
@@ -62,6 +65,7 @@ const FUNCTION_AUTH_UPDATED: [u8; 32] =
 const MODULE_AUTHORIZED: [u8; 32] = event_topic("ModuleAuthorized(address,bytes32,bool,address)");
 const SHARE_CLASS_REGISTERED: [u8; 32] =
     event_topic("ShareClassRegistered(address,uint64,uint64,uint64)");
+const TREASURY_UPDATED: [u8; 32] = event_topic("TreasuryAccountUpdated(address,address)");
 
 const TAG_SET_POLICY: [u8; 32] = keccak256(b"CHARTER_SET_POLICY");
 const TAG_DEACTIVATE_POLICY: [u8; 32] = keccak256(b"CHARTER_DEACTIVATE_POLICY");
@@ -80,6 +84,7 @@ const SEL_GRANT_ROLE: [u8; 4] = selector("grantRole(bytes32,address,address)");
 const SEL_REVOKE_ROLE: [u8; 4] = selector("revokeRole(bytes32,address,address)");
 const SEL_REGISTER_SHARE_CLASS: [u8; 4] =
     selector("registerShareClass(address,uint64,uint64,uint64,address)");
+const SEL_SET_TREASURY: [u8; 4] = selector("setTreasuryAccount(address,address)");
 
 const KEY_INIT: &[u8] = b"chr:init";
 const KEY_STATE: &[u8] = b"chr:state";
@@ -88,6 +93,8 @@ const KEY_ACTIVATION_AUTH: &[u8] = b"chr:act_auth";
 const KEY_DEFINED_ROLES_COUNT: &[u8] = b"chr:role_cnt";
 const KEY_REGISTRY: &[u8] = b"chr:reg";
 const KEY_INITIALIZER: &[u8] = b"chr:init_by";
+const KEY_TREASURY: &[u8] = b"chr:treasury";
+const KEY_EQ_SETTLEMENT_MOD: &[u8] = b"chr:eq_mod";
 const KEY_DIRECTORS_BLOB: &[u8] = b"chr:directors";
 const KEY_PENDING_DIRECTORS_BLOB: &[u8] = b"chr:dpend_list";
 const KEY_BOARD_EXPIRY: &[u8] = b"chr:board_exp";
@@ -137,6 +144,11 @@ hps_entry! {
     "signShareholdersAgreement(bytes32)"                                        => handle_sign_sha_direct,
     "hasSignedShareholdersAgreement(address)"                                   => handle_has_signed_sha,
     "shaDocumentHash()"                                                         => handle_sha_document_hash,
+    "treasuryAccount()"                                                         => handle_treasury_account,
+    "setTreasuryAccount(address,address)"                                       => handle_set_treasury_account,
+    "hashSetTreasuryAccount(address)"                                           => handle_hash_set_treasury_account,
+    "equitySettlementModule()"                                                  => handle_equity_settlement_module,
+    "getShareClassByLedger(address)"                                            => handle_get_share_class_by_ledger,
     "shareClassCount()"                                                         => handle_share_class_count,
     "getShareClass(uint64)"                                                     => handle_get_share_class,
     "shareholderVotingPower(address)"                                           => handle_shareholder_voting_power,
@@ -843,7 +855,7 @@ fn seed_default_function_auths(me: &[u8; 20]) {
         super_pol
     };
 
-    let defaults: [([u8; 4], [u8; 32]); 12] = [
+    let defaults: [([u8; 4], [u8; 32]); 13] = [
         (SEL_ACTIVATE_CHARTER, activate_pol),
         (SEL_SET_FUNCTION_AUTH, super_pol),
         (SEL_AUTHORIZE_MODULE, board_pol),
@@ -853,6 +865,7 @@ fn seed_default_function_auths(me: &[u8; 20]) {
         (SEL_ADD_DIRECTOR, super_pol),
         (SEL_REMOVE_DIRECTOR, super_pol),
         (SEL_REGISTER_SHARE_CLASS, super_pol),
+        (SEL_SET_TREASURY, super_pol),
         (SEL_GRANT_ROLE, board_pol),
         (SEL_REVOKE_ROLE, board_pol),
         (
@@ -1007,6 +1020,7 @@ fn handle_initialize(args: &CalldataReader) -> Result<(), i32> {
 
     storage::set_address(KEY_REGISTRY, &registry);
     storage::set_address(KEY_INITIALIZER, &caller);
+    storage::set_address(KEY_TREASURY, &caller);
     storage::set_u64(KEY_INIT, 1);
     storage::set_u64(KEY_STATE, CHARTER_STATE_PENDING_RATIFICATION);
     seed_initial_director_consents(&caller);
@@ -1270,6 +1284,9 @@ fn execute_initialize_with_governance(
                 module_configured_key(&spec.module_hps, &spec.capability).as_slice(),
                 1,
             );
+            if spec.capability == CAP_EQUITY_SETTLEMENT {
+                storage::set_address(KEY_EQ_SETTLEMENT_MOD, &spec.module_hps);
+            }
             mpos += AuthorizedModuleSpec::ENCODED_LEN;
             m += 1;
         }
@@ -1277,6 +1294,7 @@ fn execute_initialize_with_governance(
 
     storage::set_address(KEY_REGISTRY, registry);
     storage::set_address(KEY_INITIALIZER, &caller);
+    storage::set_address(KEY_TREASURY, &caller);
     storage::set_u64(KEY_INIT, 1);
     storage::set_u64(KEY_STATE, CHARTER_STATE_PENDING_RATIFICATION);
     seed_initial_director_consents(&caller);
@@ -1376,6 +1394,50 @@ fn handle_activated_at_block(_args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
+fn compute_set_treasury_hash(new_treasury: &[u8; 20]) -> [u8; 32] {
+    ActionHasher::<128>::new(&context::self_address(), &ACTION_SET_TREASURY)
+        .push_address(new_treasury)
+        .finish()
+}
+
+/// Verify that `sub_hps` is pinned to THIS `CorporateCharter` whenever `sub_hps` implements
+/// `associatedCharter()` (rejecting unpinned `[0u8; 20]` or foreign-Charter subroutines while
+/// remaining compatible with minimal unit-test stubs that return `Err` on unknown selectors).
+fn verify_subroutine_pinned_to_self(sub_hps: &[u8; 20]) -> Result<(), i32> {
+    if *sub_hps == [0u8; 20] {
+        return Err(ERR_CHARTER_MISMATCH);
+    }
+    let cd = CallEncoder::<16>::new(const { selector("associatedCharter()") });
+    if let Ok(raw) = call::call_raw(sub_hps, cd.as_slice()) {
+        if raw.len() < 32 || &raw[12..32] != &context::self_address() {
+            return Err(ERR_CHARTER_MISMATCH);
+        }
+    }
+    Ok(())
+}
+
+fn is_constitutional_super_selector(sel: &[u8; 4]) -> bool {
+    *sel == SEL_SET_FUNCTION_AUTH
+        || *sel == SEL_SET_POLICY
+        || *sel == SEL_DEACTIVATE_POLICY
+        || *sel == SEL_ADD_DIRECTOR
+        || *sel == SEL_REMOVE_DIRECTOR
+        || *sel == SEL_REGISTER_SHARE_CLASS
+        || *sel == SEL_SET_TREASURY
+}
+
+fn spec_satisfies_shareholder_super(spec: &PolicySpec) -> bool {
+    if spec.stage_count == 0 {
+        return false;
+    }
+    let mut classes = [ShareClassSpec::empty(); MAX_SHARE_CLASSES];
+    if load_share_classes(&mut classes) == 0 {
+        return true;
+    }
+    let st0 = &spec.stages[0];
+    st0.has_role(&ROLE_SHAREHOLDER) && st0.required_weight >= 75
+}
+
 /// Update which authorization process (`newPolicyId`) is required to invoke `(targetHps, fnSelector)`.
 /// Calling `setFunctionAuth` itself requires and consumes an `Authorization` object (`authObj`)
 /// satisfying `getFunctionAuth(self, SEL_SET_FUNCTION_AUTH)`.
@@ -1397,6 +1459,20 @@ fn handle_set_function_auth(args: &CalldataReader) -> Result<(), i32> {
     };
     if !policy_exists_for(&check_target, &new_policy_id) {
         return Err(ERR_POLICY_INVALID);
+    }
+
+    // Prevent constitutional governance downgrade: core shareholder-reserved Charter selectors
+    // can NEVER be remapped to an officer/board/1-of-1 policy below >=75% Shareholder Super-Majority!
+    if (target_hps == [0u8; 20] || target_hps == me)
+        && is_constitutional_super_selector(&fn_selector)
+    {
+        let mut pbuf = [0u8; MAX_ENCODED_POLICY_BYTES];
+        let n = resolve_policy_into(&check_target, &new_policy_id, &mut pbuf)
+            .ok_or(ERR_POLICY_INVALID)?;
+        let pspec = PolicySpec::decode(&pbuf[..n]).ok_or(ERR_POLICY_INVALID)?;
+        if !spec_satisfies_shareholder_super(&pspec) {
+            return Err(ERR_GOVERNANCE_DOWNGRADE);
+        }
     }
 
     let gov_policy = require_charter_function_auth(&SEL_SET_FUNCTION_AUTH)?;
@@ -1438,34 +1514,23 @@ fn handle_authorize_module(args: &CalldataReader) -> Result<(), i32> {
     if module_hps == [0u8; 20] || capability == [0u8; 32] {
         return Err(-59);
     }
+    if active {
+        verify_subroutine_pinned_to_self(&module_hps)?;
+    }
 
     let cfg_key = module_configured_key(&module_hps, &capability);
+    let existing_eq_mod = storage::get_address(KEY_EQ_SETTLEMENT_MOD).unwrap_or([0u8; 20]);
     if auth_obj == [0u8; 20]
         && active
         && storage::get_u64(cfg_key.as_slice()) == 0
         && !is_fn_auth_explicit(&[0u8; 20], &SEL_AUTHORIZE_MODULE)
+        && (capability != CAP_EQUITY_SETTLEMENT || existing_eq_mod == [0u8; 20])
     {
-        // Initial bootstrap binding by an active Director (or Charter initializer if 0 directors)
-        let mut dirs = [[0u8; 20]; MAX_MEMBERS_PER_STAGE];
-        let count = load_directors(&mut dirs);
-        if count > 0 {
-            let mut is_dir = false;
-            let mut i = 0;
-            while i < count {
-                if dirs[i] == caller {
-                    is_dir = true;
-                    break;
-                }
-                i += 1;
-            }
-            if !is_dir {
-                return Err(-61);
-            }
-        } else {
-            let init_by = storage::get_address(KEY_INITIALIZER).unwrap_or([0u8; 20]);
-            if caller != init_by {
-                return Err(-61);
-            }
+        // Initial one-time bootstrap binding ONLY by the Charter initializer (never by a non-founder
+        // minority director, and never once `CAP_EQUITY_SETTLEMENT` is already bound!)
+        let init_by = storage::get_address(KEY_INITIALIZER).unwrap_or([0u8; 20]);
+        if caller != init_by {
+            return Err(-61);
         }
     } else {
         let req_pol = require_charter_function_auth(&SEL_AUTHORIZE_MODULE)?;
@@ -1479,6 +1544,13 @@ fn handle_authorize_module(args: &CalldataReader) -> Result<(), i32> {
         u64::from(active),
     );
     storage::set_u64(cfg_key.as_slice(), 1);
+    if capability == CAP_EQUITY_SETTLEMENT {
+        if active {
+            storage::set_address(KEY_EQ_SETTLEMENT_MOD, &module_hps);
+        } else if existing_eq_mod == module_hps {
+            storage::set_address(KEY_EQ_SETTLEMENT_MOD, &[0u8; 20]);
+        }
+    }
 
     events::emit(
         &[
@@ -1564,9 +1636,20 @@ fn handle_set_policy(args: &CalldataReader) -> Result<(), i32> {
     }
 
     let spec = validate_and_verify_spec(&registry, raw_spec)?;
+    let me = context::self_address();
+    let set_fn_pol =
+        get_function_auth(&[0u8; 20], &SEL_SET_FUNCTION_AUTH).unwrap_or(POLICY_SUPER_GOVERNANCE);
+    if (target_hps == [0u8; 20] || target_hps == me)
+        && (policy_id == POLICY_SUPER_GOVERNANCE
+            || policy_id == POLICY_SHAREHOLDER_SUPERMAJORITY
+            || policy_id == set_fn_pol)
+        && !spec_satisfies_shareholder_super(&spec)
+    {
+        return Err(ERR_GOVERNANCE_DOWNGRADE);
+    }
+
     let req_pol = require_charter_function_auth(&SEL_SET_POLICY)?;
     let action_hash = compute_set_policy_hash(&target_hps, &policy_id, raw_spec);
-    let me = context::self_address();
     verify_and_consume_auth(&registry, &super_auth, &me, &req_pol, &action_hash, &caller)?;
 
     store_policy(&target_hps, &policy_id, raw_spec, &spec);
@@ -1871,6 +1954,11 @@ fn handle_grant_role(args: &CalldataReader) -> Result<(), i32> {
     if role_id == [0u8; 32] || account == [0u8; 20] {
         return Err(-59);
     }
+    // Constitutional Organs Guard: `ROLE_DIRECTOR` requires Shareholder `addDirector` + `consentToDirectorship`,
+    // and `ROLE_SHAREHOLDER` reflects actual share ownership (never Board `grantRole`)!
+    if role_id == ROLE_DIRECTOR || role_id == ROLE_SHAREHOLDER {
+        return Err(ERR_RESERVED_GOVERNANCE_ROLE);
+    }
     if !is_role_defined(&role_id) {
         return Err(ERR_ROLE_NOT_DEFINED);
     }
@@ -1903,6 +1991,9 @@ fn handle_revoke_role(args: &CalldataReader) -> Result<(), i32> {
     let board_auth = args.address(2).ok_or(-3)?;
     if role_id == [0u8; 32] || account == [0u8; 20] {
         return Err(-59);
+    }
+    if role_id == ROLE_DIRECTOR || role_id == ROLE_SHAREHOLDER {
+        return Err(ERR_RESERVED_GOVERNANCE_ROLE);
     }
     if !is_role_defined(&role_id) {
         return Err(ERR_ROLE_NOT_DEFINED);
@@ -1993,9 +2084,14 @@ fn handle_register_share_class(args: &CalldataReader) -> Result<(), i32> {
     let conversion_denom = args.u64(3).ok_or(-3)?;
     let super_auth = args.address(4).ok_or(-3)?;
 
-    if share_ledger == [0u8; 20] || conversion_numer == 0 || conversion_denom == 0 {
+    if share_ledger == [0u8; 20]
+        || votes_per_share == 0
+        || conversion_numer == 0
+        || conversion_denom == 0
+    {
         return Err(-59);
     }
+    verify_subroutine_pinned_to_self(&share_ledger)?;
 
     let mut classes = [ShareClassSpec::empty(); MAX_SHARE_CLASSES];
     let count = load_share_classes(&mut classes);
@@ -2009,25 +2105,17 @@ fn handle_register_share_class(args: &CalldataReader) -> Result<(), i32> {
         i += 1;
     }
 
+    let existing_eq_mod = storage::get_address(KEY_EQ_SETTLEMENT_MOD).unwrap_or([0u8; 20]);
     if super_auth == [0u8; 20]
         && existing_idx.is_none()
+        && existing_eq_mod == [0u8; 20]
         && !is_fn_auth_explicit(&[0u8; 20], &SEL_REGISTER_SHARE_CLASS)
     {
-        // Founder/director initial share-class registration (permitted during PENDING_RATIFICATION
-        // when shareClassesBlob was omitted, or post-activation when adding a bootstrap class)
+        // Initial founder bootstrap registration ONLY before `ShareCapital` (`CAP_EQUITY_SETTLEMENT`) is bound
+        // and ONLY by the Charter initializer (never by a non-founder director!).
         let (_registry, caller) = ensure_initialized_any_state_caller()?;
-        let mut dirs = [[0u8; 20]; MAX_MEMBERS_PER_STAGE];
-        let dcount = load_directors(&mut dirs);
-        let mut is_dir = false;
-        let mut d = 0;
-        while d < dcount {
-            if dirs[d] == caller {
-                is_dir = true;
-                break;
-            }
-            d += 1;
-        }
-        if !is_dir && dcount > 0 {
+        let init_by = storage::get_address(KEY_INITIALIZER).unwrap_or([0u8; 20]);
+        if caller != init_by {
             return Err(-61);
         }
     } else {
@@ -2223,22 +2311,32 @@ fn handle_validate_capital_process_auth(args: &CalldataReader) -> Result<(), i32
     }
 
     // For Equity Financing (`POLICY_SHARE_ISSUANCE_AUCTION` with `isEquityFinancing == 1`),
-    // constitutionally enforce `subscribedAtOrAboveOffer >= targetShares`!
+    // constitutionally enforce `subscribedAtOrAboveOffer >= targetShares` AND verify `preMoneyCommon`
+    // matches live company `convertedCommonTotals` (preventing concurrent/stale-snapshot double dilution)!
     if pid == POLICY_SHARE_ISSUANCE_AUCTION {
         let eq_cd = CallEncoder::<16>::new(const { selector("equityFinancingTerms()") });
         if let Ok(eq_raw) = call::call_raw(&auth_obj, eq_cd.as_slice()) {
             if eq_raw.len() >= 9 * 32 {
                 let mut w_flag = [0u8; 8];
+                let mut w_pre = [0u8; 8];
                 let mut w_tgt = [0u8; 8];
                 let mut w_sub = [0u8; 8];
                 w_flag.copy_from_slice(&eq_raw[24..32]);
+                w_pre.copy_from_slice(&eq_raw[7 * 32 + 24..8 * 32]);
                 w_tgt.copy_from_slice(&eq_raw[5 * 32 + 24..6 * 32]);
                 w_sub.copy_from_slice(&eq_raw[8 * 32 + 24..9 * 32]);
                 let is_eqf = u64::from_be_bytes(w_flag);
+                let pre_snap = u64::from_be_bytes(w_pre);
                 let tgt_sh = u64::from_be_bytes(w_tgt);
                 let sub_sh = u64::from_be_bytes(w_sub);
                 if is_eqf == 1 && (tgt_sh == 0 || sub_sh < tgt_sh) {
                     return Err(ERR_NO_BIDS_IN_STAGE);
+                }
+                if is_eqf == 1 && pre_snap > 0 {
+                    let (_, live_total_common) = compute_converted_common_totals(&[0u8; 20]);
+                    if live_total_common > 0 && live_total_common != pre_snap {
+                        return Err(ERR_STALE_CAPITAL_SNAPSHOT);
+                    }
                 }
             }
         }
@@ -2288,6 +2386,12 @@ fn handle_sign_sha_direct(args: &CalldataReader) -> Result<(), i32> {
     if sha_hash != expected {
         return Err(ERR_SHA_SIGNATURE_REQUIRED);
     }
+    // Only actual shareholders holding > 0 shares may self-record SHA directly on `CorporateCharter`
+    // (new investors in Step 5 record SHA atomically via `ShareCapital.signShareholdersAgreementAndClaimShares`)!
+    let (holder_common, _) = compute_converted_common_totals(&caller);
+    if holder_common == 0 {
+        return Err(ERR_NOT_EXISTING_SHAREHOLDER);
+    }
     storage::set_u64(sha_signed_charter_key(&caller).as_slice(), 1);
     if is_role_defined(&ROLE_SHAREHOLDER)
         && storage::get_u64(role_has_key(&ROLE_SHAREHOLDER, &caller).as_slice()) == 0
@@ -2295,6 +2399,75 @@ fn handle_sign_sha_direct(args: &CalldataReader) -> Result<(), i32> {
         let _ = grant_role_internal(&ROLE_SHAREHOLDER, &caller);
     }
     ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_treasury_account(_args: &CalldataReader) -> Result<(), i32> {
+    let tr = storage::get_address(KEY_TREASURY)
+        .or_else(|| storage::get_address(KEY_INITIALIZER))
+        .unwrap_or([0u8; 20]);
+    ret::write_address(&tr);
+    Ok(())
+}
+
+fn handle_set_treasury_account(args: &CalldataReader) -> Result<(), i32> {
+    let (registry, caller) = ensure_initialized_and_valid_caller()?;
+    let new_treasury = args.address(0).ok_or(-3)?;
+    let super_auth = args.address(1).ok_or(-3)?;
+    require_valid_identity(&registry, &new_treasury)?;
+
+    let req_pol = require_charter_function_auth(&SEL_SET_TREASURY)?;
+    let action_hash = compute_set_treasury_hash(&new_treasury);
+    let me = context::self_address();
+    verify_and_consume_auth(&registry, &super_auth, &me, &req_pol, &action_hash, &caller)?;
+
+    storage::set_address(KEY_TREASURY, &new_treasury);
+    events::emit(
+        &[
+            TREASURY_UPDATED,
+            addr_topic(&new_treasury),
+            addr_topic(&super_auth),
+        ],
+        &[],
+    );
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_hash_set_treasury_account(args: &CalldataReader) -> Result<(), i32> {
+    let new_treasury = args.address(0).ok_or(-3)?;
+    ret::write_word(&compute_set_treasury_hash(&new_treasury));
+    Ok(())
+}
+
+fn handle_equity_settlement_module(_args: &CalldataReader) -> Result<(), i32> {
+    if storage::get_u64(KEY_INIT) != 1 || storage::get_u64(KEY_STATE) != CHARTER_STATE_ACTIVE {
+        ret::write_address(&[0u8; 20]);
+        return Ok(());
+    }
+    let m = storage::get_address(KEY_EQ_SETTLEMENT_MOD).unwrap_or([0u8; 20]);
+    let ok = m != [0u8; 20] && storage::get_u64(module_auth_key(&m, &CAP_EQUITY_SETTLEMENT).as_slice()) == 1;
+    ret::write_address(if ok { &m } else { &[0u8; 20] });
+    Ok(())
+}
+
+fn handle_get_share_class_by_ledger(args: &CalldataReader) -> Result<(), i32> {
+    let ledger = args.address(0).ok_or(-3)?;
+    let mut classes = [ShareClassSpec::empty(); MAX_SHARE_CLASSES];
+    let count = load_share_classes(&mut classes);
+    let mut out = [0u8; 128];
+    let mut i = 0;
+    while i < count {
+        if classes[i].ledger == ledger {
+            out[31] = 1;
+            out[56..64].copy_from_slice(&classes[i].votes_per_share.to_be_bytes());
+            out[88..96].copy_from_slice(&classes[i].conversion_numer.to_be_bytes());
+            out[120..128].copy_from_slice(&classes[i].conversion_denom.to_be_bytes());
+            break;
+        }
+        i += 1;
+    }
+    ret::write(&out);
     Ok(())
 }
 
@@ -2328,6 +2501,7 @@ fn handle_module_ensure_share_class(args: &CalldataReader) -> Result<(), i32> {
     {
         return Err(-59);
     }
+    verify_subroutine_pinned_to_self(&share_ledger)?;
 
     let mut classes = [ShareClassSpec::empty(); MAX_SHARE_CLASSES];
     let count = load_share_classes(&mut classes);
@@ -2560,6 +2734,10 @@ mod tests {
             }
             if sel == const { selector("totalOutstanding()") } {
                 ret::write_u64_word(storage::get_u64(b"supply"));
+                return 0;
+            }
+            if sel == const { selector("associatedCharter()") } {
+                ret::write_address(&storage::get_address(b"charter").unwrap_or([0u8; 20]));
                 return 0;
             }
             -2
@@ -2854,5 +3032,290 @@ mod tests {
             .push_bytes4(&sel_prod_set_price);
         assert_eq!(dispatch_calldata(q_fn.as_slice()), 0);
         assert_eq!(mock::take_return_data(), pol_dual_pm_cfo);
+    }
+
+    #[test]
+    fn security_audit_blocks_zero_auth_takeovers_board_role_escalation_and_downgrades() {
+        mock::reset();
+        let charter_addr = [0xC1; 20];
+        let reg_addr = [0xB0; 20];
+        let share_capital_hps = [0x5C; 20];
+        let fake_module = [0x66; 20];
+        let common_ledger = [0x51; 20];
+        let fake_ledger = [0x59; 20];
+        let founder = [0x01; 20];
+        let rogue_dir = [0x02; 20];
+        let stranger = [0x09; 20];
+        let treasury_id = [0x07; 20];
+
+        mock::register_hps(reg_addr, reg_stub::dispatch);
+        mock::register_hps(common_ledger, share_stub::dispatch);
+        mock::register_hps(fake_ledger, share_stub::dispatch);
+        mock::register_hps(share_capital_hps, share_stub::dispatch);
+        mock::register_hps(fake_module, share_stub::dispatch);
+
+        mock::set_self_address(common_ledger);
+        storage::set_address(b"charter", &charter_addr);
+        storage::set_u64(&founder, 80_000);
+        storage::set_u64(&rogue_dir, 20_000);
+        storage::set_u64(b"supply", 100_000);
+
+        mock::set_self_address(share_capital_hps);
+        storage::set_address(b"charter", &charter_addr);
+
+        let mut roles_blob = Vec::new();
+        roles_blob.extend_from_slice(&2u16.to_be_bytes());
+        for (rid, members) in [
+            (ROLE_SHAREHOLDER, &[][..]),
+            (ROLE_DIRECTOR, &[founder, rogue_dir][..]),
+        ] {
+            roles_blob.extend_from_slice(&rid);
+            roles_blob.extend_from_slice(&(members.len() as u16).to_be_bytes());
+            for m in members {
+                roles_blob.extend_from_slice(m);
+            }
+        }
+
+        let pol_super = PolicySpec::new(100)
+            .add_stage(
+                StageSpec::new(7_500, 50)
+                    .add_role(ROLE_SHAREHOLDER, 1)
+                    .unwrap(),
+            )
+            .unwrap();
+        let pol_board = PolicySpec::new(100)
+            .add_stage(
+                StageSpec::new(2, 50)
+                    .add_member(founder, 1)
+                    .unwrap()
+                    .add_member(rogue_dir, 1)
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut policies_blob = Vec::new();
+        policies_blob.extend_from_slice(&3u16.to_be_bytes());
+        for (pid, spec) in [
+            (POLICY_SUPER_GOVERNANCE, &pol_super),
+            (POLICY_FIRST_SHAREHOLDER_RESOLUTION, &pol_super),
+            (POLICY_BOARD_RESOLUTION, &pol_board),
+        ] {
+            let mut sb = [0u8; 512];
+            let slen = spec.encode(&mut sb).unwrap();
+            policies_blob.extend_from_slice(&[0u8; 20]);
+            policies_blob.extend_from_slice(&pid);
+            policies_blob.extend_from_slice(&(slen as u16).to_be_bytes());
+            policies_blob.extend_from_slice(&sb[..slen]);
+        }
+
+        let mut sc_blob = Vec::new();
+        sc_blob.extend_from_slice(&1u16.to_be_bytes());
+        sc_blob.extend_from_slice(
+            &ShareClassSpec {
+                ledger: common_ledger,
+                votes_per_share: 1,
+                conversion_numer: 1,
+                conversion_denom: 1,
+            }
+            .encode(),
+        );
+        let mut mod_blob = Vec::new();
+        mod_blob.extend_from_slice(&1u16.to_be_bytes());
+        mod_blob.extend_from_slice(
+            &AuthorizedModuleSpec {
+                module_hps: share_capital_hps,
+                capability: CAP_EQUITY_SETTLEMENT,
+            }
+            .encode(),
+        );
+
+        mock::set_self_address(charter_addr);
+        mock::set_sender(founder);
+        let mut init_cd = Vec::new();
+        init_cd.extend_from_slice(&selector(
+            "initializeWithGovernance(address,bytes,bytes,bytes,bytes,bytes)",
+        ));
+        let blobs: [&[u8]; 5] = [&roles_blob, &policies_blob, &[], &sc_blob, &mod_blob];
+        let mut head = [0u8; 6 * 32];
+        head[12..32].copy_from_slice(&reg_addr);
+        let mut tail = Vec::new();
+        for (i, b) in blobs.iter().enumerate() {
+            let off = 6 * 32 + tail.len();
+            head[(i + 1) * 32 + 24..(i + 2) * 32].copy_from_slice(&(off as u64).to_be_bytes());
+            let mut len_w = [0u8; 32];
+            len_w[24..32].copy_from_slice(&(b.len() as u64).to_be_bytes());
+            tail.extend_from_slice(&len_w);
+            let pad_len = (b.len() + 31) & !31;
+            let start = tail.len();
+            tail.resize(start + pad_len, 0);
+            tail[start..start + b.len()].copy_from_slice(b);
+        }
+        init_cd.extend_from_slice(&head);
+        init_cd.extend_from_slice(&tail);
+        assert_eq!(dispatch_calldata(&init_cd), 0);
+
+        mock::set_sender(rogue_dir);
+        assert_eq!(dispatch_calldata(&selector("consentToDirectorship()")), 0);
+        assert_eq!(dispatch_calldata(&selector("hashActivateCharter()")), 0);
+        let act_hash: [u8; 32] = mock::take_return_data().try_into().unwrap();
+        let auth_act = [0xA0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        mock::register_hps(auth_act, auth_stub::dispatch);
+        mock::set_self_address(auth_act);
+        storage::set_address(b"target", &charter_addr);
+        storage::set(b"pol", &POLICY_FIRST_SHAREHOLDER_RESOLUTION);
+        storage::set(b"hash", &act_hash);
+        mock::set_self_address(charter_addr);
+        mock::set_sender(founder);
+        assert_eq!(
+            dispatch_calldata(
+                CallEncoder::<64>::new(SEL_ACTIVATE_CHARTER)
+                    .push_address(&auth_act)
+                    .as_slice()
+            ),
+            0
+        );
+
+        // 1. CRITICAL-02: Rogue director attempting zero-auth `registerShareClass(..., 0x0)` or `authorizeModule(..., 0x0)` MUST REVERT!
+        mock::set_sender(rogue_dir);
+        let zero_reg_sc = CallEncoder::<192>::new(SEL_REGISTER_SHARE_CLASS)
+            .push_address(&fake_ledger)
+            .push_u64(1_000_000)
+            .push_u64(1_000_000)
+            .push_u64(1)
+            .push_address(&[0u8; 20]);
+        assert!(dispatch_calldata(zero_reg_sc.as_slice()) < 0);
+
+        let zero_auth_mod = CallEncoder::<160>::new(SEL_AUTHORIZE_MODULE)
+            .push_address(&fake_module)
+            .push_bytes32(&CAP_EQUITY_SETTLEMENT)
+            .push_bool(true)
+            .push_address(&[0u8; 20]);
+        assert!(dispatch_calldata(zero_auth_mod.as_slice()) < 0);
+
+        // 2. HIGH-08: Board attempting to grant `ROLE_DIRECTOR` or `ROLE_SHAREHOLDER` via `grantRole` MUST REVERT (-103)!
+        let grant_dir = CallEncoder::<128>::new(SEL_GRANT_ROLE)
+            .push_bytes32(&ROLE_DIRECTOR)
+            .push_address(&stranger)
+            .push_address(&[0xA0; 20]);
+        assert_eq!(
+            dispatch_calldata(grant_dir.as_slice()),
+            ERR_RESERVED_GOVERNANCE_ROLE
+        );
+        let grant_sh = CallEncoder::<128>::new(SEL_GRANT_ROLE)
+            .push_bytes32(&ROLE_SHAREHOLDER)
+            .push_address(&stranger)
+            .push_address(&[0xA0; 20]);
+        assert_eq!(
+            dispatch_calldata(grant_sh.as_slice()),
+            ERR_RESERVED_GOVERNANCE_ROLE
+        );
+
+        // 3. HIGH-08: Zero-share stranger attempting `signShareholdersAgreement` MUST REVERT (-75)!
+        mock::set_sender(stranger);
+        let sha_hash = hps_sdk::governance::compute_sha_doc_hash(&charter_addr);
+        let sign_sha = CallEncoder::<64>::new(selector("signShareholdersAgreement(bytes32)"))
+            .push_bytes32(&sha_hash);
+        assert_eq!(
+            dispatch_calldata(sign_sha.as_slice()),
+            ERR_NOT_EXISTING_SHAREHOLDER
+        );
+
+        // 4. HIGH-08: Attempting to downgrade constitutional `SEL_ADD_DIRECTOR` to `POLICY_BOARD_RESOLUTION` MUST REVERT (-108)!
+        mock::set_sender(founder);
+        let downgrade_cd = CallEncoder::<160>::new(SEL_SET_FUNCTION_AUTH)
+            .push_address(&charter_addr)
+            .push_bytes4(&SEL_ADD_DIRECTOR)
+            .push_bytes32(&POLICY_BOARD_RESOLUTION)
+            .push_address(&[0xA0; 20]);
+        assert_eq!(
+            dispatch_calldata(downgrade_cd.as_slice()),
+            ERR_GOVERNANCE_DOWNGRADE
+        );
+
+        // 5. Governed `setTreasuryAccount` updates `treasuryAccount()` cleanly!
+        let h_tr_cd = CallEncoder::<64>::new(selector("hashSetTreasuryAccount(address)"))
+            .push_address(&treasury_id);
+        assert_eq!(dispatch_calldata(h_tr_cd.as_slice()), 0);
+        let tr_hash: [u8; 32] = mock::take_return_data().try_into().unwrap();
+        let auth_tr = [0xA0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        mock::register_hps(auth_tr, auth_stub::dispatch);
+        mock::set_self_address(auth_tr);
+        storage::set_address(b"target", &charter_addr);
+        storage::set(b"pol", &POLICY_SUPER_GOVERNANCE);
+        storage::set(b"hash", &tr_hash);
+
+        mock::set_self_address(charter_addr);
+        let set_tr_cd = CallEncoder::<96>::new(SEL_SET_TREASURY)
+            .push_address(&treasury_id)
+            .push_address(&auth_tr);
+        assert_eq!(dispatch_calldata(set_tr_cd.as_slice()), 0);
+        assert_eq!(dispatch_calldata(&selector("treasuryAccount()")), 0);
+        assert_eq!(&mock::take_return_data()[12..32], &treasury_id);
+
+        // 6. HIGH-11: `validateCapitalProcessAuth` checks 9-word `equityFinancingTerms` word 7 (`preMoneyCommon`):
+        //    succeeds when `preMoneyCommon == 100_000` (even when `maxOwnershipBps == 2_000`), and reverts with
+        //    `ERR_STALE_CAPITAL_SNAPSHOT (-106)` when `preMoneyCommon != 100_000`!
+        let auth_eq_ok = [0xA0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3];
+        let auth_eq_stale = [0xA0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4];
+        for (a, pre_snap) in [(auth_eq_ok, 100_000u64), (auth_eq_stale, 80_000u64)] {
+            mock::register_hps(a, |raw| {
+                let Some((sel, _)) = CalldataReader::parse(raw) else { return -1; };
+                if sel == const { selector("charter()") } {
+                    ret::write_address(&[0xC1; 20]);
+                    return 0;
+                }
+                if sel == const { selector("policyId()") } {
+                    ret::write_word(&POLICY_SHARE_ISSUANCE_AUCTION);
+                    return 0;
+                }
+                if sel == const { selector("hasFailedBidsStage()") } {
+                    ret::write_bool(false);
+                    return 0;
+                }
+                if sel == const { selector("activeStep1BidCount()") } {
+                    ret::write_u64_word(2);
+                    return 0;
+                }
+                if sel == const { selector("isReadyToConsume()") } {
+                    ret::write_bool(true);
+                    return 0;
+                }
+                if sel == const { selector("equityFinancingTerms()") } {
+                    let mut out = [0u8; 9 * 32];
+                    out[24..32].copy_from_slice(&1u64.to_be_bytes()); // [0] isEquityFinancing
+                    out[32 + 24..64].copy_from_slice(&3u64.to_be_bytes()); // [1] classCode
+                    out[2 * 32 + 24..3 * 32].copy_from_slice(&1u64.to_be_bytes()); // [2] convRate
+                    out[3 * 32 + 24..4 * 32].copy_from_slice(&1_000_000u64.to_be_bytes()); // [3] minRaise
+                    out[4 * 32 + 24..5 * 32].copy_from_slice(&2_000u64.to_be_bytes()); // [4] maxOwnershipBps
+                    out[5 * 32 + 24..6 * 32].copy_from_slice(&25_000u64.to_be_bytes()); // [5] targetShares
+                    out[6 * 32 + 24..7 * 32].copy_from_slice(&40u64.to_be_bytes()); // [6] offerPrice
+                    out[7 * 32 + 24..8 * 32]
+                        .copy_from_slice(&storage::get_u64(b"pre_snap").to_be_bytes()); // [7] preMoneyCommon
+                    out[8 * 32 + 24..9 * 32].copy_from_slice(&40_000u64.to_be_bytes()); // [8] subscribedAtOrAboveOffer
+                    ret::write(&out);
+                    return 0;
+                }
+                -2
+            });
+            mock::set_self_address(a);
+            storage::set_u64(b"pre_snap", pre_snap);
+        }
+        mock::set_self_address(charter_addr);
+        let val_sel = selector("validateCapitalProcessAuth(address)");
+        assert_eq!(
+            dispatch_calldata(
+                CallEncoder::<64>::new(val_sel)
+                    .push_address(&auth_eq_ok)
+                    .as_slice()
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch_calldata(
+                CallEncoder::<64>::new(val_sel)
+                    .push_address(&auth_eq_stale)
+                    .as_slice()
+            ),
+            ERR_STALE_CAPITAL_SNAPSHOT
+        );
     }
 }

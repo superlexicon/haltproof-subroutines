@@ -21,14 +21,16 @@ use hps_sdk::abi::CalldataReader;
 use hps_sdk::call::{self, CallEncoder};
 use hps_sdk::governance::{
     compute_esop_exercise_letter_hash, compute_sha_doc_hash, query_charter_function_auth,
-    require_active_charter, require_valid_identity, validate_charter_capital_auth,
+    query_charter_share_class_spec, query_charter_treasury, require_active_charter,
+    require_valid_authorization_hps, require_valid_identity, validate_charter_capital_auth,
     verify_and_consume_auth, verify_and_consume_issuance_auction_auth, ActionHasher, AuctionBook,
     ACTION_AUTHORIZE_FUTURES_UNDERWRITING, ACTION_AWARD_ESOP_OPTIONS, ACTION_CREATE_ESOP_PROGRAM,
     ACTION_EXECUTE_REVERSE_SPLIT, ACTION_EXECUTE_SHARE_BUYBACK, ACTION_EXECUTE_SHARE_SPLIT,
     ACTION_SET_SHARE_ESCROW, ERR_ALREADY_EXECUTED_IN_BLOCK, ERR_CHARTER_MISMATCH,
-    ERR_ESOP_CLIFF_NOT_PASSED, ERR_ESOP_POOL_EXCEEDED, ERR_FUTURES_CAP_EXCEEDED,
-    ERR_INVALID_FUTURES_CONFIG, ERR_NO_BIDS_IN_STAGE, ERR_POLICY_INVALID,
-    ERR_SHA_SIGNATURE_REQUIRED, MAX_AUCTION_ORDERS, MAX_ENCODED_AUCTION_BOOK_BYTES,
+    ERR_ESOP_CLIFF_NOT_PASSED, ERR_ESOP_POOL_EXCEEDED, ERR_FUTURES_BACKING_LOCKED,
+    ERR_FUTURES_CAP_EXCEEDED, ERR_INVALID_FUTURES_CONFIG, ERR_NO_BIDS_IN_STAGE,
+    ERR_POLICY_INVALID, ERR_SELLER_CONSENT_REQUIRED, ERR_SHA_SIGNATURE_REQUIRED,
+    ERR_STALE_CAPITAL_SNAPSHOT, MAX_AUCTION_ORDERS, MAX_ENCODED_AUCTION_BOOK_BYTES,
     ORDER_SIDE_BUY_STEP1, ORDER_SIDE_BUY_STEP3, POLICY_BOARD_RESOLUTION,
     POLICY_SHAREHOLDER_SUPERMAJORITY, POLICY_SHARE_ISSUANCE_AUCTION, POLICY_SUPER_GOVERNANCE,
 };
@@ -69,6 +71,16 @@ const ISSUANCE_SHARES_CLAIMED: [u8; 32] =
 const SEL_SET_SHARE_ESCROW: [u8; 4] = selector("setShareEscrowAccount(address,address,address)");
 const SEL_AUTHORIZE_FUTURES: [u8; 4] =
     selector("authorizeFuturesUnderwriting(address,uint64,address)");
+const SEL_EXECUTE_SHARE_BUYBACK: [u8; 4] =
+    selector("executeShareBuyback(address,address,uint64,uint64,address)");
+const SEL_EXECUTE_SHARE_SPLIT: [u8; 4] =
+    selector("executeShareSplit(address,uint64,address)");
+const SEL_EXECUTE_REVERSE_SPLIT: [u8; 4] =
+    selector("executeReverseShareSplit(address,uint64,address)");
+const SEL_CREATE_ESOP_PROGRAM: [u8; 4] =
+    selector("createEsopProgram(address,address,uint64,uint64,uint64,uint64,address)");
+const SEL_AWARD_ESOP_OPTIONS: [u8; 4] =
+    selector("awardEmployeeOptions(uint64,address,uint64,uint64,bytes,address)");
 
 const KEY_INIT: &[u8] = b"shc:init";
 const KEY_REGISTRY: &[u8] = b"shc:reg";
@@ -108,8 +120,11 @@ hps_entry! {
     "cancelBuyOrder(address,uint64)"                                            => handle_cancel_buy_order,
     "placeSellOrder(address,uint64,uint64)"                                     => handle_place_sell_order,
     "settleShareTransferAuction(address,address)"                               => handle_settle_share_transfer_auction,
+    "settleShareTransferAuction(address)"                                       => handle_settle_share_transfer_auction_1,
     "settleShareIssuance(address,address)"                                      => handle_settle_share_issuance,
+    "settleShareIssuance(address)"                                              => handle_settle_share_issuance_1,
     "determineIssuanceAllocation(address,address)"                              => handle_determine_issuance_allocation,
+    "determineIssuanceAllocation(address)"                                      => handle_determine_issuance_allocation_1,
     "signShareholdersAgreementAndClaimShares(address,bytes32)"                  => handle_sign_sha_and_claim_shares,
     "issuanceAllocationSummary(address)"                                        => handle_issuance_allocation_summary,
     "getIssuanceAllotment(address,uint64)"                                      => handle_get_issuance_allotment,
@@ -244,6 +259,7 @@ fn handle_initialize(args: &CalldataReader) -> Result<(), i32> {
     require_valid_identity(&registry, &caller)?;
     if share_escrow_acct != [0u8; 20] {
         require_valid_identity(&registry, &share_escrow_acct)?;
+        verify_ledger_pinned_to_charter(&bank_ledger, &charter)?;
         storage::set_address(KEY_BANK_LEDGER, &bank_ledger);
         storage::set_address(KEY_SHARE_ESCROW_ACCT, &share_escrow_acct);
     }
@@ -276,6 +292,7 @@ fn handle_set_share_escrow_account(args: &CalldataReader) -> Result<(), i32> {
         return Err(-59);
     }
     require_valid_identity(&registry, &share_escrow_acct)?;
+    verify_ledger_pinned_to_charter(&bank_ledger, &charter)?;
 
     let me = context::self_address();
     let explicit_pol = query_charter_function_auth(&charter, &me, &SEL_SET_SHARE_ESCROW);
@@ -332,8 +349,78 @@ fn handle_share_escrow_account(_args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
+fn resolve_treasury_recipient(charter: &[u8; 20]) -> Option<[u8; 20]> {
+    query_charter_treasury(charter)
+        .or_else(|| storage::get_address(KEY_INITIALIZER))
+        .or_else(|| storage::get_address(KEY_SHARE_ESCROW_ACCT))
+}
+
+/// Verify that `auth_obj` is an approved `Authorization` HPS in `IdentityRegistry`, bound to
+/// `charter`, and return its authoritative `targetHps()` (verified pinned to `charter`)!
+fn verify_charter_auth_and_get_target(
+    registry: &[u8; 20],
+    charter: &[u8; 20],
+    auth_obj: &[u8; 20],
+) -> Result<[u8; 20], i32> {
+    require_valid_authorization_hps(registry, auth_obj)?;
+    let chr_cd = CallEncoder::<16>::new(const { selector("charter()") });
+    let raw_chr = call::call_raw(auth_obj, chr_cd.as_slice()).map_err(|_| ERR_CHARTER_MISMATCH)?;
+    if raw_chr.len() < 32 || &raw_chr[12..32] != charter {
+        return Err(ERR_CHARTER_MISMATCH);
+    }
+    let tgt_cd = CallEncoder::<16>::new(const { selector("targetHps()") });
+    let raw_tgt = call::call_raw(auth_obj, tgt_cd.as_slice())?;
+    if raw_tgt.len() < 32 {
+        return Err(-62);
+    }
+    let mut target_hps = [0u8; 20];
+    target_hps.copy_from_slice(&raw_tgt[12..32]);
+    if target_hps == [0u8; 20] {
+        return Err(-62);
+    }
+    verify_ledger_pinned_to_charter(&target_hps, charter)?;
+    Ok(target_hps)
+}
+
+/// Enforce that debiting `debit_shares` on `share_ledger` from `shareholder` will not drop their
+/// remaining converted common shares below what is required to back any open underwritten futures!
+fn ensure_futures_backed_after_debit(
+    charter: &[u8; 20],
+    share_ledger: &[u8; 20],
+    shareholder: &[u8; 20],
+    debit_shares: u64,
+) -> Result<(), i32> {
+    let Some(futures_ledger) = storage::get_address(KEY_FUTURES_LEDGER) else {
+        return Ok(());
+    };
+    let already_uw = storage::get_u64(futures_underwritten_key(&futures_ledger, shareholder).as_slice());
+    if already_uw == 0 {
+        return Ok(());
+    }
+    let pct = storage::get_u64(KEY_FUTURES_PCT);
+    if pct == 0 {
+        return Err(ERR_FUTURES_BACKING_LOCKED);
+    }
+    let (holder_common, _) = query_converted_common_totals(charter, shareholder)?;
+    let debit_common = if let Some((_, num, den)) = query_charter_share_class_spec(charter, share_ledger) {
+        if den == 0 {
+            debit_shares
+        } else {
+            (((debit_shares as u128) * (num as u128) + (den as u128 - 1)) / (den as u128)) as u64
+        }
+    } else {
+        debit_shares
+    };
+    let rem_common = holder_common.saturating_sub(debit_common);
+    if apply_futures_pct(rem_common, pct) < already_uw {
+        return Err(ERR_FUTURES_BACKING_LOCKED);
+    }
+    Ok(())
+}
+
 fn handle_treasury_recipient(_args: &CalldataReader) -> Result<(), i32> {
-    ret::write_address(&storage::get_address(KEY_INITIALIZER).unwrap_or([0u8; 20]));
+    let charter = storage::get_address(KEY_CHARTER).unwrap_or([0u8; 20]);
+    ret::write_address(&resolve_treasury_recipient(&charter).unwrap_or([0u8; 20]));
     Ok(())
 }
 
@@ -562,13 +649,14 @@ fn handle_futures_allowance_of(args: &CalldataReader) -> Result<(), i32> {
 /// (`authObj`), escrowing `price * quantity` into `ShareCapital`'s dedicated **`shareEscrowAccount`**
 /// (segregated from corporate operating revenue).
 fn handle_place_buy_order(args: &CalldataReader) -> Result<(), i32> {
-    let (_registry, _charter, buyer) = ensure_active_and_valid_caller()?;
+    let (registry, charter, buyer) = ensure_active_and_valid_caller()?;
     let auth_obj = args.address(0).ok_or(-3)?;
     let price = args.u64(1).ok_or(-3)?;
     let quantity = args.u64(2).ok_or(-3)?;
     if price == 0 || quantity == 0 {
         return Err(-14);
     }
+    let _ = verify_charter_auth_and_get_target(&registry, &charter, &auth_obj)?;
     let escrow_cash = price.checked_mul(quantity).ok_or(-15)?;
 
     let bank_ledger = storage::get_address(KEY_BANK_LEDGER).ok_or(-63)?;
@@ -617,9 +705,10 @@ fn handle_place_buy_order(args: &CalldataReader) -> Result<(), i32> {
 /// Cancel a previously placed buy order (`orderIndex`) in the same auction step and refund
 /// `price * quantity` from **`shareEscrowAccount`** back to `buyer`.
 fn handle_cancel_buy_order(args: &CalldataReader) -> Result<(), i32> {
-    let (_registry, _charter, buyer) = ensure_active_and_valid_caller()?;
+    let (registry, charter, buyer) = ensure_active_and_valid_caller()?;
     let auth_obj = args.address(0).ok_or(-3)?;
     let order_index = args.u64(1).ok_or(-3)?;
+    let _ = verify_charter_auth_and_get_target(&registry, &charter, &auth_obj)?;
 
     let bank_ledger = storage::get_address(KEY_BANK_LEDGER).ok_or(-63)?;
     let escrow_acct = storage::get_address(KEY_SHARE_ESCROW_ACCT).ok_or(-63)?;
@@ -674,10 +763,12 @@ fn handle_cancel_buy_order(args: &CalldataReader) -> Result<(), i32> {
 }
 
 fn handle_place_sell_order(args: &CalldataReader) -> Result<(), i32> {
-    let (_registry, _charter, seller) = ensure_active_and_valid_caller()?;
+    let (registry, charter, seller) = ensure_active_and_valid_caller()?;
     let auth_obj = args.address(0).ok_or(-3)?;
     let price = args.u64(1).ok_or(-3)?;
     let quantity = args.u64(2).ok_or(-3)?;
+    let target_ledger = verify_charter_auth_and_get_target(&registry, &charter, &auth_obj)?;
+    ensure_futures_backed_after_debit(&charter, &target_ledger, &seller, quantity)?;
 
     let order_cd =
         CallEncoder::<128>::new(const { selector("placeSellOrderFor(address,uint64,uint64)") })
@@ -689,18 +780,38 @@ fn handle_place_sell_order(args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
-fn handle_settle_share_transfer_auction(args: &CalldataReader) -> Result<(), i32> {
-    let (_registry, charter, _caller) = ensure_active_and_valid_caller()?;
-    let share_ledger = args.address(0).ok_or(-3)?;
-    let auth_obj = args.address(1).ok_or(-3)?;
-
-    validate_charter_capital_auth(&charter, &auth_obj)?;
+fn execute_settle_share_transfer_inner(
+    registry: &[u8; 20],
+    charter: &[u8; 20],
+    expected_ledger_opt: Option<[u8; 20]>,
+    auth_obj: &[u8; 20],
+) -> Result<(), i32> {
+    let target_ledger = verify_charter_auth_and_get_target(registry, charter, auth_obj)?;
+    if let Some(exp) = expected_ledger_opt {
+        if exp != [0u8; 20] && exp != target_ledger {
+            return Err(-62);
+        }
+    }
+    validate_charter_capital_auth(charter, auth_obj)?;
 
     let settle_cd = CallEncoder::<64>::new(const { selector("settleTransferAuction(address)") })
-        .push_address(&auth_obj);
-    let out = call::call_raw(&share_ledger, settle_cd.as_slice())?;
+        .push_address(auth_obj);
+    let out = call::call_raw(&target_ledger, settle_cd.as_slice())?;
     ret::write(out);
     Ok(())
+}
+
+fn handle_settle_share_transfer_auction(args: &CalldataReader) -> Result<(), i32> {
+    let (registry, charter, _caller) = ensure_active_and_valid_caller()?;
+    let share_ledger = args.address(0).ok_or(-3)?;
+    let auth_obj = args.address(1).ok_or(-3)?;
+    execute_settle_share_transfer_inner(&registry, &charter, Some(share_ledger), &auth_obj)
+}
+
+fn handle_settle_share_transfer_auction_1(args: &CalldataReader) -> Result<(), i32> {
+    let (registry, charter, _caller) = ensure_active_and_valid_caller()?;
+    let auth_obj = args.address(0).ok_or(-3)?;
+    execute_settle_share_transfer_inner(&registry, &charter, None, &auth_obj)
 }
 
 #[derive(Clone, Copy)]
@@ -848,8 +959,179 @@ fn compute_issuance_clearing_price(
     }
 }
 
-/// Pro-rata allocation with largest-remainder tie-breaking across `idxs[..count]` so total fills
-/// equal `min(sum_qty, cap)` without ever exceeding `cap` or any individual `ord.quantity`.
+/// Ownership-weighted water-filling pro-rata for oversubscribed Step 3 Shareholder ROFR orders
+/// (`rofr_qty > cap`): aggregates crossing ROFR demand per UNIQUE existing shareholder and allocates
+/// `cap` shares strictly proportional to each participating shareholder's pre-round company ownership
+/// (`convertedCommonTotals(charter, holder)`), capped at each shareholder's requested ROFR quantity!
+fn allocate_rofr_by_ownership(
+    charter: &[u8; 20],
+    book: &AuctionBook,
+    idxs: &[usize; MAX_AUCTION_ORDERS],
+    count: usize,
+    cap: u64,
+    fills: &mut [u64; MAX_AUCTION_ORDERS],
+) -> u64 {
+    if cap == 0 || count == 0 {
+        return 0;
+    }
+    let mut sum_qty = 0u64;
+    let mut k = 0usize;
+    while k < count {
+        sum_qty = sum_qty.saturating_add(book.orders[idxs[k]].quantity);
+        k += 1;
+    }
+    if sum_qty == 0 {
+        return 0;
+    }
+    if sum_qty <= cap {
+        k = 0;
+        while k < count {
+            let oi = idxs[k];
+            fills[oi] = book.orders[oi].quantity;
+            k += 1;
+        }
+        return sum_qty;
+    }
+
+    let mut holders = [[0u8; 20]; MAX_AUCTION_ORDERS];
+    let mut holder_req = [0u64; MAX_AUCTION_ORDERS];
+    let mut holder_own = [0u64; MAX_AUCTION_ORDERS];
+    let mut holder_max_px = [0u64; MAX_AUCTION_ORDERS];
+    let mut holder_alloc = [0u64; MAX_AUCTION_ORDERS];
+    let mut uncapped = [false; MAX_AUCTION_ORDERS];
+    let mut h_cnt = 0usize;
+
+    k = 0;
+    while k < count {
+        let ord = book.orders[idxs[k]];
+        let mut u = 0usize;
+        while u < h_cnt {
+            if holders[u] == ord.trader {
+                break;
+            }
+            u += 1;
+        }
+        if u == h_cnt {
+            let (conv, _) = query_converted_common_totals(charter, &ord.trader).unwrap_or((1, 1));
+            holders[u] = ord.trader;
+            holder_own[u] = conv.max(1);
+            uncapped[u] = true;
+            h_cnt += 1;
+        }
+        holder_req[u] = holder_req[u].saturating_add(ord.quantity);
+        if ord.price > holder_max_px[u] {
+            holder_max_px[u] = ord.price;
+        }
+        k += 1;
+    }
+
+    let mut rem_to_fill = cap;
+    loop {
+        let mut weight_sum = 0u128;
+        let mut u = 0usize;
+        while u < h_cnt {
+            if uncapped[u] {
+                weight_sum += holder_own[u] as u128;
+            }
+            u += 1;
+        }
+        if weight_sum == 0 || rem_to_fill == 0 {
+            break;
+        }
+
+        let mut any_capped = false;
+        u = 0;
+        while u < h_cnt {
+            if uncapped[u] {
+                let prov = ((rem_to_fill as u128) * (holder_own[u] as u128)) / weight_sum;
+                if prov >= (holder_req[u] as u128) {
+                    holder_alloc[u] = holder_req[u];
+                    rem_to_fill = rem_to_fill.saturating_sub(holder_req[u]);
+                    uncapped[u] = false;
+                    any_capped = true;
+                }
+            }
+            u += 1;
+        }
+
+        if !any_capped {
+            let mut allocated = 0u64;
+            let mut remainders = [0u128; MAX_AUCTION_ORDERS];
+            let mut used = [false; MAX_AUCTION_ORDERS];
+            u = 0;
+            while u < h_cnt {
+                if uncapped[u] {
+                    let num = (rem_to_fill as u128) * (holder_own[u] as u128);
+                    let base = (num / weight_sum) as u64;
+                    holder_alloc[u] = base;
+                    remainders[u] = num % weight_sum;
+                    allocated = allocated.saturating_add(base);
+                }
+                u += 1;
+            }
+            let mut rem = rem_to_fill.saturating_sub(allocated);
+            while rem > 0 {
+                let mut best_u = usize::MAX;
+                u = 0;
+                while u < h_cnt {
+                    if uncapped[u] && !used[u] && holder_alloc[u] < holder_req[u] {
+                        if best_u == usize::MAX
+                            || remainders[u] > remainders[best_u]
+                            || (remainders[u] == remainders[best_u]
+                                && holder_max_px[u] > holder_max_px[best_u])
+                        {
+                            best_u = u;
+                        }
+                    }
+                    u += 1;
+                }
+                if best_u == usize::MAX {
+                    break;
+                }
+                used[best_u] = true;
+                holder_alloc[best_u] += 1;
+                rem -= 1;
+            }
+            break;
+        }
+    }
+
+    let mut total_out = 0u64;
+    let mut u = 0usize;
+    while u < h_cnt {
+        let mut rem_u = holder_alloc[u];
+        while rem_u > 0 {
+            let mut best_k = usize::MAX;
+            k = 0;
+            while k < count {
+                let oi = idxs[k];
+                if book.orders[oi].trader == holders[u]
+                    && fills[oi] < book.orders[oi].quantity
+                    && (best_k == usize::MAX
+                        || book.orders[oi].price > book.orders[idxs[best_k]].price)
+                {
+                    best_k = k;
+                }
+                k += 1;
+            }
+            if best_k == usize::MAX {
+                break;
+            }
+            let oi = idxs[best_k];
+            let room = book.orders[oi].quantity - fills[oi];
+            let take = if rem_u < room { rem_u } else { room };
+            fills[oi] += take;
+            total_out = total_out.saturating_add(take);
+            rem_u -= take;
+        }
+        u += 1;
+    }
+    total_out
+}
+
+/// Unique-investor pro-rata allocation with largest-remainder tie-breaking across `idxs[..count]`:
+/// aggregates crossing orders per unique bidder Identity first so splitting a bid into many small
+/// orders yields ZERO extra remainder shares!
 fn allocate_tier_pro_rata(
     book: &AuctionBook,
     idxs: &[usize; MAX_AUCTION_ORDERS],
@@ -879,66 +1161,118 @@ fn allocate_tier_pro_rata(
         return sum_qty;
     }
 
+    let mut uniq_traders = [[0u8; 20]; MAX_AUCTION_ORDERS];
+    let mut uniq_qty = [0u64; MAX_AUCTION_ORDERS];
+    let mut uniq_max_px = [0u64; MAX_AUCTION_ORDERS];
+    let mut uniq_alloc = [0u64; MAX_AUCTION_ORDERS];
+    let mut u_cnt = 0usize;
+
+    k = 0;
+    while k < count {
+        let ord = book.orders[idxs[k]];
+        let mut u = 0usize;
+        while u < u_cnt {
+            if uniq_traders[u] == ord.trader {
+                break;
+            }
+            u += 1;
+        }
+        if u == u_cnt {
+            uniq_traders[u] = ord.trader;
+            u_cnt += 1;
+        }
+        uniq_qty[u] = uniq_qty[u].saturating_add(ord.quantity);
+        if ord.price > uniq_max_px[u] {
+            uniq_max_px[u] = ord.price;
+        }
+        k += 1;
+    }
+
     let denom = sum_qty as u128;
     let mut remainders = [0u128; MAX_AUCTION_ORDERS];
     let mut used = [false; MAX_AUCTION_ORDERS];
     let mut allocated = 0u64;
-    k = 0;
-    while k < count {
-        let oi = idxs[k];
-        let num = (cap as u128) * (book.orders[oi].quantity as u128);
+    let mut u = 0usize;
+    while u < u_cnt {
+        let num = (cap as u128) * (uniq_qty[u] as u128);
         let base = (num / denom) as u64;
-        fills[oi] = base;
-        remainders[k] = num % denom;
+        uniq_alloc[u] = base;
+        remainders[u] = num % denom;
         allocated = allocated.saturating_add(base);
-        k += 1;
+        u += 1;
     }
 
     let mut rem = cap.saturating_sub(allocated);
     while rem > 0 {
-        let mut best_k = usize::MAX;
-        k = 0;
-        while k < count {
-            let oi = idxs[k];
-            if !used[k] && fills[oi] < book.orders[oi].quantity {
-                if best_k == usize::MAX {
-                    best_k = k;
-                } else {
-                    let prev_oi = idxs[best_k];
-                    let better = remainders[k] > remainders[best_k]
-                        || (remainders[k] == remainders[best_k]
-                            && book.orders[oi].price > book.orders[prev_oi].price);
-                    if better {
-                        best_k = k;
-                    }
+        let mut best_u = usize::MAX;
+        u = 0;
+        while u < u_cnt {
+            if !used[u] && uniq_alloc[u] < uniq_qty[u] {
+                if best_u == usize::MAX
+                    || remainders[u] > remainders[best_u]
+                    || (remainders[u] == remainders[best_u]
+                        && uniq_max_px[u] > uniq_max_px[best_u])
+                {
+                    best_u = u;
                 }
             }
-            k += 1;
+            u += 1;
         }
-        if best_k == usize::MAX {
+        if best_u == usize::MAX {
             break;
         }
-        used[best_k] = true;
-        fills[idxs[best_k]] += 1;
-        allocated += 1;
+        used[best_u] = true;
+        uniq_alloc[best_u] += 1;
         rem -= 1;
     }
-    allocated
+
+    let mut total_out = 0u64;
+    u = 0;
+    while u < u_cnt {
+        let mut rem_u = uniq_alloc[u];
+        while rem_u > 0 {
+            let mut best_k = usize::MAX;
+            k = 0;
+            while k < count {
+                let oi = idxs[k];
+                if book.orders[oi].trader == uniq_traders[u]
+                    && fills[oi] < book.orders[oi].quantity
+                    && (best_k == usize::MAX
+                        || book.orders[oi].price > book.orders[idxs[best_k]].price)
+                {
+                    best_k = k;
+                }
+                k += 1;
+            }
+            if best_k == usize::MAX {
+                break;
+            }
+            let oi = idxs[best_k];
+            let room = book.orders[oi].quantity - fills[oi];
+            let take = if rem_u < room { rem_u } else { room };
+            fills[oi] += take;
+            total_out = total_out.saturating_add(take);
+            rem_u -= take;
+        }
+        u += 1;
+    }
+    total_out
 }
 
 /// Core 5-Step Share Issuance Step 4 Allocation Determination:
-/// - Prioritizes Step 3 Existing Shareholder ROFR orders (`100%` up to `targetShares`, pro-rata if `> targetShares`).
-/// - Allocates remaining shares (`targetShares - rofrAllocated`) across Step 2 External Investor Bids (pro-rata if oversubscribed).
+/// - Retrieves `shareLedger` directly from `authObj.targetHps()` and verifies Charter pinning + conversion rate.
+/// - Prioritizes Step 3 Existing Shareholder ROFR orders (`100%` up to `targetShares`, ownership-weighted pro-rata if `> targetShares`).
+/// - Allocates remaining shares (`targetShares - rofrAllocated`) across Step 2 External Investor Bids (unique-investor pro-rata).
 /// - Refunds all unfilled / surplus escrowed cash immediately.
 /// - Mints existing shareholders' shares immediately; locks new shareholders' exact allotments awaiting Step 5 SHA signature!
 fn execute_determine_issuance_allocation(
     registry: &[u8; 20],
     charter: &[u8; 20],
-    share_ledger: &[u8; 20],
+    expected_ledger_opt: Option<[u8; 20]>,
     auth_obj: &[u8; 20],
     enforce_block_guard: bool,
 ) -> Result<[u8; 160], i32> {
-    if *share_ledger == [0u8; 20] || *auth_obj == [0u8; 20] {
+    if *auth_obj == [0u8; 20] {
         return Err(-14);
     }
     if load_issuance_summary(auth_obj).is_some() {
@@ -955,25 +1289,50 @@ fn execute_determine_issuance_allocation(
         storage::set_u64(KEY_ISS_ALLOC_LAST_BLK, now);
     }
 
-    verify_ledger_pinned_to_charter(share_ledger, charter)?;
-    let target_cd = CallEncoder::<16>::new(const { selector("targetHps()") });
-    let raw_tgt = call::call_raw(auth_obj, target_cd.as_slice())?;
-    if raw_tgt.len() < 32 || &raw_tgt[12..32] != share_ledger {
-        return Err(-62);
+    let share_ledger_val = verify_charter_auth_and_get_target(registry, charter, auth_obj)?;
+    let share_ledger = &share_ledger_val;
+    if let Some(exp) = expected_ledger_opt {
+        if exp != [0u8; 20] && &exp != share_ledger {
+            return Err(-62);
+        }
     }
 
     validate_charter_capital_auth(charter, auth_obj)?;
 
-    // Read Equity Financing conversion rate & custom class label BEFORE consuming `auth_obj`
+    // Read Equity Financing conversion rate, pre-money snapshot & custom class label BEFORE consuming `auth_obj`
     let mut conv_rate = 1u64;
+    let mut pre_money_snap = 0u64;
     let eq_cd = CallEncoder::<16>::new(const { selector("equityFinancingTerms()") });
     if let Ok(eq_raw) = call::call_raw(auth_obj, eq_cd.as_slice()) {
         if eq_raw.len() >= 9 * 32 {
             let mut w_cv = [0u8; 8];
+            let mut w_pre = [0u8; 8];
             w_cv.copy_from_slice(&eq_raw[2 * 32 + 24..3 * 32]);
+            w_pre.copy_from_slice(&eq_raw[7 * 32 + 24..8 * 32]);
             conv_rate = u64::from_be_bytes(w_cv).max(1);
+            pre_money_snap = u64::from_be_bytes(w_pre);
         }
     }
+
+    // Verify authoritative `CorporateCharter` share class spec if `share_ledger` is already registered!
+    if let Some((chr_votes, chr_num, chr_den)) = query_charter_share_class_spec(charter, share_ledger) {
+        if chr_den == 0 || chr_num == 0 || chr_num % chr_den != 0 {
+            return Err(-61);
+        }
+        let chr_conv = chr_num / chr_den;
+        if chr_conv != conv_rate || chr_votes != conv_rate {
+            return Err(-61);
+        }
+    }
+
+    // Prevent stale-snapshot double issuance dilution if company share capital changed after round launch!
+    if pre_money_snap > 0 {
+        let (_, live_total_common) = query_converted_common_totals(charter, &[0u8; 20]).unwrap_or((0, 0));
+        if live_total_common > 0 && live_total_common != pre_money_snap {
+            return Err(ERR_STALE_CAPITAL_SNAPSHOT);
+        }
+    }
+
     let mut class_label = [0u8; 32];
     let lbl_cd = CallEncoder::<16>::new(const { selector("issuanceClassLabel()") });
     if let Ok(lbl_raw) = call::call_raw(auth_obj, lbl_cd.as_slice()) {
@@ -1028,11 +1387,17 @@ fn execute_determine_issuance_allocation(
         return Err(ERR_NO_BIDS_IN_STAGE);
     }
 
-    // Tier 1: Prioritize Existing Shareholders' ROFR (`100%` up to `target_shares`, pro-rata if `rofr_qty > target_shares`)
+    // Tier 1: Prioritize Existing Shareholders' ROFR (`100%` up to `target_shares`, ownership-weighted pro-rata if `rofr_qty > target_shares`)
     let mut order_fills = [0u64; MAX_AUCTION_ORDERS];
-    let rofr_allocated =
-        allocate_tier_pro_rata(&book, &rofr_idxs, rofr_cnt, target_shares, &mut order_fills);
-    // Tier 2: Remaining shares (`target_shares - rofr_allocated`) go to Step 2 Prospective Investor Bidders
+    let rofr_allocated = allocate_rofr_by_ownership(
+        charter,
+        &book,
+        &rofr_idxs,
+        rofr_cnt,
+        target_shares,
+        &mut order_fills,
+    );
+    // Tier 2: Remaining shares (`target_shares - rofr_allocated`) go to Step 2 Prospective Investor Bidders (unique-investor pro-rata)
     let rem_for_bidders = target_shares.saturating_sub(rofr_allocated);
     let bidders_allocated =
         allocate_tier_pro_rata(&book, &bid_idxs, bid_cnt, rem_for_bidders, &mut order_fills);
@@ -1068,16 +1433,11 @@ fn execute_determine_issuance_allocation(
                 let bal_cd = CallEncoder::<64>::new(const { selector("balanceOf(address)") })
                     .push_address(&inv);
                 let led_bal = call::call_u64(share_ledger, bal_cd.as_slice()).unwrap_or(0);
-                let sha_cd = CallEncoder::<64>::new(const {
-                    selector("hasSignedShareholdersAgreement(address)")
-                })
-                .push_address(&inv);
-                let signed_sha = call::call_bool(charter, sha_cd.as_slice()).unwrap_or(false);
 
                 uniq_investors[uniq_cnt] = inv;
                 uniq_shares[uniq_cnt] = fill;
                 uniq_is_rofr[uniq_cnt] = is_r;
-                uniq_existing[uniq_cnt] = holder_conv > 0 || led_bal > 0 || signed_sha || is_r == 1;
+                uniq_existing[uniq_cnt] = holder_conv > 0 || led_bal > 0 || is_r == 1;
                 uniq_cnt += 1;
             } else {
                 uniq_shares[found] = uniq_shares[found].saturating_add(fill);
@@ -1114,7 +1474,7 @@ fn execute_determine_issuance_allocation(
     let mut cur_escrow = storage::get_u64(ek.as_slice());
     let bank_ledger = storage::get_address(KEY_BANK_LEDGER).unwrap_or([0u8; 20]);
     let escrow_acct = storage::get_address(KEY_SHARE_ESCROW_ACCT).unwrap_or([0u8; 20]);
-    let treasury = storage::get_address(KEY_INITIALIZER).unwrap_or(escrow_acct);
+    let treasury = resolve_treasury_recipient(charter).unwrap_or(escrow_acct);
 
     // Immediately refund unfilled / surplus escrowed cash (`ord.price * ord.qty - clearing_price * fill`)
     if has_escrow && bank_ledger != [0u8; 20] && escrow_acct != [0u8; 20] {
@@ -1253,10 +1613,20 @@ fn handle_determine_issuance_allocation(args: &CalldataReader) -> Result<(), i32
     let out = execute_determine_issuance_allocation(
         &registry,
         &charter,
-        &share_ledger,
+        Some(share_ledger),
         &auth_obj,
         true,
     )?;
+    ret::write(&out);
+    Ok(())
+}
+
+fn handle_determine_issuance_allocation_1(args: &CalldataReader) -> Result<(), i32> {
+    let charter = ensure_charter_active_only()?;
+    let registry = storage::get_address(KEY_REGISTRY).ok_or(-57)?;
+    let auth_obj = args.address(0).ok_or(-3)?;
+
+    let out = execute_determine_issuance_allocation(&registry, &charter, None, &auth_obj, true)?;
     ret::write(&out);
     Ok(())
 }
@@ -1310,7 +1680,7 @@ fn handle_sign_sha_and_claim_shares(args: &CalldataReader) -> Result<(), i32> {
         storage::set_u64(ek.as_slice(), rem_escrow);
         let bank_ledger = storage::get_address(KEY_BANK_LEDGER).ok_or(-63)?;
         let escrow_acct = storage::get_address(KEY_SHARE_ESCROW_ACCT).ok_or(-63)?;
-        let treasury = storage::get_address(KEY_INITIALIZER).unwrap_or(escrow_acct);
+        let treasury = resolve_treasury_recipient(&charter).unwrap_or(escrow_acct);
         if cost > 0 && escrow_acct != treasury && treasury != [0u8; 20] {
             let pay_cd = CallEncoder::<128>::new(const {
                 selector("charterModuleClearTransfer(address,address,uint64)")
@@ -1421,15 +1791,23 @@ fn handle_pending_sha_allotment_of(args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
-fn handle_settle_share_issuance(args: &CalldataReader) -> Result<(), i32> {
-    let (registry, charter, _caller) = ensure_active_and_valid_caller()?;
-    let share_ledger = args.address(0).ok_or(-3)?;
-    let auth_obj = args.address(1).ok_or(-3)?;
+fn execute_settle_share_issuance_inner(
+    registry: &[u8; 20],
+    charter: &[u8; 20],
+    expected_ledger_opt: Option<[u8; 20]>,
+    auth_obj: &[u8; 20],
+) -> Result<(), i32> {
+    let target_ledger = verify_charter_auth_and_get_target(registry, charter, auth_obj)?;
+    if let Some(exp) = expected_ledger_opt {
+        if exp != [0u8; 20] && exp != target_ledger {
+            return Err(-62);
+        }
+    }
 
     // Delegate multi-step Equity Financing rounds (`isEquityFinancing == 1`) to the 5-step ROFR + SHA allocation engine!
     let mut is_eqf = false;
     let eq_cd = CallEncoder::<16>::new(const { selector("equityFinancingTerms()") });
-    if let Ok(eq_raw) = call::call_raw(&auth_obj, eq_cd.as_slice()) {
+    if let Ok(eq_raw) = call::call_raw(auth_obj, eq_cd.as_slice()) {
         if eq_raw.len() >= 9 * 32 {
             let mut w_eq = [0u8; 8];
             w_eq.copy_from_slice(&eq_raw[24..32]);
@@ -1438,21 +1816,21 @@ fn handle_settle_share_issuance(args: &CalldataReader) -> Result<(), i32> {
     }
     if is_eqf {
         let out = execute_determine_issuance_allocation(
-            &registry,
-            &charter,
-            &share_ledger,
-            &auth_obj,
+            registry,
+            charter,
+            Some(target_ledger),
+            auth_obj,
             false,
         )?;
         ret::write(&out);
         return Ok(());
     }
 
-    validate_charter_capital_auth(&charter, &auth_obj)?;
+    validate_charter_capital_auth(charter, auth_obj)?;
 
     let settle_cd = CallEncoder::<64>::new(const { selector("settleIssuanceAuction(address)") })
-        .push_address(&auth_obj);
-    let out_raw = call::call_raw(&share_ledger, settle_cd.as_slice())?;
+        .push_address(auth_obj);
+    let out_raw = call::call_raw(&target_ledger, settle_cd.as_slice())?;
     let mut out_copy = [0u8; 160];
     let out_len = out_raw.len().min(160);
     out_copy[..out_len].copy_from_slice(&out_raw[..out_len]);
@@ -1460,10 +1838,23 @@ fn handle_settle_share_issuance(args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
+fn handle_settle_share_issuance(args: &CalldataReader) -> Result<(), i32> {
+    let (registry, charter, _caller) = ensure_active_and_valid_caller()?;
+    let share_ledger = args.address(0).ok_or(-3)?;
+    let auth_obj = args.address(1).ok_or(-3)?;
+    execute_settle_share_issuance_inner(&registry, &charter, Some(share_ledger), &auth_obj)
+}
+
+fn handle_settle_share_issuance_1(args: &CalldataReader) -> Result<(), i32> {
+    let (registry, charter, _caller) = ensure_active_and_valid_caller()?;
+    let auth_obj = args.address(0).ok_or(-3)?;
+    execute_settle_share_issuance_inner(&registry, &charter, None, &auth_obj)
+}
+
 /// Place a prospective investor subscription order (`price`, `quantity`) with a signed
 /// **Share Subscription Agreement (`ssaDocHash`)**, escrowing `price * quantity` SGD into `shareEscrowAccount`.
 fn handle_place_subscription_order(args: &CalldataReader) -> Result<(), i32> {
-    let (_registry, _charter, buyer) = ensure_active_and_valid_caller()?;
+    let (registry, charter, buyer) = ensure_active_and_valid_caller()?;
     let auth_obj = args.address(0).ok_or(-3)?;
     let price = args.u64(1).ok_or(-3)?;
     let quantity = args.u64(2).ok_or(-3)?;
@@ -1471,6 +1862,7 @@ fn handle_place_subscription_order(args: &CalldataReader) -> Result<(), i32> {
     if price == 0 || quantity == 0 {
         return Err(-14);
     }
+    let _ = verify_charter_auth_and_get_target(&registry, &charter, &auth_obj)?;
     let escrow_cash = price.checked_mul(quantity).ok_or(-15)?;
 
     let bank_ledger = storage::get_address(KEY_BANK_LEDGER).ok_or(-63)?;
@@ -1519,8 +1911,9 @@ fn handle_place_subscription_order(args: &CalldataReader) -> Result<(), i32> {
 }
 
 fn handle_refund_failed_auction(args: &CalldataReader) -> Result<(), i32> {
-    let (_registry, _charter, _caller) = ensure_active_and_valid_caller()?;
+    let (registry, charter, _caller) = ensure_active_and_valid_caller()?;
     let auth_obj = args.address(0).ok_or(-3)?;
+    let _ = verify_charter_auth_and_get_target(&registry, &charter, &auth_obj)?;
 
     let ek = auc_escrow_key(&auth_obj);
     let cur_escrow = storage::get_u64(ek.as_slice());
@@ -1603,12 +1996,10 @@ fn handle_disburse_auction_cash(args: &CalldataReader) -> Result<(), i32> {
         return Ok(());
     }
 
+    let registry = storage::get_address(KEY_REGISTRY).ok_or(-57)?;
     let caller = context::msg_sender();
-    let target_cd = CallEncoder::<16>::new(const { selector("targetHps()") });
-    let Ok(raw_target) = call::call_raw(&auth_obj, target_cd.as_slice()) else {
-        return Err(-62);
-    };
-    if raw_target.len() < 32 || raw_target[12..32] != caller {
+    let target_hps = verify_charter_auth_and_get_target(&registry, &charter, &auth_obj)?;
+    if target_hps != caller {
         return Err(-62);
     }
 
@@ -1672,19 +2063,31 @@ fn handle_hash_authorize_futures(args: &CalldataReader) -> Result<(), i32> {
 fn consume_shareholder_super_auth(
     registry: &[u8; 20],
     charter: &[u8; 20],
+    fn_selector: &[u8; 4],
     auth_obj: &[u8; 20],
     action_hash: &[u8; 32],
     caller: &[u8; 20],
 ) -> Result<(), i32> {
-    let pid_cd = CallEncoder::<16>::new(const { selector("policyId()") });
-    let expected_pol = if let Ok(raw_pid) = call::call_raw(auth_obj, pid_cd.as_slice()) {
-        if raw_pid.len() >= 32 && raw_pid[..32] == POLICY_SHAREHOLDER_SUPERMAJORITY {
-            POLICY_SHAREHOLDER_SUPERMAJORITY
+    let me = context::self_address();
+    let cfg_pol = query_charter_function_auth(charter, &me, fn_selector)
+        .unwrap_or(POLICY_SHAREHOLDER_SUPERMAJORITY);
+    let expected_pol = if cfg_pol == POLICY_SHAREHOLDER_SUPERMAJORITY
+        || cfg_pol == POLICY_SUPER_GOVERNANCE
+    {
+        let pid_cd = CallEncoder::<16>::new(const { selector("policyId()") });
+        if let Ok(raw_pid) = call::call_raw(auth_obj, pid_cd.as_slice()) {
+            if raw_pid.len() >= 32 && raw_pid[..32] == POLICY_SHAREHOLDER_SUPERMAJORITY {
+                POLICY_SHAREHOLDER_SUPERMAJORITY
+            } else if raw_pid.len() >= 32 && raw_pid[..32] == POLICY_SUPER_GOVERNANCE {
+                POLICY_SUPER_GOVERNANCE
+            } else {
+                cfg_pol
+            }
         } else {
-            POLICY_SUPER_GOVERNANCE
+            cfg_pol
         }
     } else {
-        POLICY_SHAREHOLDER_SUPERMAJORITY
+        cfg_pol
     };
     verify_and_consume_auth(registry, auth_obj, charter, &expected_pol, action_hash, caller)
 }
@@ -1692,15 +2095,19 @@ fn consume_shareholder_super_auth(
 fn consume_board_auth(
     registry: &[u8; 20],
     charter: &[u8; 20],
+    fn_selector: &[u8; 4],
     auth_obj: &[u8; 20],
     action_hash: &[u8; 32],
     caller: &[u8; 20],
 ) -> Result<(), i32> {
+    let me = context::self_address();
+    let expected_pol =
+        query_charter_function_auth(charter, &me, fn_selector).unwrap_or(POLICY_BOARD_RESOLUTION);
     verify_and_consume_auth(
         registry,
         auth_obj,
         charter,
-        &POLICY_BOARD_RESOLUTION,
+        &expected_pol,
         action_hash,
         caller,
     )
@@ -1775,6 +2182,13 @@ fn handle_hash_execute_reverse_share_split(args: &CalldataReader) -> Result<(), 
 
 /// Repurchase `shares` from `seller` at `pricePerShare` SGD out of Company Treasury (`treasuryRecipient()`)
 /// and retire/cancel them on `shareLedger`, increasing remaining shareholders' ownership `%`.
+///
+/// Security Guards:
+/// - `pricePerShare` MUST be strictly positive (`> 0`).
+/// - Voluntary seller consent is mandatory: either `caller == seller` OR `seller` explicitly signed
+///   Stage 0 of `super_auth` (`hasSigned(0, seller) == true`), preventing a 75% majority from
+///   expropriating or burning a minority shareholder's stake against their will (`ERR_SELLER_CONSENT_REQUIRED`).
+/// - Cannot debit shares that are backing open underwritten futures (`ERR_FUTURES_BACKING_LOCKED`).
 fn handle_execute_share_buyback(args: &CalldataReader) -> Result<(), i32> {
     let (registry, charter, caller) = ensure_active_and_valid_caller()?;
     let share_ledger = args.address(0).ok_or(-3)?;
@@ -1783,14 +2197,33 @@ fn handle_execute_share_buyback(args: &CalldataReader) -> Result<(), i32> {
     let price_per_share = args.u64(3).ok_or(-3)?;
     let super_auth = args.address(4).ok_or(-3)?;
 
-    if share_ledger == [0u8; 20] || seller == [0u8; 20] || shares == 0 {
+    if share_ledger == [0u8; 20] || seller == [0u8; 20] || shares == 0 || price_per_share == 0 {
         return Err(-14);
     }
     require_valid_identity(&registry, &seller)?;
     verify_ledger_pinned_to_charter(&share_ledger, &charter)?;
 
+    if caller != seller {
+        let sig_cd = CallEncoder::<96>::new(const { selector("hasSigned(uint64,address)") })
+            .push_u64(0)
+            .push_address(&seller);
+        let seller_signed = call::call_bool(&super_auth, sig_cd.as_slice()).unwrap_or(false);
+        if !seller_signed {
+            return Err(ERR_SELLER_CONSENT_REQUIRED);
+        }
+    }
+
+    ensure_futures_backed_after_debit(&charter, &share_ledger, &seller, shares)?;
+
     let action_hash = compute_share_buyback_hash(&share_ledger, &seller, shares, price_per_share);
-    consume_shareholder_super_auth(&registry, &charter, &super_auth, &action_hash, &caller)?;
+    consume_shareholder_super_auth(
+        &registry,
+        &charter,
+        &SEL_EXECUTE_SHARE_BUYBACK,
+        &super_auth,
+        &action_hash,
+        &caller,
+    )?;
 
     // Ensure at least 1 share remains outstanding in the company or in this class if sole class!
     let (_, total_common) = query_converted_common_totals(&charter, &[0u8; 20]).unwrap_or((0, 0));
@@ -1799,22 +2232,18 @@ fn handle_execute_share_buyback(args: &CalldataReader) -> Result<(), i32> {
     }
 
     let total_paid = shares.checked_mul(price_per_share).ok_or(-15)?;
-    if total_paid > 0 {
-        let bank_ledger = storage::get_address(KEY_BANK_LEDGER).ok_or(-63)?;
-        let treasury = storage::get_address(KEY_INITIALIZER)
-            .or_else(|| storage::get_address(KEY_SHARE_ESCROW_ACCT))
-            .ok_or(-63)?;
-        if treasury != seller {
-            let pay_cd = CallEncoder::<128>::new(const {
-                selector("charterModuleClearTransfer(address,address,uint64)")
-            })
-            .push_address(&treasury)
-            .push_address(&seller)
-            .push_u64(total_paid);
-            let ok = call::call_bool(&bank_ledger, pay_cd.as_slice())?;
-            if !ok {
-                return Err(-16);
-            }
+    let bank_ledger = storage::get_address(KEY_BANK_LEDGER).ok_or(-63)?;
+    let treasury = resolve_treasury_recipient(&charter).ok_or(-63)?;
+    if treasury != seller {
+        let pay_cd = CallEncoder::<128>::new(const {
+            selector("charterModuleClearTransfer(address,address,uint64)")
+        })
+        .push_address(&treasury)
+        .push_address(&seller)
+        .push_u64(total_paid);
+        let ok = call::call_bool(&bank_ledger, pay_cd.as_slice())?;
+        if !ok {
+            return Err(-16);
         }
     }
 
@@ -1852,7 +2281,14 @@ fn handle_execute_share_split(args: &CalldataReader) -> Result<(), i32> {
     verify_ledger_pinned_to_charter(&share_ledger, &charter)?;
 
     let action_hash = compute_share_split_hash(&share_ledger, multiplier);
-    consume_shareholder_super_auth(&registry, &charter, &super_auth, &action_hash, &caller)?;
+    consume_shareholder_super_auth(
+        &registry,
+        &charter,
+        &SEL_EXECUTE_SHARE_SPLIT,
+        &super_auth,
+        &action_hash,
+        &caller,
+    )?;
 
     let split_cd =
         CallEncoder::<64>::new(const { selector("charterModuleSplit(uint64)") }).push_u64(multiplier);
@@ -1873,7 +2309,14 @@ fn handle_execute_reverse_share_split(args: &CalldataReader) -> Result<(), i32> 
     verify_ledger_pinned_to_charter(&share_ledger, &charter)?;
 
     let action_hash = compute_reverse_split_hash(&share_ledger, divisor);
-    consume_shareholder_super_auth(&registry, &charter, &super_auth, &action_hash, &caller)?;
+    consume_shareholder_super_auth(
+        &registry,
+        &charter,
+        &SEL_EXECUTE_REVERSE_SPLIT,
+        &super_auth,
+        &action_hash,
+        &caller,
+    )?;
 
     let rev_cd = CallEncoder::<64>::new(const { selector("charterModuleReverseSplit(uint64)") })
         .push_u64(divisor);
@@ -2095,6 +2538,15 @@ fn handle_create_esop_program(args: &CalldataReader) -> Result<(), i32> {
     verify_ledger_pinned_to_charter(&option_ledger, &charter)?;
     verify_ledger_pinned_to_charter(&underlying_ledger, &charter)?;
 
+    if let Some((reg_vps, reg_num, reg_den)) =
+        query_charter_share_class_spec(&charter, &underlying_ledger)
+    {
+        if reg_den == 0 || reg_num != conversion_rate.saturating_mul(reg_den) || reg_vps != conversion_rate
+        {
+            return Err(-61);
+        }
+    }
+
     let action_hash = compute_create_esop_program_hash(
         &option_ledger,
         &underlying_ledger,
@@ -2103,7 +2555,14 @@ fn handle_create_esop_program(args: &CalldataReader) -> Result<(), i32> {
         authorized_shares,
         exercise_price,
     );
-    consume_shareholder_super_auth(&registry, &charter, &super_auth, &action_hash, &caller)?;
+    consume_shareholder_super_auth(
+        &registry,
+        &charter,
+        &SEL_CREATE_ESOP_PROGRAM,
+        &super_auth,
+        &action_hash,
+        &caller,
+    )?;
 
     let ens_cd = CallEncoder::<160>::new(const {
         selector("moduleEnsureShareClass(address,uint64,uint64,uint64)")
@@ -2112,7 +2571,7 @@ fn handle_create_esop_program(args: &CalldataReader) -> Result<(), i32> {
     .push_u64(conversion_rate)
     .push_u64(conversion_rate)
     .push_u64(1);
-    let _ = call::call_raw(&charter, ens_cd.as_slice());
+    let _ = call::call_raw(&charter, ens_cd.as_slice())?;
 
     let program_id = storage::get_u64(KEY_ESOP_PROG_CNT);
     let rec = EsopProgramRec {
@@ -2202,7 +2661,14 @@ fn handle_award_employee_options(args: &CalldataReader) -> Result<(), i32> {
         cliff_timestamp,
         schedule_blob,
     );
-    consume_board_auth(&registry, &charter, &board_auth, &action_hash, &caller)?;
+    consume_board_auth(
+        &registry,
+        &charter,
+        &SEL_AWARD_ESOP_OPTIONS,
+        &board_auth,
+        &action_hash,
+        &caller,
+    )?;
 
     prog.committed_shares = next_committed;
     save_esop_program(program_id, &prog);
@@ -2426,9 +2892,7 @@ fn handle_exercise_employee_options(args: &CalldataReader) -> Result<(), i32> {
     if prog.exercise_price > 0 {
         let strike_total = amount.checked_mul(prog.exercise_price).ok_or(-15)?;
         let bank_ledger = storage::get_address(KEY_BANK_LEDGER).ok_or(-63)?;
-        let treasury = storage::get_address(KEY_INITIALIZER)
-            .or_else(|| storage::get_address(KEY_SHARE_ESCROW_ACCT))
-            .ok_or(-63)?;
+        let treasury = resolve_treasury_recipient(&charter).ok_or(-63)?;
         if treasury != caller {
             let pay_cd = CallEncoder::<128>::new(const {
                 selector("charterModuleClearTransfer(address,address,uint64)")
@@ -2644,6 +3108,15 @@ mod tests {
                 ret::write_word(&storage::get_bytes32(b"pol").unwrap_or([0u8; 32]));
                 return 0;
             }
+            if sel == const { selector("charter()") } {
+                ret::write_address(&storage::get_address(b"charter").unwrap_or([0u8; 20]));
+                return 0;
+            }
+            if sel == const { selector("hasSigned(uint64,address)") } {
+                let signer = args.address(1).unwrap();
+                ret::write_bool(storage::get_u64(&signer) == 1);
+                return 0;
+            }
             if sel == const { selector("consume(address,bytes32,bytes32,address)") } {
                 if context::msg_sender() != storage::get_address(b"target").unwrap() {
                     return -66;
@@ -2746,6 +3219,7 @@ mod tests {
         mock::register_hps(reg_addr, reg_stub::dispatch);
         mock::register_hps(charter_addr, charter_stub::dispatch);
         mock::register_hps(fut_addr, futures_stub::dispatch);
+        mock::register_hps(bank_addr, futures_stub::dispatch);
 
         // Charter starts PENDING_RATIFICATION: holder has 100k Pref A @ 50% = 50,000 common equiv
         mock::set_self_address(charter_addr);
@@ -2754,6 +3228,8 @@ mod tests {
         storage::set_u64(b"total_common", 150_000);
 
         mock::set_self_address(fut_addr);
+        storage::set_address(b"charter", &charter_addr);
+        mock::set_self_address(bank_addr);
         storage::set_address(b"charter", &charter_addr);
 
         mock::set_self_address(sc_addr);
@@ -3040,6 +3516,23 @@ mod tests {
         .push_u64(500)
         .push_u64(50)
         .push_address(&auth_bb);
+        // Unconsented buyback called by `founder` without `employee` having signed `auth_bb` MUST revert (-104)!
+        assert_eq!(
+            dispatch_calldata(bb_cd.as_slice()),
+            ERR_SELLER_CONSENT_REQUIRED
+        );
+        // Zero-price buyback MUST revert (-14)!
+        let bb_zero = CallEncoder::<192>::new(selector(
+            "executeShareBuyback(address,address,uint64,uint64,address)",
+        ))
+        .push_address(&share_led)
+        .push_address(&employee)
+        .push_u64(500)
+        .push_u64(0)
+        .push_address(&auth_bb);
+        assert_eq!(dispatch_calldata(bb_zero.as_slice()), -14);
+        // Voluntary buyback submitted by `employee` (or signed by `employee`) succeeds!
+        mock::set_sender(employee);
         assert_eq!(dispatch_calldata(bb_cd.as_slice()), 0);
         assert_eq!(
             u64::from_be_bytes(mock::take_return_data()[24..32].try_into().unwrap()),
@@ -3100,6 +3593,10 @@ mod tests {
             let Some((sel, _args)) = CalldataReader::parse(raw) else {
                 return -1;
             };
+            if sel == const { selector("charter()") } {
+                ret::write_address(&[0xC0; 20]);
+                return 0;
+            }
             if sel == const { selector("targetHps()") } {
                 ret::write_address(&PREF_X_LED);
                 return 0;
@@ -3250,5 +3747,236 @@ mod tests {
         mock::set_self_address(bank_addr);
         assert_eq!(storage::get_u64(&founder), 25_000 * 46); // Full 1,150,000 SGD proceeds in Treasury!
         assert_eq!(storage::get_u64(&escrow_acct), 0);       // Zero leftover escrow!
+    }
+
+    #[test]
+    fn security_audit_ownership_weighted_rofr_conversion_spoof_and_futures_backing_lock() {
+        use hps_sdk::governance::AuctionOrder;
+
+        mock::reset();
+        let sc_addr = [0x5C; 20];
+        let reg_addr = [0xB0; 20];
+        let charter_addr = [0xC0; 20];
+        let bank_addr = [0xBA; 20];
+        let escrow_acct = [0xE5; 20];
+        let fut_addr = [0xF0; 20];
+        const COMMON_LED: [u8; 20] = [0x51; 20];
+        const PREF_10X_LED: [u8; 20] = [0x59; 20];
+        const FOUNDER: [u8; 20] = [0x11; 20];
+        const MINOR: [u8; 20] = [0x12; 20];
+        const EXT_BIDDER: [u8; 20] = [0x31; 20];
+
+        let auth_rofr = [0xA0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 71];
+        let auth_spoof = [0xA0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 72];
+        let auth_stale = [0xA0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 73];
+        let auth_sell = [0xA0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 74];
+
+        mock::register_hps(reg_addr, reg_stub::dispatch);
+        mock::register_hps(bank_addr, futures_stub::dispatch);
+        mock::register_hps(COMMON_LED, futures_stub::dispatch);
+        mock::register_hps(PREF_10X_LED, futures_stub::dispatch);
+        mock::register_hps(fut_addr, futures_stub::dispatch);
+
+        mock::register_hps(charter_addr, |raw| {
+            let Some((sel, args)) = CalldataReader::parse(raw) else { return -1; };
+            if sel == const { selector("getShareClassByLedger(address)") } {
+                let led = args.address(0).unwrap();
+                let mut out = [0u8; 4 * 32];
+                if led == PREF_10X_LED {
+                    out[31] = 1; // exists = true
+                    out[32 + 24..64].copy_from_slice(&10u64.to_be_bytes()); // votes = 10
+                    out[64 + 24..96].copy_from_slice(&10u64.to_be_bytes()); // num = 10
+                    out[96 + 24..128].copy_from_slice(&1u64.to_be_bytes()); // den = 1
+                }
+                ret::write(&out);
+                return 0;
+            }
+            charter_stub::dispatch(raw)
+        });
+
+        mock::set_self_address(charter_addr);
+        storage::set_u64(b"state", CHARTER_STATE_ACTIVE);
+        storage::set_u64(&FOUNDER, 80_000); // 80% pre-round ownership
+        storage::set_u64(&MINOR, 20_000);   // 20% pre-round ownership
+        storage::set_u64(b"total_common", 100_000);
+
+        for led in [COMMON_LED, PREF_10X_LED, bank_addr, fut_addr] {
+            mock::set_self_address(led);
+            storage::set_address(b"charter", &charter_addr);
+        }
+        mock::set_self_address(COMMON_LED);
+        storage::set_u64(&FOUNDER, 80_000);
+        storage::set_u64(&MINOR, 20_000);
+        storage::set_u64(b"supply", 100_000);
+
+        // 1. HIGH-06: Oversubscribed ROFR (`FOUNDER` bids 25,000 & `MINOR` bids 25,000 for 25,000 round):
+        //    Allocated by pre-round ownership (80% / 20%) -> `FOUNDER = 20,000`, `MINOR = 5,000`!
+        let rofr_escrow = 25_000 * 40 + 25_000 * 40 + 25_000 * 40;
+        mock::set_self_address(bank_addr);
+        storage::set_u64(&escrow_acct, rofr_escrow);
+
+        mock::register_hps(auth_rofr, |raw| {
+            let Some((sel, _args)) = CalldataReader::parse(raw) else { return -1; };
+            if sel == const { selector("charter()") } {
+                ret::write_address(&[0xC0; 20]);
+                return 0;
+            }
+            if sel == const { selector("targetHps()") } {
+                ret::write_address(&COMMON_LED);
+                return 0;
+            }
+            if sel == const { selector("equityFinancingTerms()") } {
+                let mut out = [0u8; 9 * 32];
+                out[24..32].copy_from_slice(&1u64.to_be_bytes());
+                out[64 + 24..96].copy_from_slice(&1u64.to_be_bytes());
+                out[7 * 32 + 24..8 * 32].copy_from_slice(&100_000u64.to_be_bytes());
+                ret::write(&out);
+                return 0;
+            }
+            if sel == const { selector("consumeIssuanceAuction(address,bytes32,address)") } {
+                let mut book = AuctionBook::new();
+                assert!(book.push(AuctionOrder {
+                    side: ORDER_SIDE_BUY_STEP1,
+                    trader: EXT_BIDDER,
+                    price: 40,
+                    quantity: 25_000,
+                }));
+                assert!(book.push(AuctionOrder {
+                    side: ORDER_SIDE_BUY_STEP3,
+                    trader: FOUNDER,
+                    price: 40,
+                    quantity: 25_000,
+                }));
+                assert!(book.push(AuctionOrder {
+                    side: ORDER_SIDE_BUY_STEP3,
+                    trader: MINOR,
+                    price: 40,
+                    quantity: 25_000,
+                }));
+                let mut raw_book = [0u8; 256];
+                let n = book.encode(&mut raw_book).unwrap();
+                let pad = (32 - (n % 32)) % 32;
+                let mut out = vec![0u8; 128 + n + pad];
+                out[24..32].copy_from_slice(&25_000u64.to_be_bytes());
+                out[56..64].copy_from_slice(&40u64.to_be_bytes());
+                out[88..96].copy_from_slice(&96u64.to_be_bytes());
+                out[96 + 24..128].copy_from_slice(&(n as u64).to_be_bytes());
+                out[128..128 + n].copy_from_slice(&raw_book[..n]);
+                ret::write(&out);
+                return 0;
+            }
+            -2
+        });
+
+        mock::set_self_address(sc_addr);
+        mock::set_sender(FOUNDER);
+        mock::set_block_number(100);
+        let init_cd = CallEncoder::<160>::new(selector("initialize(address,address,address,address)"))
+            .push_address(&reg_addr)
+            .push_address(&charter_addr)
+            .push_address(&bank_addr)
+            .push_address(&escrow_acct);
+        assert_eq!(dispatch_calldata(init_cd.as_slice()), 0);
+        storage::set_u64(auc_escrow_key(&auth_rofr).as_slice(), rofr_escrow);
+        storage::set_u64(auc_escrow_active_key(&auth_rofr).as_slice(), 1);
+
+        let det_1arg = CallEncoder::<64>::new(selector("determineIssuanceAllocation(address)"))
+            .push_address(&auth_rofr);
+        assert_eq!(dispatch_calldata(det_1arg.as_slice()), 0);
+
+        mock::set_self_address(COMMON_LED);
+        assert_eq!(storage::get_u64(&FOUNDER), 80_000 + 20_000); // 80% of 25,000 ROFR!
+        assert_eq!(storage::get_u64(&MINOR), 20_000 + 5_000);    // 20% of 25,000 ROFR!
+        assert_eq!(storage::get_u64(&EXT_BIDDER), 0);
+
+        // 2. CRITICAL-05: Conversion-rate spoofing (`conv_rate = 1` on `PREF_10X_LED` registered as `10x`) MUST REVERT (-61)!
+        mock::register_hps(auth_spoof, |raw| {
+            let Some((sel, _args)) = CalldataReader::parse(raw) else { return -1; };
+            if sel == const { selector("charter()") } {
+                ret::write_address(&[0xC0; 20]);
+                return 0;
+            }
+            if sel == const { selector("targetHps()") } {
+                ret::write_address(&PREF_10X_LED);
+                return 0;
+            }
+            if sel == const { selector("equityFinancingTerms()") } {
+                let mut out = [0u8; 9 * 32];
+                out[24..32].copy_from_slice(&1u64.to_be_bytes());
+                out[64 + 24..96].copy_from_slice(&1u64.to_be_bytes()); // Spoofed 1x vs 10x on Charter!
+                ret::write(&out);
+                return 0;
+            }
+            -2
+        });
+        mock::set_self_address(sc_addr);
+        mock::set_block_number(101);
+        assert_eq!(
+            dispatch_calldata(
+                CallEncoder::<64>::new(selector("determineIssuanceAllocation(address)"))
+                    .push_address(&auth_spoof)
+                    .as_slice()
+            ),
+            -61
+        );
+
+        // 3. HIGH-08: Stale `preMoneyCommon` (`80_000` vs live `100_000`) MUST REVERT with `ERR_STALE_CAPITAL_SNAPSHOT (-106)`!
+        mock::register_hps(auth_stale, |raw| {
+            let Some((sel, _args)) = CalldataReader::parse(raw) else { return -1; };
+            if sel == const { selector("charter()") } {
+                ret::write_address(&[0xC0; 20]);
+                return 0;
+            }
+            if sel == const { selector("targetHps()") } {
+                ret::write_address(&COMMON_LED);
+                return 0;
+            }
+            if sel == const { selector("equityFinancingTerms()") } {
+                let mut out = [0u8; 9 * 32];
+                out[24..32].copy_from_slice(&1u64.to_be_bytes());
+                out[64 + 24..96].copy_from_slice(&1u64.to_be_bytes());
+                out[7 * 32 + 24..8 * 32].copy_from_slice(&80_000u64.to_be_bytes()); // Stale snapshot!
+                ret::write(&out);
+                return 0;
+            }
+            -2
+        });
+        mock::set_block_number(102);
+        assert_eq!(
+            dispatch_calldata(
+                CallEncoder::<64>::new(selector("determineIssuanceAllocation(address)"))
+                    .push_address(&auth_stale)
+                    .as_slice()
+            ),
+            ERR_STALE_CAPITAL_SNAPSHOT
+        );
+
+        // 4. HIGH-08: Futures backing lock — `MINOR` (`20,000` common equiv) underwrites `2,000` futures (`10%`),
+        //    then attempting `placeSellOrder` for `1,000` shares MUST REVERT with `ERR_FUTURES_BACKING_LOCKED (-107)`!
+        storage::set_address(KEY_FUTURES_LEDGER, &fut_addr);
+        storage::set_u64(KEY_FUTURES_PCT, 10);
+        storage::set_u64(futures_underwritten_key(&fut_addr, &MINOR).as_slice(), 2_000);
+
+        mock::register_hps(auth_sell, |raw| {
+            let Some((sel, _args)) = CalldataReader::parse(raw) else { return -1; };
+            if sel == const { selector("charter()") } {
+                ret::write_address(&[0xC0; 20]);
+                return 0;
+            }
+            if sel == const { selector("targetHps()") } {
+                ret::write_address(&COMMON_LED);
+                return 0;
+            }
+            -2
+        });
+        mock::set_sender(MINOR);
+        let sell_cd = CallEncoder::<128>::new(selector("placeSellOrder(address,uint64,uint64)"))
+            .push_address(&auth_sell)
+            .push_u64(50)
+            .push_u64(1_000);
+        assert_eq!(
+            dispatch_calldata(sell_cd.as_slice()),
+            ERR_FUTURES_BACKING_LOCKED
+        );
     }
 }

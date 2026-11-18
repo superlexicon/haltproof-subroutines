@@ -67,6 +67,7 @@ pub const ACTION_EXECUTE_SHARE_SPLIT: [u8; 32] = keccak256(b"EXECUTE_SHARE_SPLIT
 pub const ACTION_EXECUTE_REVERSE_SPLIT: [u8; 32] = keccak256(b"EXECUTE_REVERSE_SPLIT");
 pub const ACTION_CREATE_ESOP_PROGRAM: [u8; 32] = keccak256(b"CREATE_ESOP_PROGRAM");
 pub const ACTION_AWARD_ESOP_OPTIONS: [u8; 32] = keccak256(b"AWARD_ESOP_OPTIONS");
+pub const ACTION_SET_TREASURY: [u8; 32] = keccak256(b"CHARTER_SET_TREASURY");
 
 pub const DOC_TAG_SUBSCRIPTION_AGREEMENT: [u8; 32] = keccak256(b"SHARE_SUBSCRIPTION_AGREEMENT");
 pub const DOC_TAG_SHAREHOLDERS_AGREEMENT: [u8; 32] = keccak256(b"SHAREHOLDERS_AGREEMENT");
@@ -155,6 +156,13 @@ pub const ERR_SHA_SIGNATURE_REQUIRED: i32 = -99;
 pub const ERR_SSA_SIGNATURE_REQUIRED: i32 = -100;
 pub const ERR_ESOP_POOL_EXCEEDED: i32 = -101;
 pub const ERR_ALREADY_EXECUTED_IN_BLOCK: i32 = -102;
+pub const ERR_RESERVED_GOVERNANCE_ROLE: i32 = -103;
+pub const ERR_SELLER_CONSENT_REQUIRED: i32 = -104;
+pub const ERR_FRACTIONAL_SHARE_WIPEOUT: i32 = -105;
+pub const ERR_STALE_CAPITAL_SNAPSHOT: i32 = -106;
+pub const ERR_FUTURES_BACKING_LOCKED: i32 = -107;
+pub const ERR_GOVERNANCE_DOWNGRADE: i32 = -108;
+pub const ERR_DEX_FORBIDDEN_ON_SHARES: i32 = -109;
 pub const ERR_CHARTER_MISMATCH: i32 = -19;
 pub const ERR_CONSTITUTION_MISMATCH: i32 = ERR_CHARTER_MISMATCH;
 
@@ -816,6 +824,70 @@ pub fn is_authorized_charter_module(
         .push_address(module_hps)
         .push_bytes32(capability);
     matches!(call::call_bool(charter, cd.as_slice()), Ok(true))
+}
+
+/// Query `CorporateCharter.equitySettlementModule()` (returns `[0u8; 20]` if unconfigured or unsupported).
+pub fn query_charter_equity_module(charter: &[u8; 20]) -> [u8; 20] {
+    if *charter == [0u8; 20] {
+        return [0u8; 20];
+    }
+    let cd = CallEncoder::<16>::new(const { selector("equitySettlementModule()") });
+    let Ok(raw) = call::call_raw(charter, cd.as_slice()) else {
+        return [0u8; 20];
+    };
+    if raw.len() < 32 {
+        return [0u8; 20];
+    }
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&raw[12..32]);
+    out
+}
+
+/// Query `CorporateCharter.treasuryAccount()` when supported.
+pub fn query_charter_treasury(charter: &[u8; 20]) -> Option<[u8; 20]> {
+    if *charter == [0u8; 20] {
+        return None;
+    }
+    let cd = CallEncoder::<16>::new(const { selector("treasuryAccount()") });
+    let raw = call::call_raw(charter, cd.as_slice()).ok()?;
+    if raw.len() < 32 {
+        return None;
+    }
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&raw[12..32]);
+    if out == [0u8; 20] {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Query `CorporateCharter.getShareClassByLedger(ledger)` -> `Some((votes_per_share, conv_numer, conv_denom))`
+/// when `ledger` is already registered in `CorporateCharter`.
+pub fn query_charter_share_class_spec(
+    charter: &[u8; 20],
+    ledger: &[u8; 20],
+) -> Option<(u64, u64, u64)> {
+    if *charter == [0u8; 20] || *ledger == [0u8; 20] {
+        return None;
+    }
+    let cd = CallEncoder::<64>::new(const { selector("getShareClassByLedger(address)") })
+        .push_address(ledger);
+    let raw = call::call_raw(charter, cd.as_slice()).ok()?;
+    if raw.len() < 128 || raw[31] != 1 {
+        return None;
+    }
+    let mut w1 = [0u8; 8];
+    let mut w2 = [0u8; 8];
+    let mut w3 = [0u8; 8];
+    w1.copy_from_slice(&raw[56..64]);
+    w2.copy_from_slice(&raw[88..96]);
+    w3.copy_from_slice(&raw[120..128]);
+    Some((
+        u64::from_be_bytes(w1),
+        u64::from_be_bytes(w2),
+        u64::from_be_bytes(w3),
+    ))
 }
 
 /// Query `CorporateCharter.getFunctionAuth(targetHps, fnSelector)` and return `Some(policy_id)`
