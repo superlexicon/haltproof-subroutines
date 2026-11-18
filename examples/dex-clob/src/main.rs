@@ -39,8 +39,9 @@
 use hps_sdk::abi::CalldataReader;
 use hps_sdk::call::{self, CallEncoder};
 use hps_sdk::governance::{
-    require_valid_identity, ERR_INVALID_DEX_ORDER, ERR_NOT_ORDER_OWNER, ERR_NO_CROSSING_ORDERS,
-    ERR_ORDERBOOK_FULL, ERR_ORDER_ALREADY_CANCELLED, ERR_ORDER_NOT_FOUND,
+    require_valid_identity, ERR_ALREADY_EXECUTED_IN_BLOCK, ERR_INVALID_DEX_ORDER,
+    ERR_NOT_ORDER_OWNER, ERR_NO_CROSSING_ORDERS, ERR_ORDERBOOK_FULL, ERR_ORDER_ALREADY_CANCELLED,
+    ERR_ORDER_NOT_FOUND,
 };
 use hps_sdk::storage::KeyBuilder;
 use hps_sdk::{context, event_topic, events, hps_entry, ret, selector, storage};
@@ -93,6 +94,7 @@ const KEY_ACTIVE_ASKS: &[u8] = b"dex:aa_cnt";
 const KEY_BID_TREE: &[u8] = b"dex:bid_tree";
 const KEY_ASK_TREE: &[u8] = b"dex:ask_tree";
 
+const KEY_LAST_MATCH_EXEC_SET: &[u8] = b"dex:lm_set";
 const KEY_LAST_MATCH_BLOCK: &[u8] = b"dex:lm_blk";
 const KEY_LAST_PRICE: &[u8] = b"dex:lm_px";
 const KEY_LAST_VOL: &[u8] = b"dex:lm_vol";
@@ -106,6 +108,7 @@ hps_entry! {
     "placeAsk(uint64,uint64)"                     => handle_place_ask,
     "cancelOrder(uint64)"                         => handle_cancel_order,
     "matchBlock()"                                => handle_match_block,
+    "lastMatchedBlock()"                          => handle_last_matched_block,
     "getOrder(uint64)"                            => handle_get_order,
     "orderCount()"                                => handle_order_count,
     "bookDepth()"                                 => handle_book_depth,
@@ -1251,11 +1254,20 @@ fn commit_filled_prefix_to_tree(
 ///    $O(M_{\text{cross}})$ (two-pointer merge, zero order storage reads).
 /// 4. Loads crossing cohorts only up to the marginal `(price, block_number)` cohort, computes
 ///    permutation-invariant fills, settles transfers, and updates/prunes price levels in $O(\log M)$.
+/// Permissionless periodic orderbook matcher (no authentication or authorization required;
+/// guarded against being called more than once per block).
 fn handle_match_block(_args: &CalldataReader) -> Result<(), i32> {
     if storage::get_u64(KEY_INIT) != 1 {
         return Err(-10);
     }
     let current_block = context::block_number();
+    if storage::get_u64(KEY_LAST_MATCH_EXEC_SET) == 1
+        && storage::get_u64(KEY_LAST_MATCH_BLOCK) == current_block
+    {
+        return Err(ERR_ALREADY_EXECUTED_IN_BLOCK);
+    }
+    storage::set_u64(KEY_LAST_MATCH_EXEC_SET, 1);
+    storage::set_u64(KEY_LAST_MATCH_BLOCK, current_block);
 
     let mut pending_head = storage::get_u64(KEY_PENDING_HEAD);
     let mut pending_tail = storage::get_u64(KEY_PENDING_TAIL);
@@ -1763,6 +1775,11 @@ fn handle_get_ordered_ask_at(args: &CalldataReader) -> Result<(), i32> {
     let ask_tree = load_tree(KEY_ASK_TREE, false);
     let ord = get_ordered_at_in_tree(&ask_tree, idx)?;
     write_order_tuple(&ord);
+    Ok(())
+}
+
+fn handle_last_matched_block(_args: &CalldataReader) -> Result<(), i32> {
+    ret::write_u64_word(storage::get_u64(KEY_LAST_MATCH_BLOCK));
     Ok(())
 }
 
@@ -2343,5 +2360,67 @@ mod tests {
         let cnt_out = mock::transact_as(buyer, dex, cnt_cd.as_slice()).unwrap();
         let total_orders = u64::from_be_bytes(cnt_out[24..32].try_into().unwrap());
         assert_eq!(total_orders, 323);
+    }
+
+    #[test]
+    fn match_block_is_permissionless_and_enforces_once_per_block_safeguard() {
+        mock::reset();
+        let reg = [0x10; 20];
+        let asset_ledger = [0x20; 20];
+        let quote_ledger = [0x30; 20];
+        let dex = [0x40; 20];
+        let escrow_id = [0x90; 20];
+
+        let buyer = [0xA1; 20];
+        let seller = [0xB1; 20];
+        // `[0xEE; 20]` is explicitly rejected by `sim_ledgers::reg_dispatch::isValidIdentity`!
+        let unauthenticated_sim_eoa = [0xEE; 20];
+
+        mock::register_hps(reg, sim_ledgers::reg_dispatch);
+        mock::register_hps(asset_ledger, sim_ledgers::ledger_dispatch);
+        mock::register_hps(quote_ledger, sim_ledgers::ledger_dispatch);
+        mock::register_hps(dex, dispatch_calldata);
+
+        let init_cd = CallEncoder::<160>::new(const {
+            selector("initialize(address,address,address,address)")
+        })
+        .push_address(&reg)
+        .push_address(&asset_ledger)
+        .push_address(&quote_ledger)
+        .push_address(&escrow_id);
+        mock::transact_as(buyer, dex, init_cd.as_slice()).unwrap();
+
+        seed_balance(quote_ledger, buyer, 100_000);
+        seed_balance(asset_ledger, seller, 1_000);
+
+        mock::set_block_number(5);
+        let bid_cd = CallEncoder::<96>::new(const { selector("placeBid(uint64,uint64)") })
+            .push_u64(25)
+            .push_u64(40);
+        let ask_cd = CallEncoder::<96>::new(const { selector("placeAsk(uint64,uint64)") })
+            .push_u64(25)
+            .push_u64(40);
+        mock::transact_as(buyer, dex, bid_cd.as_slice()).unwrap();
+        mock::transact_as(seller, dex, ask_cd.as_slice()).unwrap();
+
+        mock::set_block_number(6);
+        let match_cd = CallEncoder::<16>::new(const { selector("matchBlock()") });
+        // 1. Unauthenticated simulator EOA (`[0xEE; 20]`) calls `matchBlock()` directly without Identity!
+        let out = mock::transact_as(unauthenticated_sim_eoa, dex, match_cd.as_slice()).unwrap();
+        assert_eq!(u64::from_be_bytes(out[56..64].try_into().unwrap()), 40);
+
+        // 2. Second `matchBlock()` call in the SAME block (#6) is rejected!
+        assert_eq!(
+            mock::transact_as(unauthenticated_sim_eoa, dex, match_cd.as_slice()),
+            Err(ERR_ALREADY_EXECUTED_IN_BLOCK)
+        );
+        assert_eq!(
+            mock::transact_as(buyer, dex, match_cd.as_slice()),
+            Err(ERR_ALREADY_EXECUTED_IN_BLOCK)
+        );
+
+        // 3. Advancing to the next block (#7) permits `matchBlock()` again!
+        mock::set_block_number(7);
+        assert!(mock::transact_as(unauthenticated_sim_eoa, dex, match_cd.as_slice()).is_ok());
     }
 }

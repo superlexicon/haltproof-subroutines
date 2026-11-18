@@ -15,6 +15,7 @@
 #![cfg_attr(target_arch = "wasm32", no_main)]
 
 use hps_sdk::abi::CalldataReader;
+use hps_sdk::governance::ERR_ALREADY_EXECUTED_IN_BLOCK;
 use hps_sdk::storage::KeyBuilder;
 use hps_sdk::{context, event_topic, events, hps_entry, ret, storage};
 
@@ -1615,9 +1616,19 @@ fn handle_repair_ship(args: &CalldataReader) -> Result<i32, i32> {
     Ok(cells_repaired as i32)
 }
 
+/// Permissionless periodic shell-resolution sweep (no authentication or authorization required;
+/// guarded against being called more than once per block per battle).
 fn handle_resolve_shells(args: &CalldataReader) -> Result<(), i32> {
     let bid = args.bytes32(0).ok_or(-10)?;
     let mut hdr = load_hdr(&bid).ok_or(-13)?;
+    let now = context::block_number();
+    let set_key = KeyBuilder::<48>::new().push(b"b:rs_s:").push(&bid);
+    let blk_key = KeyBuilder::<48>::new().push(b"b:rs_b:").push(&bid);
+    if storage::get_u64(set_key.as_slice()) == 1 && storage::get_u64(blk_key.as_slice()) == now {
+        return Err(ERR_ALREADY_EXECUTED_IN_BLOCK);
+    }
+    storage::set_u64(set_key.as_slice(), 1);
+    storage::set_u64(blk_key.as_slice(), now);
     sync_pending_shells(&bid, &mut hdr);
     save_hdr(&bid, &hdr);
     Ok(())
@@ -2265,5 +2276,13 @@ mod tests {
         assert_eq!(rec0.credits, 650);
         assert_eq!(rec0.score, 225);
         assert_eq!(rec0.best_score, 450);
+
+        // Permissionless `resolvePendingShells` succeeds once in block #910, and rejects a second call in #910!
+        let res_cd = CallEncoder::<64>::new(selector("resolvePendingShells(bytes32)")).push_bytes32(&bid);
+        mock::transact_as([0xEE; 20], CONTRACT, res_cd.as_slice()).unwrap();
+        assert_eq!(
+            mock::transact_as([0xEE; 20], CONTRACT, res_cd.as_slice()),
+            Err(ERR_ALREADY_EXECUTED_IN_BLOCK)
+        );
     }
 }

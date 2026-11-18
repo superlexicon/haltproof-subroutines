@@ -25,10 +25,10 @@ use hps_sdk::governance::{
     verify_and_consume_auth, ActionHasher, AuctionBook, ACTION_AUTHORIZE_FUTURES_UNDERWRITING,
     ACTION_AWARD_ESOP_OPTIONS, ACTION_CREATE_ESOP_PROGRAM, ACTION_EXECUTE_REVERSE_SPLIT,
     ACTION_EXECUTE_SHARE_BUYBACK, ACTION_EXECUTE_SHARE_SPLIT, ACTION_SET_SHARE_ESCROW,
-    ERR_CHARTER_MISMATCH, ERR_ESOP_CLIFF_NOT_PASSED, ERR_ESOP_POOL_EXCEEDED,
-    ERR_FUTURES_CAP_EXCEEDED, ERR_INVALID_FUTURES_CONFIG, ERR_POLICY_INVALID,
-    ERR_SHA_SIGNATURE_REQUIRED, MAX_ENCODED_AUCTION_BOOK_BYTES, POLICY_BOARD_RESOLUTION,
-    POLICY_SHAREHOLDER_SUPERMAJORITY, POLICY_SUPER_GOVERNANCE,
+    ERR_ALREADY_EXECUTED_IN_BLOCK, ERR_CHARTER_MISMATCH, ERR_ESOP_CLIFF_NOT_PASSED,
+    ERR_ESOP_POOL_EXCEEDED, ERR_FUTURES_CAP_EXCEEDED, ERR_INVALID_FUTURES_CONFIG,
+    ERR_POLICY_INVALID, ERR_SHA_SIGNATURE_REQUIRED, MAX_ENCODED_AUCTION_BOOK_BYTES,
+    POLICY_BOARD_RESOLUTION, POLICY_SHAREHOLDER_SUPERMAJORITY, POLICY_SUPER_GOVERNANCE,
 };
 use hps_sdk::storage::KeyBuilder;
 use hps_sdk::{context, event_topic, events, hps_entry, ret, selector, storage};
@@ -73,6 +73,8 @@ const KEY_FUTURES_LEDGER: &[u8] = b"shc:fut_led";
 const KEY_FUTURES_PCT: &[u8] = b"shc:fut_pct";
 const KEY_ESOP_PROG_CNT: &[u8] = b"shc:esop_pcnt";
 const KEY_ESOP_GRANT_CNT: &[u8] = b"shc:esop_gcnt";
+const KEY_ESOP_LAST_SWEEP_SET: &[u8] = b"shc:esop_lset";
+const KEY_ESOP_LAST_SWEEP_BLK: &[u8] = b"shc:esop_lblk";
 
 const MAX_ESOP_TRANCHES: usize = 24;
 
@@ -105,6 +107,7 @@ hps_entry! {
     "createEsopProgram(address,address,uint64,uint64,uint64,uint64,address)"    => handle_create_esop_program,
     "awardEmployeeOptions(uint64,address,uint64,uint64,bytes,address)"          => handle_award_employee_options,
     "processDueEsopIssuances()"                                                 => handle_process_due_esop_issuances,
+    "lastEsopSweepBlock()"                                                      => handle_last_esop_sweep_block,
     "dueEsopIssuanceCount()"                                                    => handle_due_esop_issuance_count,
     "exerciseEmployeeOptions(uint64,uint64,uint64,bytes32,bytes32)"             => handle_exercise_employee_options,
     "expectedExerciseLetterHash(uint64,uint64,address,uint64)"                  => handle_expected_exercise_letter_hash,
@@ -184,6 +187,15 @@ fn query_converted_common_totals(charter: &[u8; 20], shareholder: &[u8; 20]) -> 
     w_holder.copy_from_slice(&raw[24..32]);
     w_total.copy_from_slice(&raw[56..64]);
     Ok((u64::from_be_bytes(w_holder), u64::from_be_bytes(w_total)))
+}
+
+fn ensure_charter_active_only() -> Result<[u8; 20], i32> {
+    if storage::get_u64(KEY_INIT) != 1 {
+        return Err(-57);
+    }
+    let charter = storage::get_address(KEY_CHARTER).ok_or(-57)?;
+    require_active_charter(&charter)?;
+    Ok(charter)
 }
 
 fn ensure_active_and_valid_caller() -> Result<([u8; 20], [u8; 20], [u8; 20]), i32> {
@@ -1528,12 +1540,19 @@ fn handle_award_employee_options(args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
-/// Periodic digitized vesting sweep (callable hourly / weekly / monthly / every few blocks by
-/// keeper or any verified Identity): issues due option tranches onto each Master ESOP Program's
-/// dedicated `optionLedger`.
+/// Permissionless periodic digitized vesting sweep (no authentication or authorization required;
+/// guarded against being called more than once per block): issues due option tranches onto each
+/// Master ESOP Program's dedicated `optionLedger`.
 fn handle_process_due_esop_issuances(_args: &CalldataReader) -> Result<(), i32> {
-    let (_registry, _charter, _caller) = ensure_active_and_valid_caller()?;
+    let _charter = ensure_charter_active_only()?;
     let now = context::block_number();
+    if storage::get_u64(KEY_ESOP_LAST_SWEEP_SET) == 1
+        && storage::get_u64(KEY_ESOP_LAST_SWEEP_BLK) == now
+    {
+        return Err(ERR_ALREADY_EXECUTED_IN_BLOCK);
+    }
+    storage::set_u64(KEY_ESOP_LAST_SWEEP_SET, 1);
+    storage::set_u64(KEY_ESOP_LAST_SWEEP_BLK, now);
     let grant_cnt = storage::get_u64(KEY_ESOP_GRANT_CNT);
 
     let mut newly_issued_total = 0u64;
@@ -1600,6 +1619,11 @@ fn handle_process_due_esop_issuances(_args: &CalldataReader) -> Result<(), i32> 
     }
 
     ret::write_u64_word(newly_issued_total);
+    Ok(())
+}
+
+fn handle_last_esop_sweep_block(_args: &CalldataReader) -> Result<(), i32> {
+    ret::write_u64_word(storage::get_u64(KEY_ESOP_LAST_SWEEP_BLK));
     Ok(())
 }
 
@@ -2195,13 +2219,19 @@ mod tests {
         award_cd.resize(award_cd.len() + (32 - sched.len() % 32) % 32, 0);
         assert_eq!(dispatch_calldata(&award_cd), 0);
 
-        // 3. Periodic sweep at block #13 issues Tranche #0 (`1,000` options onto `opt_led`)!
+        // 3. Permissionless periodic sweep at block #13 by an unauthenticated simulator EOA (`[0xEE; 20]`)
+        //    issues Tranche #0 (`1,000` options onto `opt_led`), and rejects a second call in block #13!
         mock::set_block_number(13);
+        mock::set_sender([0xEE; 20]);
         let sweep_cd = CallEncoder::<16>::new(selector("processDueEsopIssuances()"));
         assert_eq!(dispatch_calldata(sweep_cd.as_slice()), 0);
         assert_eq!(
             u64::from_be_bytes(mock::take_return_data()[24..32].try_into().unwrap()),
             1_000
+        );
+        assert_eq!(
+            dispatch_calldata(sweep_cd.as_slice()),
+            ERR_ALREADY_EXECUTED_IN_BLOCK
         );
 
         // 4. Attempting exercise BEFORE cliff (#13 < #15) MUST revert with ERR_ESOP_CLIFF_NOT_PASSED (-98)!
