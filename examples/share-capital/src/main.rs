@@ -22,13 +22,15 @@ use hps_sdk::call::{self, CallEncoder};
 use hps_sdk::governance::{
     compute_esop_exercise_letter_hash, compute_sha_doc_hash, query_charter_function_auth,
     require_active_charter, require_valid_identity, validate_charter_capital_auth,
-    verify_and_consume_auth, ActionHasher, AuctionBook, ACTION_AUTHORIZE_FUTURES_UNDERWRITING,
-    ACTION_AWARD_ESOP_OPTIONS, ACTION_CREATE_ESOP_PROGRAM, ACTION_EXECUTE_REVERSE_SPLIT,
-    ACTION_EXECUTE_SHARE_BUYBACK, ACTION_EXECUTE_SHARE_SPLIT, ACTION_SET_SHARE_ESCROW,
-    ERR_ALREADY_EXECUTED_IN_BLOCK, ERR_CHARTER_MISMATCH, ERR_ESOP_CLIFF_NOT_PASSED,
-    ERR_ESOP_POOL_EXCEEDED, ERR_FUTURES_CAP_EXCEEDED, ERR_INVALID_FUTURES_CONFIG,
-    ERR_POLICY_INVALID, ERR_SHA_SIGNATURE_REQUIRED, MAX_ENCODED_AUCTION_BOOK_BYTES,
-    POLICY_BOARD_RESOLUTION, POLICY_SHAREHOLDER_SUPERMAJORITY, POLICY_SUPER_GOVERNANCE,
+    verify_and_consume_auth, verify_and_consume_issuance_auction_auth, ActionHasher, AuctionBook,
+    ACTION_AUTHORIZE_FUTURES_UNDERWRITING, ACTION_AWARD_ESOP_OPTIONS, ACTION_CREATE_ESOP_PROGRAM,
+    ACTION_EXECUTE_REVERSE_SPLIT, ACTION_EXECUTE_SHARE_BUYBACK, ACTION_EXECUTE_SHARE_SPLIT,
+    ACTION_SET_SHARE_ESCROW, ERR_ALREADY_EXECUTED_IN_BLOCK, ERR_CHARTER_MISMATCH,
+    ERR_ESOP_CLIFF_NOT_PASSED, ERR_ESOP_POOL_EXCEEDED, ERR_FUTURES_CAP_EXCEEDED,
+    ERR_INVALID_FUTURES_CONFIG, ERR_NO_BIDS_IN_STAGE, ERR_POLICY_INVALID,
+    ERR_SHA_SIGNATURE_REQUIRED, MAX_AUCTION_ORDERS, MAX_ENCODED_AUCTION_BOOK_BYTES,
+    ORDER_SIDE_BUY_STEP1, ORDER_SIDE_BUY_STEP3, POLICY_BOARD_RESOLUTION,
+    POLICY_SHAREHOLDER_SUPERMAJORITY, POLICY_SHARE_ISSUANCE_AUCTION, POLICY_SUPER_GOVERNANCE,
 };
 use hps_sdk::storage::KeyBuilder;
 use hps_sdk::{context, event_topic, events, hps_entry, ret, selector, storage};
@@ -58,6 +60,11 @@ const ESOP_OPTIONS_ISSUED: [u8; 32] =
     event_topic("EsopOptionsIssued(uint64,uint64,address,uint64,uint64)");
 const ESOP_OPTIONS_EXERCISED: [u8; 32] =
     event_topic("EsopOptionsExercised(uint64,uint64,address,uint64,bool)");
+const ISSUANCE_ALLOCATION_DETERMINED: [u8; 32] = event_topic(
+    "IssuanceAllocationDetermined(address,address,uint64,uint64,uint64,uint64,uint64)",
+);
+const ISSUANCE_SHARES_CLAIMED: [u8; 32] =
+    event_topic("IssuanceSharesClaimed(address,address,address,uint64,uint64)");
 
 const SEL_SET_SHARE_ESCROW: [u8; 4] = selector("setShareEscrowAccount(address,address,address)");
 const SEL_AUTHORIZE_FUTURES: [u8; 4] =
@@ -75,6 +82,8 @@ const KEY_ESOP_PROG_CNT: &[u8] = b"shc:esop_pcnt";
 const KEY_ESOP_GRANT_CNT: &[u8] = b"shc:esop_gcnt";
 const KEY_ESOP_LAST_SWEEP_SET: &[u8] = b"shc:esop_lset";
 const KEY_ESOP_LAST_SWEEP_BLK: &[u8] = b"shc:esop_lblk";
+const KEY_ISS_ALLOC_LAST_SET: &[u8] = b"shc:issa_lset";
+const KEY_ISS_ALLOC_LAST_BLK: &[u8] = b"shc:issa_lblk";
 
 const MAX_ESOP_TRANCHES: usize = 24;
 
@@ -100,6 +109,11 @@ hps_entry! {
     "placeSellOrder(address,uint64,uint64)"                                     => handle_place_sell_order,
     "settleShareTransferAuction(address,address)"                               => handle_settle_share_transfer_auction,
     "settleShareIssuance(address,address)"                                      => handle_settle_share_issuance,
+    "determineIssuanceAllocation(address,address)"                              => handle_determine_issuance_allocation,
+    "signShareholdersAgreementAndClaimShares(address,bytes32)"                  => handle_sign_sha_and_claim_shares,
+    "issuanceAllocationSummary(address)"                                        => handle_issuance_allocation_summary,
+    "getIssuanceAllotment(address,uint64)"                                      => handle_get_issuance_allotment,
+    "pendingShaAllotmentOf(address,address)"                                    => handle_pending_sha_allotment_of,
     "refundFailedAuction(address)"                                              => handle_refund_failed_auction,
     "executeShareBuyback(address,address,uint64,uint64,address)"                => handle_execute_share_buyback,
     "executeShareSplit(address,uint64,address)"                                 => handle_execute_share_split,
@@ -689,48 +703,752 @@ fn handle_settle_share_transfer_auction(args: &CalldataReader) -> Result<(), i32
     Ok(())
 }
 
-fn handle_settle_share_issuance(args: &CalldataReader) -> Result<(), i32> {
-    let (_registry, charter, _caller) = ensure_active_and_valid_caller()?;
+#[derive(Clone, Copy)]
+struct IssuanceRoundSummary {
+    share_ledger: [u8; 20],
+    target_shares: u64,
+    clearing_price: u64,
+    rofr_allocated: u64,
+    bidders_allocated: u64,
+    allotment_count: u16,
+    pending_sha_count: u16,
+}
+
+#[derive(Clone, Copy)]
+struct IssuanceAllotment {
+    investor: [u8; 20],
+    share_ledger: [u8; 20],
+    shares: u64,
+    clearing_price: u64,
+    is_rofr: u8,
+    claimed: u8,
+}
+
+fn iss_summary_key(auth_obj: &[u8; 20]) -> KeyBuilder<32> {
+    KeyBuilder::<32>::new().push(b"issa:s:").push(auth_obj)
+}
+
+fn iss_allot_key(auth_obj: &[u8; 20], idx: u16) -> KeyBuilder<32> {
+    KeyBuilder::<32>::new()
+        .push(b"issa:i:")
+        .push(auth_obj)
+        .push(&idx.to_be_bytes())
+}
+
+fn iss_inv_idx_key(auth_obj: &[u8; 20], investor: &[u8; 20]) -> KeyBuilder<48> {
+    KeyBuilder::<48>::new()
+        .push(b"issa:u:")
+        .push(auth_obj)
+        .push(investor)
+}
+
+fn save_issuance_summary(auth_obj: &[u8; 20], s: &IssuanceRoundSummary) {
+    let mut b = [0u8; 56];
+    b[0..20].copy_from_slice(&s.share_ledger);
+    b[20..28].copy_from_slice(&s.target_shares.to_be_bytes());
+    b[28..36].copy_from_slice(&s.clearing_price.to_be_bytes());
+    b[36..44].copy_from_slice(&s.rofr_allocated.to_be_bytes());
+    b[44..52].copy_from_slice(&s.bidders_allocated.to_be_bytes());
+    b[52..54].copy_from_slice(&s.allotment_count.to_be_bytes());
+    b[54..56].copy_from_slice(&s.pending_sha_count.to_be_bytes());
+    storage::set(iss_summary_key(auth_obj).as_slice(), &b);
+}
+
+fn load_issuance_summary(auth_obj: &[u8; 20]) -> Option<IssuanceRoundSummary> {
+    let mut b = [0u8; 56];
+    if storage::get_into(iss_summary_key(auth_obj).as_slice(), &mut b)? != 56 {
+        return None;
+    }
+    let mut share_ledger = [0u8; 20];
+    share_ledger.copy_from_slice(&b[0..20]);
+    let rd = |off: usize| -> u64 {
+        let mut w = [0u8; 8];
+        w.copy_from_slice(&b[off..off + 8]);
+        u64::from_be_bytes(w)
+    };
+    Some(IssuanceRoundSummary {
+        share_ledger,
+        target_shares: rd(20),
+        clearing_price: rd(28),
+        rofr_allocated: rd(36),
+        bidders_allocated: rd(44),
+        allotment_count: u16::from_be_bytes([b[52], b[53]]),
+        pending_sha_count: u16::from_be_bytes([b[54], b[55]]),
+    })
+}
+
+fn save_issuance_allotment(auth_obj: &[u8; 20], idx: u16, a: &IssuanceAllotment) {
+    let mut b = [0u8; 58];
+    b[0..20].copy_from_slice(&a.investor);
+    b[20..40].copy_from_slice(&a.share_ledger);
+    b[40..48].copy_from_slice(&a.shares.to_be_bytes());
+    b[48..56].copy_from_slice(&a.clearing_price.to_be_bytes());
+    b[56] = a.is_rofr;
+    b[57] = a.claimed;
+    storage::set(iss_allot_key(auth_obj, idx).as_slice(), &b);
+}
+
+fn load_issuance_allotment(auth_obj: &[u8; 20], idx: u16) -> Option<IssuanceAllotment> {
+    let mut b = [0u8; 58];
+    if storage::get_into(iss_allot_key(auth_obj, idx).as_slice(), &mut b)? != 58 {
+        return None;
+    }
+    let mut investor = [0u8; 20];
+    let mut share_ledger = [0u8; 20];
+    investor.copy_from_slice(&b[0..20]);
+    share_ledger.copy_from_slice(&b[20..40]);
+    let mut ws = [0u8; 8];
+    let mut wp = [0u8; 8];
+    ws.copy_from_slice(&b[40..48]);
+    wp.copy_from_slice(&b[48..56]);
+    Some(IssuanceAllotment {
+        investor,
+        share_ledger,
+        shares: u64::from_be_bytes(ws),
+        clearing_price: u64::from_be_bytes(wp),
+        is_rofr: b[56],
+        claimed: b[57],
+    })
+}
+
+fn compute_issuance_clearing_price(
+    book: &AuctionBook,
+    target_shares: u64,
+    offer_price: u64,
+) -> u64 {
+    let mut total_strictly_above = 0u64;
+    let mut min_strictly_above = u64::MAX;
+    let mut min_qualifying = u64::MAX;
+    let mut i = 0usize;
+    while i < book.order_count {
+        let ord = book.orders[i];
+        if !ord.is_cancelled()
+            && ord.side == ORDER_SIDE_BUY_STEP1
+            && ord.price >= offer_price
+            && ord.quantity > 0
+        {
+            if ord.price < min_qualifying {
+                min_qualifying = ord.price;
+            }
+            if ord.price > offer_price {
+                total_strictly_above = total_strictly_above.saturating_add(ord.quantity);
+                if ord.price < min_strictly_above {
+                    min_strictly_above = ord.price;
+                }
+            }
+        }
+        i += 1;
+    }
+    if target_shares > 0 && total_strictly_above > target_shares && min_strictly_above < u64::MAX {
+        min_strictly_above
+    } else if min_qualifying < u64::MAX {
+        min_qualifying
+    } else {
+        offer_price
+    }
+}
+
+/// Pro-rata allocation with largest-remainder tie-breaking across `idxs[..count]` so total fills
+/// equal `min(sum_qty, cap)` without ever exceeding `cap` or any individual `ord.quantity`.
+fn allocate_tier_pro_rata(
+    book: &AuctionBook,
+    idxs: &[usize; MAX_AUCTION_ORDERS],
+    count: usize,
+    cap: u64,
+    fills: &mut [u64; MAX_AUCTION_ORDERS],
+) -> u64 {
+    if cap == 0 || count == 0 {
+        return 0;
+    }
+    let mut sum_qty = 0u64;
+    let mut k = 0usize;
+    while k < count {
+        sum_qty = sum_qty.saturating_add(book.orders[idxs[k]].quantity);
+        k += 1;
+    }
+    if sum_qty == 0 {
+        return 0;
+    }
+    if sum_qty <= cap {
+        k = 0;
+        while k < count {
+            let oi = idxs[k];
+            fills[oi] = book.orders[oi].quantity;
+            k += 1;
+        }
+        return sum_qty;
+    }
+
+    let denom = sum_qty as u128;
+    let mut remainders = [0u128; MAX_AUCTION_ORDERS];
+    let mut used = [false; MAX_AUCTION_ORDERS];
+    let mut allocated = 0u64;
+    k = 0;
+    while k < count {
+        let oi = idxs[k];
+        let num = (cap as u128) * (book.orders[oi].quantity as u128);
+        let base = (num / denom) as u64;
+        fills[oi] = base;
+        remainders[k] = num % denom;
+        allocated = allocated.saturating_add(base);
+        k += 1;
+    }
+
+    let mut rem = cap.saturating_sub(allocated);
+    while rem > 0 {
+        let mut best_k = usize::MAX;
+        k = 0;
+        while k < count {
+            let oi = idxs[k];
+            if !used[k] && fills[oi] < book.orders[oi].quantity {
+                if best_k == usize::MAX {
+                    best_k = k;
+                } else {
+                    let prev_oi = idxs[best_k];
+                    let better = remainders[k] > remainders[best_k]
+                        || (remainders[k] == remainders[best_k]
+                            && book.orders[oi].price > book.orders[prev_oi].price);
+                    if better {
+                        best_k = k;
+                    }
+                }
+            }
+            k += 1;
+        }
+        if best_k == usize::MAX {
+            break;
+        }
+        used[best_k] = true;
+        fills[idxs[best_k]] += 1;
+        allocated += 1;
+        rem -= 1;
+    }
+    allocated
+}
+
+/// Core 5-Step Share Issuance Step 4 Allocation Determination:
+/// - Prioritizes Step 3 Existing Shareholder ROFR orders (`100%` up to `targetShares`, pro-rata if `> targetShares`).
+/// - Allocates remaining shares (`targetShares - rofrAllocated`) across Step 2 External Investor Bids (pro-rata if oversubscribed).
+/// - Refunds all unfilled / surplus escrowed cash immediately.
+/// - Mints existing shareholders' shares immediately; locks new shareholders' exact allotments awaiting Step 5 SHA signature!
+fn execute_determine_issuance_allocation(
+    registry: &[u8; 20],
+    charter: &[u8; 20],
+    share_ledger: &[u8; 20],
+    auth_obj: &[u8; 20],
+    enforce_block_guard: bool,
+) -> Result<[u8; 160], i32> {
+    if *share_ledger == [0u8; 20] || *auth_obj == [0u8; 20] {
+        return Err(-14);
+    }
+    if load_issuance_summary(auth_obj).is_some() {
+        return Err(-60); // Allocation already determined for this round!
+    }
+    if enforce_block_guard {
+        let now = context::block_number();
+        if storage::get_u64(KEY_ISS_ALLOC_LAST_SET) == 1
+            && storage::get_u64(KEY_ISS_ALLOC_LAST_BLK) == now
+        {
+            return Err(ERR_ALREADY_EXECUTED_IN_BLOCK);
+        }
+        storage::set_u64(KEY_ISS_ALLOC_LAST_SET, 1);
+        storage::set_u64(KEY_ISS_ALLOC_LAST_BLK, now);
+    }
+
+    verify_ledger_pinned_to_charter(share_ledger, charter)?;
+    let target_cd = CallEncoder::<16>::new(const { selector("targetHps()") });
+    let raw_tgt = call::call_raw(auth_obj, target_cd.as_slice())?;
+    if raw_tgt.len() < 32 || &raw_tgt[12..32] != share_ledger {
+        return Err(-62);
+    }
+
+    validate_charter_capital_auth(charter, auth_obj)?;
+
+    // Read Equity Financing conversion rate & custom class label BEFORE consuming `auth_obj`
+    let mut conv_rate = 1u64;
+    let eq_cd = CallEncoder::<16>::new(const { selector("equityFinancingTerms()") });
+    if let Ok(eq_raw) = call::call_raw(auth_obj, eq_cd.as_slice()) {
+        if eq_raw.len() >= 9 * 32 {
+            let mut w_cv = [0u8; 8];
+            w_cv.copy_from_slice(&eq_raw[2 * 32 + 24..3 * 32]);
+            conv_rate = u64::from_be_bytes(w_cv).max(1);
+        }
+    }
+    let mut class_label = [0u8; 32];
+    let lbl_cd = CallEncoder::<16>::new(const { selector("issuanceClassLabel()") });
+    if let Ok(lbl_raw) = call::call_raw(auth_obj, lbl_cd.as_slice()) {
+        if lbl_raw.len() >= 32 {
+            class_label.copy_from_slice(&lbl_raw[0..32]);
+        }
+    }
+
+    let me = context::self_address();
+    let (book, target_shares, offer_price) = verify_and_consume_issuance_auction_auth(
+        registry,
+        auth_obj,
+        charter,
+        &POLICY_SHARE_ISSUANCE_AUCTION,
+        &me,
+    )?;
+
+    if target_shares == 0 || offer_price == 0 || book.active_step1_bid_count() == 0 {
+        return Err(ERR_NO_BIDS_IN_STAGE);
+    }
+
+    let clearing_price = compute_issuance_clearing_price(&book, target_shares, offer_price);
+
+    let mut rofr_idxs = [0usize; MAX_AUCTION_ORDERS];
+    let mut rofr_cnt = 0usize;
+    let mut rofr_qty = 0u64;
+    let mut bid_idxs = [0usize; MAX_AUCTION_ORDERS];
+    let mut bid_cnt = 0usize;
+    let mut bid_qty = 0u64;
+
+    let mut i = 0usize;
+    while i < book.order_count {
+        let ord = book.orders[i];
+        if !ord.is_cancelled() && ord.is_buy() && ord.quantity > 0 {
+            require_valid_identity(registry, &ord.trader)?;
+            if ord.price >= clearing_price {
+                if ord.side == ORDER_SIDE_BUY_STEP3 {
+                    rofr_idxs[rofr_cnt] = i;
+                    rofr_cnt += 1;
+                    rofr_qty = rofr_qty.saturating_add(ord.quantity);
+                } else if ord.side == ORDER_SIDE_BUY_STEP1 {
+                    bid_idxs[bid_cnt] = i;
+                    bid_cnt += 1;
+                    bid_qty = bid_qty.saturating_add(ord.quantity);
+                }
+            }
+        }
+        i += 1;
+    }
+
+    if rofr_qty.saturating_add(bid_qty) < target_shares {
+        return Err(ERR_NO_BIDS_IN_STAGE);
+    }
+
+    // Tier 1: Prioritize Existing Shareholders' ROFR (`100%` up to `target_shares`, pro-rata if `rofr_qty > target_shares`)
+    let mut order_fills = [0u64; MAX_AUCTION_ORDERS];
+    let rofr_allocated =
+        allocate_tier_pro_rata(&book, &rofr_idxs, rofr_cnt, target_shares, &mut order_fills);
+    // Tier 2: Remaining shares (`target_shares - rofr_allocated`) go to Step 2 Prospective Investor Bidders
+    let rem_for_bidders = target_shares.saturating_sub(rofr_allocated);
+    let bidders_allocated =
+        allocate_tier_pro_rata(&book, &bid_idxs, bid_cnt, rem_for_bidders, &mut order_fills);
+    let total_allocated = rofr_allocated.saturating_add(bidders_allocated);
+    if total_allocated != target_shares {
+        return Err(ERR_NO_BIDS_IN_STAGE);
+    }
+
+    // Snapshot pre-round existing shareholder status BEFORE registering/minting any new shares
+    let mut uniq_investors = [[0u8; 20]; MAX_AUCTION_ORDERS];
+    let mut uniq_shares = [0u64; MAX_AUCTION_ORDERS];
+    let mut uniq_is_rofr = [0u8; MAX_AUCTION_ORDERS];
+    let mut uniq_existing = [false; MAX_AUCTION_ORDERS];
+    let mut uniq_cnt = 0usize;
+
+    i = 0;
+    while i < book.order_count {
+        let fill = order_fills[i];
+        if fill > 0 {
+            let inv = book.orders[i].trader;
+            let is_r = u8::from(book.orders[i].side == ORDER_SIDE_BUY_STEP3);
+            let mut found = usize::MAX;
+            let mut u = 0usize;
+            while u < uniq_cnt {
+                if uniq_investors[u] == inv {
+                    found = u;
+                    break;
+                }
+                u += 1;
+            }
+            if found == usize::MAX {
+                let (holder_conv, _) = query_converted_common_totals(charter, &inv).unwrap_or((0, 0));
+                let bal_cd = CallEncoder::<64>::new(const { selector("balanceOf(address)") })
+                    .push_address(&inv);
+                let led_bal = call::call_u64(share_ledger, bal_cd.as_slice()).unwrap_or(0);
+                let sha_cd = CallEncoder::<64>::new(const {
+                    selector("hasSignedShareholdersAgreement(address)")
+                })
+                .push_address(&inv);
+                let signed_sha = call::call_bool(charter, sha_cd.as_slice()).unwrap_or(false);
+
+                uniq_investors[uniq_cnt] = inv;
+                uniq_shares[uniq_cnt] = fill;
+                uniq_is_rofr[uniq_cnt] = is_r;
+                uniq_existing[uniq_cnt] = holder_conv > 0 || led_bal > 0 || signed_sha || is_r == 1;
+                uniq_cnt += 1;
+            } else {
+                uniq_shares[found] = uniq_shares[found].saturating_add(fill);
+                if is_r == 1 {
+                    uniq_is_rofr[found] = 1;
+                    uniq_existing[found] = true;
+                }
+            }
+        }
+        i += 1;
+    }
+
+    // Register / ensure share class & custom label on `CorporateCharter` (`votes_per_share = conv_rate`)
+    let ens_cd = CallEncoder::<160>::new(const {
+        selector("moduleEnsureShareClass(address,uint64,uint64,uint64)")
+    })
+    .push_address(share_ledger)
+    .push_u64(conv_rate)
+    .push_u64(conv_rate)
+    .push_u64(1);
+    let _ = call::call_raw(charter, ens_cd.as_slice());
+
+    if class_label != [0u8; 32] {
+        let lbl_set_cd = CallEncoder::<128>::new(const {
+            selector("moduleSetShareClassLabel(address,bytes32)")
+        })
+        .push_address(share_ledger)
+        .push_bytes32(&class_label);
+        let _ = call::call_raw(charter, lbl_set_cd.as_slice());
+    }
+
+    let has_escrow = storage::get_u64(auc_escrow_active_key(auth_obj).as_slice()) == 1;
+    let ek = auc_escrow_key(auth_obj);
+    let mut cur_escrow = storage::get_u64(ek.as_slice());
+    let bank_ledger = storage::get_address(KEY_BANK_LEDGER).unwrap_or([0u8; 20]);
+    let escrow_acct = storage::get_address(KEY_SHARE_ESCROW_ACCT).unwrap_or([0u8; 20]);
+    let treasury = storage::get_address(KEY_INITIALIZER).unwrap_or(escrow_acct);
+
+    // Immediately refund unfilled / surplus escrowed cash (`ord.price * ord.qty - clearing_price * fill`)
+    if has_escrow && bank_ledger != [0u8; 20] && escrow_acct != [0u8; 20] {
+        i = 0;
+        while i < book.order_count {
+            let ord = book.orders[i];
+            if !ord.is_cancelled() && ord.is_buy() && ord.quantity > 0 {
+                let escrowed = ord.price.checked_mul(ord.quantity).ok_or(-15)?;
+                let spent = clearing_price.checked_mul(order_fills[i]).ok_or(-15)?;
+                let refund = escrowed.saturating_sub(spent);
+                if refund > 0 {
+                    if cur_escrow < refund {
+                        return Err(-16);
+                    }
+                    cur_escrow -= refund;
+                    if escrow_acct != ord.trader {
+                        let ref_cd = CallEncoder::<128>::new(const {
+                            selector("charterModuleClearTransfer(address,address,uint64)")
+                        })
+                        .push_address(&escrow_acct)
+                        .push_address(&ord.trader)
+                        .push_u64(refund);
+                        let ok = call::call_bool(&bank_ledger, ref_cd.as_slice())?;
+                        if !ok {
+                            return Err(-16);
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+
+    // Settle existing shareholders immediately; lock new shareholders' allotments awaiting Step 5 SHA signature!
+    let mut pending_sha_count = 0u16;
+    let mut u = 0usize;
+    while u < uniq_cnt {
+        let inv = uniq_investors[u];
+        let sh = uniq_shares[u];
+        let cost = clearing_price.checked_mul(sh).ok_or(-15)?;
+        let claimed = if uniq_existing[u] {
+            if has_escrow && cost > 0 && bank_ledger != [0u8; 20] && escrow_acct != [0u8; 20] {
+                if cur_escrow < cost {
+                    return Err(-16);
+                }
+                cur_escrow -= cost;
+                if escrow_acct != treasury && treasury != [0u8; 20] {
+                    let pay_cd = CallEncoder::<128>::new(const {
+                        selector("charterModuleClearTransfer(address,address,uint64)")
+                    })
+                    .push_address(&escrow_acct)
+                    .push_address(&treasury)
+                    .push_u64(cost);
+                    let ok = call::call_bool(&bank_ledger, pay_cd.as_slice())?;
+                    if !ok {
+                        return Err(-16);
+                    }
+                }
+            }
+            let iss_cd = CallEncoder::<96>::new(const {
+                selector("charterModuleIssue(address,uint64)")
+            })
+            .push_address(&inv)
+            .push_u64(sh);
+            let _ = call::call_u64(share_ledger, iss_cd.as_slice())?;
+            1u8
+        } else {
+            pending_sha_count = pending_sha_count.saturating_add(1);
+            0u8
+        };
+
+        let allot = IssuanceAllotment {
+            investor: inv,
+            share_ledger: *share_ledger,
+            shares: sh,
+            clearing_price,
+            is_rofr: uniq_is_rofr[u],
+            claimed,
+        };
+        save_issuance_allotment(auth_obj, u as u16, &allot);
+        storage::set_u64(iss_inv_idx_key(auth_obj, &inv).as_slice(), (u as u64) + 1);
+        u += 1;
+    }
+
+    if has_escrow {
+        storage::set_u64(ek.as_slice(), cur_escrow);
+        storage::set_u64(
+            auc_escrow_active_key(auth_obj).as_slice(),
+            u64::from(pending_sha_count > 0 && cur_escrow > 0),
+        );
+    }
+
+    let summary = IssuanceRoundSummary {
+        share_ledger: *share_ledger,
+        target_shares,
+        clearing_price,
+        rofr_allocated,
+        bidders_allocated,
+        allotment_count: uniq_cnt as u16,
+        pending_sha_count,
+    };
+    save_issuance_summary(auth_obj, &summary);
+
+    let mut ev = [0u8; 40];
+    ev[0..8].copy_from_slice(&total_allocated.to_be_bytes());
+    ev[8..16].copy_from_slice(&clearing_price.to_be_bytes());
+    ev[16..24].copy_from_slice(&rofr_allocated.to_be_bytes());
+    ev[24..32].copy_from_slice(&bidders_allocated.to_be_bytes());
+    ev[32..40].copy_from_slice(&(pending_sha_count as u64).to_be_bytes());
+    events::emit(
+        &[
+            ISSUANCE_ALLOCATION_DETERMINED,
+            addr_topic(auth_obj),
+            addr_topic(share_ledger),
+        ],
+        &ev,
+    );
+
+    let mut out = [0u8; 160];
+    out[24..32].copy_from_slice(&total_allocated.to_be_bytes());
+    out[56..64].copy_from_slice(&clearing_price.to_be_bytes());
+    out[88..96].copy_from_slice(&rofr_allocated.to_be_bytes());
+    out[120..128].copy_from_slice(&bidders_allocated.to_be_bytes());
+    out[152..160].copy_from_slice(&(pending_sha_count as u64).to_be_bytes());
+    Ok(out)
+}
+
+/// Permissionless Step 4 periodic / simulator process runner (`determineIssuanceAllocation(address,address)`):
+/// requires NO authentication or authorization from `msg_sender()` and enforces a once-per-block safeguard (`-102`).
+fn handle_determine_issuance_allocation(args: &CalldataReader) -> Result<(), i32> {
+    let charter = ensure_charter_active_only()?;
+    let registry = storage::get_address(KEY_REGISTRY).ok_or(-57)?;
     let share_ledger = args.address(0).ok_or(-3)?;
     let auth_obj = args.address(1).ok_or(-3)?;
 
-    validate_charter_capital_auth(&charter, &auth_obj)?;
+    let out = execute_determine_issuance_allocation(
+        &registry,
+        &charter,
+        &share_ledger,
+        &auth_obj,
+        true,
+    )?;
+    ret::write(&out);
+    Ok(())
+}
 
-    // Check if this issuance is a multi-class Equity Financing (`isEquityFinancing == 1`);
-    // if so, ensure `share_ledger` is registered as a ShareClass on `CorporateCharter` before minting,
-    // and snapshot subscriber addresses so allotted new shareholders are recorded in the SHA registry!
+/// Step 5 — New Shareholder signs the company's **Shareholders' Agreement (`shaDocHash`)** to claim
+/// their allotted shares in their name and automatically update the Capitalization Table!
+fn handle_sign_sha_and_claim_shares(args: &CalldataReader) -> Result<(), i32> {
+    let (_registry, charter, caller) = ensure_active_and_valid_caller()?;
+    let auth_obj = args.address(0).ok_or(-3)?;
+    let sha_doc_hash = args.bytes32(1).ok_or(-3)?;
+
+    let expected_sha = compute_sha_doc_hash(&charter);
+    if sha_doc_hash != expected_sha {
+        return Err(ERR_SHA_SIGNATURE_REQUIRED);
+    }
+
+    let idx_plus_1 = storage::get_u64(iss_inv_idx_key(&auth_obj, &caller).as_slice());
+    if idx_plus_1 == 0 {
+        return Err(-62); // No allotment for caller in this issuance round
+    }
+    let idx = (idx_plus_1 - 1) as u16;
+    let mut summary = load_issuance_summary(&auth_obj).ok_or(-62)?;
+    let mut allot = load_issuance_allotment(&auth_obj, idx).ok_or(-62)?;
+    if allot.investor != caller || allot.shares == 0 {
+        return Err(-62);
+    }
+    if allot.claimed != 0 {
+        return Err(-61); // Already claimed!
+    }
+
+    // 1. Record SHA signature on `CorporateCharter`
+    let rec_cd = CallEncoder::<128>::new(const {
+        selector("moduleRecordShareholdersAgreement(address,bytes32)")
+    })
+    .push_address(&caller)
+    .push_bytes32(&sha_doc_hash);
+    let rec_ok = call::call_bool(&charter, rec_cd.as_slice())?;
+    if !rec_ok {
+        return Err(ERR_SHA_SIGNATURE_REQUIRED);
+    }
+
+    // 2. Sweep allotted subscription cash (`clearingPrice * shares`) from `shareEscrowAccount` to Corporate Treasury
+    let cost = allot.clearing_price.checked_mul(allot.shares).ok_or(-15)?;
+    let ek = auc_escrow_key(&auth_obj);
+    let cur_escrow = storage::get_u64(ek.as_slice());
+    if cur_escrow > 0 {
+        if cur_escrow < cost {
+            return Err(-16);
+        }
+        let rem_escrow = cur_escrow - cost;
+        storage::set_u64(ek.as_slice(), rem_escrow);
+        let bank_ledger = storage::get_address(KEY_BANK_LEDGER).ok_or(-63)?;
+        let escrow_acct = storage::get_address(KEY_SHARE_ESCROW_ACCT).ok_or(-63)?;
+        let treasury = storage::get_address(KEY_INITIALIZER).unwrap_or(escrow_acct);
+        if cost > 0 && escrow_acct != treasury && treasury != [0u8; 20] {
+            let pay_cd = CallEncoder::<128>::new(const {
+                selector("charterModuleClearTransfer(address,address,uint64)")
+            })
+            .push_address(&escrow_acct)
+            .push_address(&treasury)
+            .push_u64(cost);
+            let ok = call::call_bool(&bank_ledger, pay_cd.as_slice())?;
+            if !ok {
+                return Err(-16);
+            }
+        }
+        if rem_escrow == 0 {
+            storage::set_u64(auc_escrow_active_key(&auth_obj).as_slice(), 0);
+        }
+    }
+
+    // 3. Mint allotted shares directly into the new shareholder's name -> automatically updates Cap Table!
+    let iss_cd = CallEncoder::<96>::new(const { selector("charterModuleIssue(address,uint64)") })
+        .push_address(&caller)
+        .push_u64(allot.shares);
+    let _ = call::call_u64(&allot.share_ledger, iss_cd.as_slice())?;
+
+    allot.claimed = 1;
+    save_issuance_allotment(&auth_obj, idx, &allot);
+    summary.pending_sha_count = summary.pending_sha_count.saturating_sub(1);
+    save_issuance_summary(&auth_obj, &summary);
+    if summary.pending_sha_count == 0 {
+        storage::set_u64(auc_escrow_active_key(&auth_obj).as_slice(), 0);
+    }
+
+    let mut ev = [0u8; 16];
+    ev[0..8].copy_from_slice(&allot.shares.to_be_bytes());
+    ev[8..16].copy_from_slice(&allot.clearing_price.to_be_bytes());
+    events::emit(
+        &[
+            ISSUANCE_SHARES_CLAIMED,
+            addr_topic(&auth_obj),
+            addr_topic(&allot.share_ledger),
+            addr_topic(&caller),
+        ],
+        &ev,
+    );
+
+    ret::write_u64_word(allot.shares);
+    Ok(())
+}
+
+/// Returns `(bool determined, address shareLedger, uint64 targetShares, uint64 clearingPrice,
+///           uint64 rofrAllocated, uint64 biddersAllocated, uint64 allotmentCount, uint64 pendingShaCount)`.
+fn handle_issuance_allocation_summary(args: &CalldataReader) -> Result<(), i32> {
+    let auth_obj = args.address(0).ok_or(-3)?;
+    let mut out = [0u8; 8 * 32];
+    if let Some(s) = load_issuance_summary(&auth_obj) {
+        out[31] = 1;
+        out[32 + 12..64].copy_from_slice(&s.share_ledger);
+        let nums = [
+            s.target_shares,
+            s.clearing_price,
+            s.rofr_allocated,
+            s.bidders_allocated,
+            s.allotment_count as u64,
+            s.pending_sha_count as u64,
+        ];
+        let mut i = 0usize;
+        while i < nums.len() {
+            out[(i + 2) * 32 + 24..(i + 3) * 32].copy_from_slice(&nums[i].to_be_bytes());
+            i += 1;
+        }
+    }
+    ret::write(&out);
+    Ok(())
+}
+
+/// Returns `(address investor, address shareLedger, uint64 shares, uint64 clearingPrice, bool isRofr, bool claimed)`.
+fn handle_get_issuance_allotment(args: &CalldataReader) -> Result<(), i32> {
+    let auth_obj = args.address(0).ok_or(-3)?;
+    let idx = args.u64(1).ok_or(-3)? as u16;
+    let a = load_issuance_allotment(&auth_obj, idx).ok_or(-62)?;
+    let mut out = [0u8; 6 * 32];
+    out[12..32].copy_from_slice(&a.investor);
+    out[32 + 12..64].copy_from_slice(&a.share_ledger);
+    out[64 + 24..96].copy_from_slice(&a.shares.to_be_bytes());
+    out[96 + 24..128].copy_from_slice(&a.clearing_price.to_be_bytes());
+    out[128 + 31] = a.is_rofr;
+    out[160 + 31] = a.claimed;
+    ret::write(&out);
+    Ok(())
+}
+
+/// Returns `(uint64 shares, uint64 clearingPrice, address shareLedger, bool isRofr, bool claimed)`
+/// for `investor` in `authObj` (`shares == 0` if none).
+fn handle_pending_sha_allotment_of(args: &CalldataReader) -> Result<(), i32> {
+    let auth_obj = args.address(0).ok_or(-3)?;
+    let investor = args.address(1).ok_or(-3)?;
+    let mut out = [0u8; 5 * 32];
+    let idx_plus_1 = storage::get_u64(iss_inv_idx_key(&auth_obj, &investor).as_slice());
+    if idx_plus_1 > 0 {
+        if let Some(a) = load_issuance_allotment(&auth_obj, (idx_plus_1 - 1) as u16) {
+            out[24..32].copy_from_slice(&a.shares.to_be_bytes());
+            out[32 + 24..64].copy_from_slice(&a.clearing_price.to_be_bytes());
+            out[64 + 12..96].copy_from_slice(&a.share_ledger);
+            out[96 + 31] = a.is_rofr;
+            out[128 + 31] = a.claimed;
+        }
+    }
+    ret::write(&out);
+    Ok(())
+}
+
+fn handle_settle_share_issuance(args: &CalldataReader) -> Result<(), i32> {
+    let (registry, charter, _caller) = ensure_active_and_valid_caller()?;
+    let share_ledger = args.address(0).ok_or(-3)?;
+    let auth_obj = args.address(1).ok_or(-3)?;
+
+    // Delegate multi-step Equity Financing rounds (`isEquityFinancing == 1`) to the 5-step ROFR + SHA allocation engine!
     let mut is_eqf = false;
-    let mut conv_rate = 1u64;
     let eq_cd = CallEncoder::<16>::new(const { selector("equityFinancingTerms()") });
     if let Ok(eq_raw) = call::call_raw(&auth_obj, eq_cd.as_slice()) {
         if eq_raw.len() >= 9 * 32 {
             let mut w_eq = [0u8; 8];
-            let mut w_cv = [0u8; 8];
             w_eq.copy_from_slice(&eq_raw[24..32]);
-            w_cv.copy_from_slice(&eq_raw[2 * 32 + 24..3 * 32]);
             is_eqf = u64::from_be_bytes(w_eq) == 1;
-            conv_rate = u64::from_be_bytes(w_cv).max(1);
         }
+    }
+    if is_eqf {
+        let out = execute_determine_issuance_allocation(
+            &registry,
+            &charter,
+            &share_ledger,
+            &auth_obj,
+            false,
+        )?;
+        ret::write(&out);
+        return Ok(());
     }
 
-    let mut pre_book = AuctionBook::new();
-    if is_eqf {
-        let ord_cd = CallEncoder::<16>::new(const { selector("getOrdersRaw()") });
-        let mut raw_book = [0u8; MAX_ENCODED_AUCTION_BOOK_BYTES];
-        if let Ok(n) = call::call_abi_bytes_into(&auth_obj, ord_cd.as_slice(), &mut raw_book) {
-            if let Some(b) = AuctionBook::decode(&raw_book[..n]) {
-                pre_book = b;
-            }
-        }
-        let ens_cd = CallEncoder::<160>::new(const {
-            selector("moduleEnsureShareClass(address,uint64,uint64,uint64)")
-        })
-        .push_address(&share_ledger)
-        .push_u64(1)
-        .push_u64(conv_rate)
-        .push_u64(1);
-        let _ = call::call_raw(&charter, ens_cd.as_slice());
-    }
+    validate_charter_capital_auth(&charter, &auth_obj)?;
 
     let settle_cd = CallEncoder::<64>::new(const { selector("settleIssuanceAuction(address)") })
         .push_address(&auth_obj);
@@ -738,28 +1456,6 @@ fn handle_settle_share_issuance(args: &CalldataReader) -> Result<(), i32> {
     let mut out_copy = [0u8; 160];
     let out_len = out_raw.len().min(160);
     out_copy[..out_len].copy_from_slice(&out_raw[..out_len]);
-
-    if is_eqf {
-        let sha_hash = compute_sha_doc_hash(&charter);
-        let mut i = 0usize;
-        while i < pre_book.order_count {
-            let ord = pre_book.orders[i];
-            if !ord.is_cancelled() && ord.is_buy() && ord.quantity > 0 {
-                let bal_cd = CallEncoder::<64>::new(const { selector("balanceOf(address)") })
-                    .push_address(&ord.trader);
-                if call::call_u64(&share_ledger, bal_cd.as_slice()).unwrap_or(0) > 0 {
-                    let rec_cd = CallEncoder::<128>::new(const {
-                        selector("moduleRecordShareholdersAgreement(address,bytes32)")
-                    })
-                    .push_address(&ord.trader)
-                    .push_bytes32(&sha_hash);
-                    let _ = call::call_raw(&charter, rec_cd.as_slice());
-                }
-            }
-            i += 1;
-        }
-    }
-
     ret::write(&out_copy[..out_len]);
     Ok(())
 }
@@ -1413,7 +2109,7 @@ fn handle_create_esop_program(args: &CalldataReader) -> Result<(), i32> {
         selector("moduleEnsureShareClass(address,uint64,uint64,uint64)")
     })
     .push_address(&underlying_ledger)
-    .push_u64(1)
+    .push_u64(conversion_rate)
     .push_u64(conversion_rate)
     .push_u64(1);
     let _ = call::call_raw(&charter, ens_cd.as_slice());
@@ -1924,7 +2620,15 @@ mod tests {
                 return 0;
             }
             if sel == const { selector("moduleEnsureShareClass(address,uint64,uint64,uint64)") } {
+                storage::set_u64(b"last_vps", args.u64(1).unwrap());
+                storage::set_u64(b"last_conv", args.u64(2).unwrap());
                 ret::write_u64_word(1);
+                return 0;
+            }
+            if sel == const { selector("moduleSetShareClassLabel(address,bytes32)") } {
+                let lbl = args.bytes32(1).unwrap();
+                storage::set(b"last_lbl", &lbl);
+                ret::write_bool(true);
                 return 0;
             }
             -2
@@ -2341,5 +3045,210 @@ mod tests {
             u64::from_be_bytes(mock::take_return_data()[24..32].try_into().unwrap()),
             500
         );
+    }
+
+    #[test]
+    fn five_step_issuance_rofr_priority_pro_rata_and_sha_claim_updates_captable() {
+        use hps_sdk::governance::AuctionOrder;
+
+        mock::reset();
+        let sc_addr = [0x5C; 20];
+        let reg_addr = [0xB0; 20];
+        let charter_addr = [0xC0; 20];
+        let bank_addr = [0xBA; 20];
+        let escrow_acct = [0xE5; 20];
+        const PREF_X_LED: [u8; 20] = [0x58; 20];
+        const ROFR_HOLDER: [u8; 20] = [0x12; 20];
+        const NEW_INV_1: [u8; 20] = [0x31; 20];
+        const NEW_INV_2: [u8; 20] = [0x32; 20];
+        let pref_x_led = PREF_X_LED;
+        let founder = [0x11; 20]; // Existing shareholder & company treasury
+        let rofr_holder = ROFR_HOLDER; // Existing minority shareholder exercising ROFR
+        let new_inv_1 = NEW_INV_1; // Prospective new investor #1
+        let new_inv_2 = NEW_INV_2; // Prospective new investor #2
+        let auth_iss = [0xA0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 99];
+
+        mock::register_hps(reg_addr, reg_stub::dispatch);
+        mock::register_hps(charter_addr, charter_stub::dispatch);
+        mock::register_hps(bank_addr, futures_stub::dispatch);
+        mock::register_hps(pref_x_led, futures_stub::dispatch);
+
+        // Pre-money: 100,000 Common shares (`founder = 80,000`, `rofr_holder = 20,000`)
+        mock::set_self_address(charter_addr);
+        storage::set_u64(b"state", CHARTER_STATE_ACTIVE);
+        storage::set_u64(&founder, 80_000);
+        storage::set_u64(&rofr_holder, 20_000);
+        storage::set_u64(b"total_common", 100_000);
+
+        for led in [pref_x_led, bank_addr] {
+            mock::set_self_address(led);
+            storage::set_address(b"charter", &charter_addr);
+        }
+
+        // Offering: Preferred X (`conv_rate = 1`, `$1,000,000` raise, `20%` ownership -> `25,000` shares @ `40` SGD min)
+        // Step 2 Bids:
+        //  - `new_inv_1`: 15,000 @ 50 SGD (`750,000` escrowed)
+        //  - `new_inv_2`: 15,000 @ 46 SGD (`690,000` escrowed) -> `30,000 > 25,000` strictly above 40 => `P* = 46` SGD!
+        // Step 3 ROFR:
+        //  - `rofr_holder`: 5,000 @ 46 SGD (`230,000` escrowed) -> prioritized 100% (`5,000` shares)!
+        //  - Remaining `20,000` shares split pro-rata (`10,000` each) across `new_inv_1` & `new_inv_2`!
+        let total_escrowed = 15_000 * 50 + 15_000 * 46 + 5_000 * 46; // 1,670,000 SGD
+        mock::set_self_address(bank_addr);
+        storage::set_u64(&escrow_acct, total_escrowed);
+
+        mock::register_hps(auth_iss, |raw| {
+            let Some((sel, _args)) = CalldataReader::parse(raw) else {
+                return -1;
+            };
+            if sel == const { selector("targetHps()") } {
+                ret::write_address(&PREF_X_LED);
+                return 0;
+            }
+            if sel == const { selector("equityFinancingTerms()") } {
+                let mut out = [0u8; 9 * 32];
+                out[24..32].copy_from_slice(&1u64.to_be_bytes()); // isEquityFinancing = 1
+                out[32 + 24..64].copy_from_slice(&3u64.to_be_bytes()); // custom Preferred class
+                out[64 + 24..96].copy_from_slice(&2u64.to_be_bytes()); // conversionRate = 2 (votes = 2)
+                ret::write(&out);
+                return 0;
+            }
+            if sel == const { selector("issuanceClassLabel()") } {
+                let mut lbl = [0u8; 32];
+                lbl[..11].copy_from_slice(b"Preferred X");
+                ret::write_word(&lbl);
+                return 0;
+            }
+            if sel == const { selector("consumeIssuanceAuction(address,bytes32,address)") } {
+                if storage::get_u64(b"consumed") == 1 {
+                    return -64;
+                }
+                storage::set_u64(b"consumed", 1);
+                let mut book = AuctionBook::new();
+                assert!(book.push(AuctionOrder {
+                    side: ORDER_SIDE_BUY_STEP1,
+                    trader: NEW_INV_1,
+                    price: 50,
+                    quantity: 15_000,
+                }));
+                assert!(book.push(AuctionOrder {
+                    side: ORDER_SIDE_BUY_STEP1,
+                    trader: NEW_INV_2,
+                    price: 46,
+                    quantity: 15_000,
+                }));
+                assert!(book.push(AuctionOrder {
+                    side: ORDER_SIDE_BUY_STEP3,
+                    trader: ROFR_HOLDER,
+                    price: 46,
+                    quantity: 5_000,
+                }));
+                let mut raw_book = [0u8; 256];
+                let n = book.encode(&mut raw_book).unwrap();
+                let pad = (32 - (n % 32)) % 32;
+                let mut out = vec![0u8; 128 + n + pad];
+                out[24..32].copy_from_slice(&25_000u64.to_be_bytes());
+                out[56..64].copy_from_slice(&40u64.to_be_bytes());
+                out[88..96].copy_from_slice(&96u64.to_be_bytes());
+                out[96 + 24..128].copy_from_slice(&(n as u64).to_be_bytes());
+                out[128..128 + n].copy_from_slice(&raw_book[..n]);
+                ret::write(&out);
+                return 0;
+            }
+            -2
+        });
+
+        mock::set_self_address(sc_addr);
+        mock::set_sender(founder);
+        mock::set_block_number(50);
+        let init_cd = CallEncoder::<160>::new(selector("initialize(address,address,address,address)"))
+            .push_address(&reg_addr)
+            .push_address(&charter_addr)
+            .push_address(&bank_addr)
+            .push_address(&escrow_acct);
+        assert_eq!(dispatch_calldata(init_cd.as_slice()), 0);
+
+        // Seed ShareCapital's escrow tracking for `auth_iss`
+        storage::set_u64(auc_escrow_key(&auth_iss).as_slice(), total_escrowed);
+        storage::set_u64(auc_escrow_active_key(&auth_iss).as_slice(), 1);
+
+        // Step 4: Unauthenticated simulator runner (`[0xEE; 20]`) executes `determineIssuanceAllocation`!
+        mock::set_sender([0xEE; 20]);
+        let det_cd = CallEncoder::<96>::new(selector("determineIssuanceAllocation(address,address)"))
+            .push_address(&pref_x_led)
+            .push_address(&auth_iss);
+        assert_eq!(dispatch_calldata(det_cd.as_slice()), 0);
+        let det_ret = mock::take_return_data();
+        let rd = |idx: usize| -> u64 {
+            u64::from_be_bytes(det_ret[idx * 32 + 24..(idx + 1) * 32].try_into().unwrap())
+        };
+        assert_eq!(rd(0), 25_000); // totalAllocated == 25,000
+        assert_eq!(rd(1), 46);     // clearingPrice == 46 SGD
+        assert_eq!(rd(2), 5_000);  // rofrAllocated == 5,000 (100% priority!)
+        assert_eq!(rd(3), 20_000); // biddersAllocated == 20,000 (pro-rata!)
+        assert_eq!(rd(4), 2);      // pendingShaCount == 2 new investors awaiting Step 5 SHA
+
+        // Second call in the same block (#50) MUST revert with ERR_ALREADY_EXECUTED_IN_BLOCK (-102)!
+        let dummy_auth = [0xA0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 98];
+        let det_same_blk =
+            CallEncoder::<96>::new(selector("determineIssuanceAllocation(address,address)"))
+                .push_address(&pref_x_led)
+                .push_address(&dummy_auth);
+        assert_eq!(
+            dispatch_calldata(det_same_blk.as_slice()),
+            ERR_ALREADY_EXECUTED_IN_BLOCK
+        );
+
+        // Verify CorporateCharter registered Preferred X with votes_per_share = 2 & label = "Preferred X"!
+        mock::set_self_address(charter_addr);
+        assert_eq!(storage::get_u64(b"last_vps"), 2);
+        let mut lbl_buf = [0u8; 32];
+        assert_eq!(storage::get_into(b"last_lbl", &mut lbl_buf), Some(32));
+        assert_eq!(&lbl_buf[..11], b"Preferred X");
+
+        // Verify ROFR existing shareholder already received 5,000 shares, while new investors hold 0 before signing SHA!
+        mock::set_self_address(pref_x_led);
+        assert_eq!(storage::get_u64(&rofr_holder), 5_000);
+        assert_eq!(storage::get_u64(&new_inv_1), 0);
+        assert_eq!(storage::get_u64(&new_inv_2), 0);
+
+        // Verify surplus escrow was immediately refunded (`new_inv_1`: 750,000 - 460,000 = 290,000; `new_inv_2`: 690,000 - 460,000 = 230,000)!
+        mock::set_self_address(bank_addr);
+        assert_eq!(storage::get_u64(&new_inv_1), 290_000);
+        assert_eq!(storage::get_u64(&new_inv_2), 230_000);
+        assert_eq!(storage::get_u64(&founder), 230_000); // ROFR proceeds swept to treasury
+
+        // Step 5: `new_inv_1` & `new_inv_2` sign SHA -> wrong hash reverts (-99), valid hash mints 10,000 shares each!
+        mock::set_self_address(sc_addr);
+        mock::set_sender(new_inv_1);
+        let bad_claim = CallEncoder::<96>::new(selector(
+            "signShareholdersAgreementAndClaimShares(address,bytes32)",
+        ))
+        .push_address(&auth_iss)
+        .push_bytes32(&[0xFF; 32]);
+        assert_eq!(dispatch_calldata(bad_claim.as_slice()), ERR_SHA_SIGNATURE_REQUIRED);
+
+        let sha_hash = compute_sha_doc_hash(&charter_addr);
+        let good_claim = CallEncoder::<96>::new(selector(
+            "signShareholdersAgreementAndClaimShares(address,bytes32)",
+        ))
+        .push_address(&auth_iss)
+        .push_bytes32(&sha_hash);
+        assert_eq!(dispatch_calldata(good_claim.as_slice()), 0);
+        assert_eq!(
+            u64::from_be_bytes(mock::take_return_data()[24..32].try_into().unwrap()),
+            10_000
+        );
+
+        mock::set_sender(new_inv_2);
+        assert_eq!(dispatch_calldata(good_claim.as_slice()), 0);
+
+        mock::set_self_address(pref_x_led);
+        assert_eq!(storage::get_u64(&new_inv_1), 10_000);
+        assert_eq!(storage::get_u64(&new_inv_2), 10_000);
+        assert_eq!(storage::get_u64(b"supply"), 25_000);
+
+        mock::set_self_address(bank_addr);
+        assert_eq!(storage::get_u64(&founder), 25_000 * 46); // Full 1,150,000 SGD proceeds in Treasury!
+        assert_eq!(storage::get_u64(&escrow_acct), 0);       // Zero leftover escrow!
     }
 }

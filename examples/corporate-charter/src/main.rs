@@ -131,6 +131,8 @@ hps_entry! {
     "roleMemberAt(bytes32,uint64)"                                              => handle_role_member_at,
     "registerShareClass(address,uint64,uint64,uint64,address)"                  => handle_register_share_class,
     "moduleEnsureShareClass(address,uint64,uint64,uint64)"                      => handle_module_ensure_share_class,
+    "moduleSetShareClassLabel(address,bytes32)"                                 => handle_module_set_share_class_label,
+    "shareClassLabel(address)"                                                  => handle_share_class_label,
     "moduleRecordShareholdersAgreement(address,bytes32)"                        => handle_module_record_sha,
     "signShareholdersAgreement(bytes32)"                                        => handle_sign_sha_direct,
     "hasSignedShareholdersAgreement(address)"                                   => handle_has_signed_sha,
@@ -2356,6 +2358,30 @@ fn handle_module_ensure_share_class(args: &CalldataReader) -> Result<(), i32> {
     events::emit(&[SHARE_CLASS_REGISTERED, addr_topic(&share_ledger)], &ev);
 
     ret::write_u64_word(new_count as u64);
+    Ok(())
+}
+
+fn share_class_label_key(ledger: &[u8; 20]) -> KeyBuilder<32> {
+    KeyBuilder::<32>::new().push(b"chr:scl:").push(ledger)
+}
+
+fn handle_module_set_share_class_label(args: &CalldataReader) -> Result<(), i32> {
+    require_equity_settlement_module()?;
+    let share_ledger = args.address(0).ok_or(-3)?;
+    let label = args.bytes32(1).ok_or(-3)?;
+    if share_ledger == [0u8; 20] {
+        return Err(-59);
+    }
+    storage::set(share_class_label_key(&share_ledger).as_slice(), &label);
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_share_class_label(args: &CalldataReader) -> Result<(), i32> {
+    let share_ledger = args.address(0).ok_or(-3)?;
+    let lbl = storage::get_bytes32(share_class_label_key(&share_ledger).as_slice())
+        .unwrap_or([0u8; 32]);
+    ret::write_word(&lbl);
     Ok(())
 }
 

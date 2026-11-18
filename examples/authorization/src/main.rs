@@ -81,7 +81,10 @@ const KEY_SPEC: &[u8] = b"au:spec";
 const KEY_IS_AUCTION: &[u8] = b"au:is_auc";
 const KEY_IS_ISSUANCE: &[u8] = b"au:is_iss";
 const KEY_IS_EQUITY_FINANCING: &[u8] = b"au:is_eqf";
+const KEY_IS_MULTISTEP_ISSUANCE: &[u8] = b"au:ms_iss";
+const KEY_ISS_WINDOW_BLOCKS: &[u8] = b"au:iss_win";
 const KEY_EQ_CLASS_CODE: &[u8] = b"au:eq_cls";
+const KEY_EQ_CLASS_LABEL: &[u8] = b"au:eq_lbl";
 const KEY_EQ_CONV_RATE: &[u8] = b"au:eq_conv";
 const KEY_EQ_MIN_RAISE: &[u8] = b"au:eq_minr";
 const KEY_EQ_MAX_OWN_BPS: &[u8] = b"au:eq_bps";
@@ -103,6 +106,7 @@ hps_entry! {
     "initializeTransferAuction(address,address,address)"                           => handle_init_transfer_auction,
     "initializeShareIssuance(address,address,address,uint64,uint64)"               => handle_init_share_issuance,
     "initializeEquityFinancing(address,address,address,uint64,uint64,uint64,uint64)" => handle_init_equity_financing,
+    "initializeShareIssuanceRound(address,address,address,uint64,bytes32,uint64,uint64,uint64)" => handle_init_share_issuance_round,
     "initializeOracle(address,address,address,bytes32,uint64)"                     => handle_init_oracle,
     "initializeCustom(address,address,bytes32,bytes32,bytes)"                      => handle_init_custom,
     "approve()"                                                                    => handle_approve,
@@ -132,6 +136,9 @@ hps_entry! {
     "hasFailedBidsStage()"                                                         => handle_has_failed_bids_stage,
     "issuanceTerms()"                                                              => handle_issuance_terms,
     "equityFinancingTerms()"                                                       => handle_equity_financing_terms,
+    "issuancePhase()"                                                              => handle_issuance_phase,
+    "issuanceClassLabel()"                                                         => handle_issuance_class_label,
+    "projectedIssuanceClearingPrice()"                                             => handle_projected_issuance_clearing_price,
     "ssaTemplateHash()"                                                            => handle_ssa_template_hash,
     "shaTemplateHash()"                                                            => handle_sha_template_hash,
     "hasSignedSubscriptionAgreement(address)"                                      => handle_has_signed_ssa,
@@ -241,6 +248,19 @@ fn has_failed_bids_stage() -> bool {
     if !is_auc && !is_iss {
         return false;
     }
+    if is_iss && storage::get_u64(KEY_IS_MULTISTEP_ISSUANCE) == 1 {
+        if storage::get_u64(KEY_AUCTION_STARTED) != 1 {
+            return false; // Still in Step 1 (Shareholder Resolution voting)
+        }
+        let step1_dl = storage::get_u64(KEY_STEP1_DL);
+        if context::block_number() <= step1_dl {
+            return false; // Still in Step 2 (Bidding Mode)
+        }
+        let Ok(book) = load_auction_book() else {
+            return true;
+        };
+        return book.active_step1_bid_count() == 0;
+    }
     let step1_dl = storage::get_u64(KEY_STEP1_DL);
     if context::block_number() <= step1_dl {
         return false;
@@ -248,11 +268,6 @@ fn has_failed_bids_stage() -> bool {
     let Ok(book) = load_auction_book() else {
         return true;
     };
-    if is_iss && storage::get_u64(KEY_IS_EQUITY_FINANCING) == 1 {
-        let target_sh = storage::get_u64(KEY_MAX_NEW_SHARES);
-        let offer_px = storage::get_u64(KEY_MIN_ISSUE_PRICE);
-        return target_sh == 0 || book.total_step1_subscribed_at_or_above(offer_px) < target_sh;
-    }
     book.active_step1_bid_count() == 0
 }
 
@@ -292,6 +307,21 @@ fn setup_instance(
         storage::set_u64(KEY_STEP2_DL, s2_dl);
         storage::set_u64(KEY_STEP3_DL, s3_dl);
         (s1_dl, ov_dl)
+    } else if is_issuance && storage::get_u64(KEY_IS_MULTISTEP_ISSUANCE) == 1 {
+        let win = spec.stages[0].expiry_blocks.max(6);
+        let vote_exp = if spec.stage_count > 1 {
+            spec.stages[1].expiry_blocks.max(30)
+        } else {
+            30
+        };
+        let s0_dl = now.saturating_add(vote_exp);
+        let ov_dl = s0_dl.saturating_add(win.saturating_mul(2)).saturating_add(spec.overall_expiry_blocks.max(200));
+        storage::set_u64(KEY_AUCTION_STARTED, 0);
+        storage::set_u64(KEY_ISS_WINDOW_BLOCKS, win);
+        storage::set_u64(KEY_STEP1_DL, 0);
+        storage::set_u64(KEY_STEP2_DL, 0);
+        storage::set_u64(KEY_STEP3_DL, 0);
+        (s0_dl, ov_dl)
     } else if is_issuance {
         let s1_dl = now.saturating_add(spec.stages[0].expiry_blocks);
         let s2_dl = s1_dl.saturating_add(spec.stages[1].expiry_blocks);
@@ -543,15 +573,28 @@ fn handle_init_share_issuance(args: &CalldataReader) -> Result<(), i32> {
 /// - `targetShares = floor((preMoneyCommon * maxOwnershipBps) / ((10_000 - maxOwnershipBps) * conversionRate))`
 /// - `offerPrice   = ceil(minRaiseAmount / targetShares)`
 /// and starts **Stage 0 (Investor Subscription & Bidding Window)** immediately.
-fn handle_init_equity_financing(args: &CalldataReader) -> Result<(), i32> {
-    let registry = args.address(0).ok_or(-3)?;
-    let constitution = args.address(1).ok_or(-3)?;
-    let target_hps = args.address(2).ok_or(-3)?;
-    let class_code = args.u64(3).ok_or(-3)?;
-    let conversion_rate = args.u64(4).ok_or(-3)?;
-    let min_raise_amount = args.u64(5).ok_or(-3)?;
-    let max_ownership_bps = args.u64(6).ok_or(-3)?;
+fn default_class_label(class_code: u64) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let s: &[u8] = match class_code {
+        0 => b"Common",
+        1 => b"Preferred A",
+        2 => b"Preferred B",
+        _ => b"Preferred",
+    };
+    out[..s.len()].copy_from_slice(s);
+    out
+}
 
+fn init_multistep_issuance_inner(
+    registry: [u8; 20],
+    constitution: [u8; 20],
+    target_hps: [u8; 20],
+    class_code: u64,
+    class_label: [u8; 32],
+    conversion_rate: u64,
+    min_raise_amount: u64,
+    max_ownership_bps: u64,
+) -> Result<(), i32> {
     if constitution == [0u8; 20]
         || target_hps == [0u8; 20]
         || conversion_rate == 0
@@ -606,16 +649,22 @@ fn handle_init_equity_financing(args: &CalldataReader) -> Result<(), i32> {
             (s, n)
         }
         Err(_) => {
-            // Also check Charter-level or primary ShareLedger transfer auction window
-            let (w0, w1, ov) = (6, 30, 200);
+            let (w0, w1, ov) = (8, 36, 200);
             let s = share_issuance_auction_policy_spec(w0, w1, ov).ok_or(ERR_POLICY_INVALID)?;
             let n = s.encode(&mut raw_spec).ok_or(ERR_POLICY_INVALID)?;
             (s, n)
         }
     };
 
-    let action_hash = ActionHasher::<192>::new(&target_hps, &ACTION_ISSUE)
+    let final_label = if class_label == [0u8; 32] {
+        default_class_label(class_code)
+    } else {
+        class_label
+    };
+
+    let action_hash = ActionHasher::<224>::new(&target_hps, &ACTION_ISSUE)
         .push_u64(class_code)
+        .push_bytes32(&final_label)
         .push_u64(conversion_rate)
         .push_u64(min_raise_amount)
         .push_u64(max_ownership_bps)
@@ -623,8 +672,10 @@ fn handle_init_equity_financing(args: &CalldataReader) -> Result<(), i32> {
         .push_u64(offer_price)
         .finish();
 
+    storage::set_u64(KEY_IS_MULTISTEP_ISSUANCE, 1);
     storage::set_u64(KEY_IS_EQUITY_FINANCING, 1);
     storage::set_u64(KEY_EQ_CLASS_CODE, class_code);
+    storage::set(KEY_EQ_CLASS_LABEL, &final_label);
     storage::set_u64(KEY_EQ_CONV_RATE, conversion_rate);
     storage::set_u64(KEY_EQ_MIN_RAISE, min_raise_amount);
     storage::set_u64(KEY_EQ_MAX_OWN_BPS, max_ownership_bps);
@@ -647,6 +698,47 @@ fn handle_init_equity_financing(args: &CalldataReader) -> Result<(), i32> {
     out[56..64].copy_from_slice(&offer_price.to_be_bytes());
     ret::write(&out);
     Ok(())
+}
+
+fn handle_init_equity_financing(args: &CalldataReader) -> Result<(), i32> {
+    let registry = args.address(0).ok_or(-3)?;
+    let constitution = args.address(1).ok_or(-3)?;
+    let target_hps = args.address(2).ok_or(-3)?;
+    let class_code = args.u64(3).ok_or(-3)?;
+    let conversion_rate = args.u64(4).ok_or(-3)?;
+    let min_raise_amount = args.u64(5).ok_or(-3)?;
+    let max_ownership_bps = args.u64(6).ok_or(-3)?;
+    init_multistep_issuance_inner(
+        registry,
+        constitution,
+        target_hps,
+        class_code,
+        default_class_label(class_code),
+        conversion_rate,
+        min_raise_amount,
+        max_ownership_bps,
+    )
+}
+
+fn handle_init_share_issuance_round(args: &CalldataReader) -> Result<(), i32> {
+    let registry = args.address(0).ok_or(-3)?;
+    let constitution = args.address(1).ok_or(-3)?;
+    let target_hps = args.address(2).ok_or(-3)?;
+    let class_code = args.u64(3).ok_or(-3)?;
+    let class_label = args.bytes32(4).ok_or(-3)?;
+    let conversion_rate = args.u64(5).ok_or(-3)?;
+    let min_raise_amount = args.u64(6).ok_or(-3)?;
+    let max_ownership_bps = args.u64(7).ok_or(-3)?;
+    init_multistep_issuance_inner(
+        registry,
+        constitution,
+        target_hps,
+        class_code,
+        class_label,
+        conversion_rate,
+        min_raise_amount,
+        max_ownership_bps,
+    )
 }
 
 fn handle_init_oracle(args: &CalldataReader) -> Result<(), i32> {
@@ -766,7 +858,8 @@ fn resolve_stage_authorizer_weight(
         || (cur_stage == 0
             && (*bound_pol == POLICY_SHAREHOLDER_SUPERMAJORITY
                 || *bound_pol == POLICY_SUPER_GOVERNANCE
-                || *bound_pol == POLICY_FIRST_SHAREHOLDER_RESOLUTION));
+                || *bound_pol == POLICY_FIRST_SHAREHOLDER_RESOLUTION
+                || storage::get_u64(KEY_IS_MULTISTEP_ISSUANCE) == 1));
 
     if *bound_con != [0u8; 20] && is_shareholder_stage {
         if let Some((dyn_weight, total_power, default_super_req)) =
@@ -775,7 +868,9 @@ fn resolve_stage_authorizer_weight(
             if dyn_weight == 0 {
                 return Err(ERR_NOT_STAGE_AUTHORIZER);
             }
-            let dyn_req = if stage.has_role(&ROLE_SHAREHOLDER)
+            let dyn_req = if storage::get_u64(KEY_IS_MULTISTEP_ISSUANCE) == 1 {
+                default_super_req
+            } else if stage.has_role(&ROLE_SHAREHOLDER)
                 && stage.required_weight >= 1
                 && stage.required_weight <= 100
             {
@@ -851,7 +946,12 @@ fn execute_approve_step() -> Result<[u8; 20], i32> {
     require_valid_identity(&registry, &caller)?;
 
     let now = context::block_number();
-    if storage::get_u64(KEY_IS_ISSUANCE) == 1 {
+    let is_ms_iss = storage::get_u64(KEY_IS_MULTISTEP_ISSUANCE) == 1;
+    if is_ms_iss {
+        if storage::get_u64(KEY_AUCTION_STARTED) == 1 {
+            return Err(ERR_WRONG_AUCTION_STEP); // Step 1 Shareholder Resolution already passed!
+        }
+    } else if storage::get_u64(KEY_IS_ISSUANCE) == 1 {
         let step1_dl = storage::get_u64(KEY_STEP1_DL);
         let step2_dl = storage::get_u64(KEY_STEP2_DL);
         if now <= step1_dl {
@@ -908,7 +1008,25 @@ fn execute_approve_step() -> Result<[u8; 20], i32> {
         thr[16..24].copy_from_slice(&required_weight.to_be_bytes());
         events::emit(&[STAGE_THRESHOLD_REACHED], &thr);
 
-        if cur_stage + 1 < spec.stage_count {
+        if is_ms_iss {
+            // Step 1 Shareholder Resolution passed (>=75% Super-Majority) -> immediately open Step 2 Bidding & Step 3 ROFR!
+            let win = storage::get_u64(KEY_ISS_WINDOW_BLOCKS).max(6);
+            let s1_dl = now.saturating_add(win);
+            let s2_dl = s1_dl.saturating_add(win);
+            let next_ov = overall_dl.max(s2_dl.saturating_add(200));
+            storage::set_u64(KEY_STAGES_DONE, 1);
+            storage::set_u64(KEY_CUR_STAGE, 1);
+            storage::set_u64(KEY_AUCTION_STARTED, 1);
+            storage::set_u64(KEY_STEP1_DL, s1_dl);
+            storage::set_u64(KEY_STEP2_DL, s2_dl);
+            storage::set_u64(KEY_STEP3_DL, s2_dl);
+            storage::set_u64(KEY_STAGE_DEADLINE, s1_dl);
+            storage::set_u64(KEY_OVERALL_DEADLINE, next_ov);
+            let mut adv = [0u8; 16];
+            adv[0..8].copy_from_slice(&1u64.to_be_bytes());
+            adv[8..16].copy_from_slice(&s1_dl.to_be_bytes());
+            events::emit(&[STAGE_ADVANCED], &adv);
+        } else if cur_stage + 1 < spec.stage_count {
             let next_stage = cur_stage + 1;
             let next_dl = now.saturating_add(spec.stages[next_stage].expiry_blocks);
             storage::set_u64(KEY_CUR_STAGE, next_stage as u64);
@@ -927,6 +1045,28 @@ fn execute_approve_step() -> Result<[u8; 20], i32> {
 fn execute_finalize_step(caller: &[u8; 20]) -> Result<(), i32> {
     if has_failed_bids_stage() {
         return Err(ERR_NO_BIDS_IN_STAGE);
+    }
+    if storage::get_u64(KEY_IS_MULTISTEP_ISSUANCE) == 1 {
+        if storage::get_u64(KEY_STAGES_DONE) != 1 || storage::get_u64(KEY_AUCTION_STARTED) != 1 {
+            return Err(-62);
+        }
+        let now = context::block_number();
+        let step2_dl = storage::get_u64(KEY_STEP2_DL);
+        let overall_dl = storage::get_u64(KEY_OVERALL_DEADLINE);
+        if now > overall_dl {
+            return Err(ERR_AUTH_EXPIRED);
+        }
+        if now <= step2_dl {
+            // Called via `approveAndFinalize()` right as Step 1 passed: keep STATE_PENDING while Step 2 Bidding & Step 3 ROFR run!
+            return Ok(());
+        }
+        storage::set_u64(KEY_CUR_STAGE, 3);
+        storage::set_u64(KEY_STATE, STATE_FINALIZED);
+        events::emit(
+            &[AUTH_FINALIZED, addr_topic(caller)],
+            &now.to_be_bytes(),
+        );
+        return Ok(());
     }
     if storage::get_u64(KEY_IS_AUCTION) == 1 {
         if storage::get_u64(KEY_AUCTION_STARTED) != 1 {
@@ -978,6 +1118,61 @@ fn execute_finalize_step(caller: &[u8; 20]) -> Result<(), i32> {
 /// - **Transfer Step 2 (`step1_deadline < now <= step2_deadline`)**: Buy orders rejected (`ERR_WRONG_AUCTION_STEP`).
 /// - **Transfer Step 3 (`step2_deadline < now <= step3_deadline`)**: Non-selling existing shareholders only.
 /// - **Issuance Stage 1 (`step1_deadline < now <= step2_deadline`)**: Existing shareholders Pre-Emptive Subscription Bids.
+fn compute_projected_step2_clearing_price(
+    book: &AuctionBook,
+    target_shares: u64,
+    offer_price: u64,
+) -> u64 {
+    let mut total_strictly_above = 0u64;
+    let mut min_strictly_above = u64::MAX;
+    let mut min_qualifying = u64::MAX;
+    let mut i = 0usize;
+    while i < book.order_count {
+        let ord = book.orders[i];
+        if !ord.is_cancelled() && ord.side == ORDER_SIDE_BUY_STEP1 && ord.price >= offer_price && ord.quantity > 0 {
+            if ord.price < min_qualifying {
+                min_qualifying = ord.price;
+            }
+            if ord.price > offer_price {
+                total_strictly_above = total_strictly_above.saturating_add(ord.quantity);
+                if ord.price < min_strictly_above {
+                    min_strictly_above = ord.price;
+                }
+            }
+        }
+        i += 1;
+    }
+    if target_shares > 0 && total_strictly_above > target_shares && min_strictly_above < u64::MAX {
+        min_strictly_above
+    } else if min_qualifying < u64::MAX {
+        min_qualifying
+    } else {
+        offer_price
+    }
+}
+
+fn query_existing_company_shareholder(
+    bound_con: &[u8; 20],
+    target_ledger: &[u8; 20],
+    who: &[u8; 20],
+) -> u64 {
+    if *bound_con != [0u8; 20] {
+        let cd = CallEncoder::<64>::new(const { selector("convertedCommonTotals(address)") })
+            .push_address(who);
+        if let Ok(raw) = call::call_raw(bound_con, cd.as_slice()) {
+            if raw.len() >= 64 {
+                let mut w = [0u8; 8];
+                w.copy_from_slice(&raw[24..32]);
+                let holder_conv = u64::from_be_bytes(w);
+                if holder_conv > 0 {
+                    return holder_conv;
+                }
+            }
+        }
+    }
+    query_ledger_balance(target_ledger, who).unwrap_or(0)
+}
+
 fn execute_place_buy_order_inner(
     buyer: &[u8; 20],
     price: u64,
@@ -987,22 +1182,24 @@ fn execute_place_buy_order_inner(
     let is_auc = storage::get_u64(KEY_IS_AUCTION) == 1;
     let is_iss = storage::get_u64(KEY_IS_ISSUANCE) == 1;
     let is_eqf = storage::get_u64(KEY_IS_EQUITY_FINANCING) == 1;
+    let is_ms_iss = storage::get_u64(KEY_IS_MULTISTEP_ISSUANCE) == 1;
     if (!is_auc && !is_iss) || storage::get_u64(KEY_STATE) != STATE_PENDING {
         return Err(-62);
     }
     if has_failed_bids_stage() {
         return Err(ERR_NO_BIDS_IN_STAGE);
     }
+    if is_ms_iss && storage::get_u64(KEY_AUCTION_STARTED) != 1 {
+        return Err(ERR_WRONG_AUCTION_STEP); // Step 1 Shareholder Resolution has not passed yet!
+    }
     if price == 0 || quantity == 0 {
         return Err(-61);
     }
-    if is_iss && price < storage::get_u64(KEY_MIN_ISSUE_PRICE) {
-        return Err(-61); // Subscription bid below constitutional minimum issue price
+    let min_issue_px = storage::get_u64(KEY_MIN_ISSUE_PRICE);
+    if is_iss && price < min_issue_px {
+        return Err(-61); // Bid below minimum offer price
     }
-    if is_eqf {
-        let Some(ssa_hash) = ssa_doc_hash_opt else {
-            return Err(ERR_SSA_SIGNATURE_REQUIRED);
-        };
+    if let Some(ssa_hash) = ssa_doc_hash_opt {
         if ssa_hash != current_ssa_template_hash() {
             return Err(ERR_SSA_SIGNATURE_REQUIRED);
         }
@@ -1027,7 +1224,7 @@ fn execute_place_buy_order_inner(
             st_ev[32..40].copy_from_slice(&step3_dl.to_be_bytes());
             events::emit(&[AUCTION_STEP1_STARTED, addr_topic(buyer)], &st_ev);
         }
-        if is_eqf {
+        if is_eqf && ssa_doc_hash_opt.is_some() {
             storage::set_u64(ssa_signed_key(buyer).as_slice(), 1);
             let mut ssa_ev = [0u8; 16];
             ssa_ev[0..8].copy_from_slice(&price.to_be_bytes());
@@ -1042,10 +1239,27 @@ fn execute_place_buy_order_inner(
             );
         }
         ORDER_SIDE_BUY_STEP1
-    } else if is_eqf {
-        // In full Equity Financing, prospective investor buy orders ONLY occur in Stage 0;
-        // Stage 1 is dedicated to signing the Shareholders' Agreement to finalize allocation!
-        return Err(ERR_WRONG_AUCTION_STEP);
+    } else if is_ms_iss {
+        // Step 3: Existing Shareholders' Right of First Refusal (`step1_dl < now <= step2_dl`)!
+        if now <= step2_dl {
+            let bound_con = storage::get_address(KEY_CONSTITUTION).unwrap_or([0u8; 20]);
+            let target_ledger = storage::get_address(KEY_TARGET).ok_or(-62)?;
+            if query_existing_company_shareholder(&bound_con, &target_ledger, buyer) == 0 {
+                return Err(ERR_NOT_EXISTING_SHAREHOLDER);
+            }
+            let existing_book = load_auction_book()?;
+            let target_sh = storage::get_u64(KEY_MAX_NEW_SHARES);
+            let min_rofr_px =
+                compute_projected_step2_clearing_price(&existing_book, target_sh, min_issue_px);
+            if price < min_rofr_px {
+                return Err(-61); // ROFR must match or beat Step 2 clearing price
+            }
+            storage::set_u64(KEY_CUR_STAGE, 2);
+            storage::set_u64(KEY_STAGE_DEADLINE, step2_dl);
+            ORDER_SIDE_BUY_STEP3
+        } else {
+            return Err(ERR_WRONG_AUCTION_STEP);
+        }
     } else if is_iss {
         if now <= step2_dl {
             let target_ledger = storage::get_address(KEY_TARGET).ok_or(-62)?;
@@ -1573,39 +1787,55 @@ fn handle_consume_issuance_auction(args: &CalldataReader) -> Result<(), i32> {
     }
 
     let now = context::block_number();
+    let is_ms_iss = storage::get_u64(KEY_IS_MULTISTEP_ISSUANCE) == 1;
     let step1_dl = storage::get_u64(KEY_STEP1_DL);
+    let step2_dl = storage::get_u64(KEY_STEP2_DL);
     let overall_dl = storage::get_u64(KEY_OVERALL_DEADLINE);
-    if now <= step1_dl {
-        return Err(ERR_WRONG_AUCTION_STEP); // Stage 0 (Bids Stage) has not finished yet!
-    }
-    if now > overall_dl {
-        return Err(ERR_AUTH_EXPIRED);
+
+    if is_ms_iss {
+        if storage::get_u64(KEY_STAGES_DONE) != 1 || storage::get_u64(KEY_AUCTION_STARTED) != 1 {
+            return Err(-62); // Step 1 Shareholder Resolution has not passed yet!
+        }
+        if now <= step2_dl {
+            return Err(ERR_WRONG_AUCTION_STEP); // Step 3 ROFR window has not finished yet!
+        }
+        if now > overall_dl {
+            return Err(ERR_AUTH_EXPIRED);
+        }
+    } else {
+        if now <= step1_dl {
+            return Err(ERR_WRONG_AUCTION_STEP);
+        }
+        if now > overall_dl {
+            return Err(ERR_AUTH_EXPIRED);
+        }
+        if storage::get_u64(KEY_STAGES_DONE) != 1 || storage::get_u64(KEY_STATE) != STATE_FINALIZED {
+            return Err(-62);
+        }
     }
 
     let book_check = load_auction_book()?;
+    if book_check.active_step1_bid_count() == 0 {
+        return Err(ERR_NO_BIDS_IN_STAGE);
+    }
     if storage::get_u64(KEY_IS_EQUITY_FINANCING) == 1 {
         let target_sh = storage::get_u64(KEY_MAX_NEW_SHARES);
         let offer_px = storage::get_u64(KEY_MIN_ISSUE_PRICE);
-        if target_sh == 0 || book_check.total_step1_subscribed_at_or_above(offer_px) < target_sh {
+        if target_sh == 0 || total_issuance_subscribed_at_or_above(&book_check, offer_px) < target_sh {
             return Err(ERR_NO_BIDS_IN_STAGE);
         }
-    } else if book_check.active_step1_bid_count() == 0 {
-        return Err(ERR_NO_BIDS_IN_STAGE);
-    }
-    if storage::get_u64(KEY_STAGES_DONE) != 1 || storage::get_u64(KEY_STATE) != STATE_FINALIZED {
-        return Err(-62); // Stage 1 Shareholder Super-Majority not finalized!
-    }
-
-    let caller_target = context::msg_sender();
-    let bound_target = storage::get_address(KEY_TARGET).ok_or(-62)?;
-    if caller_target != bound_target {
-        return Err(ERR_WRONG_TARGET);
     }
 
     let bound_con = storage::get_address(KEY_CONSTITUTION).unwrap_or([0u8; 20]);
     let bound_pol = storage::get_bytes32(KEY_POLICY_ID).ok_or(-62)?;
     if bound_con != expected_constitution || bound_pol != expected_policy_id {
         return Err(ERR_POLICY_MISMATCH);
+    }
+
+    let caller_target = context::msg_sender();
+    let bound_target = storage::get_address(KEY_TARGET).ok_or(-62)?;
+    if caller_target != bound_target && !is_authorized_auction_broker(&bound_con, &caller_target) {
+        return Err(ERR_WRONG_TARGET);
     }
 
     let registry = storage::get_address(KEY_REGISTRY).ok_or(-62)?;
@@ -1672,10 +1902,33 @@ fn effective_status() -> u64 {
     }
     if storage::get_u64(KEY_IS_ISSUANCE) == 1 {
         let ov_dl = storage::get_u64(KEY_OVERALL_DEADLINE);
-        let step2_dl = storage::get_u64(KEY_STEP2_DL);
         if now > ov_dl {
             return STATE_EXPIRED;
         }
+        if storage::get_u64(KEY_IS_MULTISTEP_ISSUANCE) == 1 {
+            if storage::get_u64(KEY_AUCTION_STARTED) != 1 {
+                if now > storage::get_u64(KEY_STAGE_DEADLINE) {
+                    return STATE_EXPIRED;
+                }
+                return STATE_PENDING;
+            }
+            let step2_dl = storage::get_u64(KEY_STEP2_DL);
+            if now > step2_dl {
+                if storage::get_u64(KEY_IS_EQUITY_FINANCING) == 1 {
+                    let target_sh = storage::get_u64(KEY_MAX_NEW_SHARES);
+                    let offer_px = storage::get_u64(KEY_MIN_ISSUE_PRICE);
+                    let sub_ok = load_auction_book()
+                        .map(|b| target_sh > 0 && total_issuance_subscribed_at_or_above(&b, offer_px) >= target_sh)
+                        .unwrap_or(false);
+                    if !sub_ok {
+                        return STATE_EXPIRED;
+                    }
+                }
+                return STATE_FINALIZED;
+            }
+            return STATE_PENDING;
+        }
+        let step2_dl = storage::get_u64(KEY_STEP2_DL);
         if st == STATE_PENDING && storage::get_u64(KEY_STAGES_DONE) == 0 && now > step2_dl {
             return STATE_EXPIRED;
         }
@@ -1702,6 +1955,23 @@ fn handle_status(_args: &CalldataReader) -> Result<(), i32> {
 
 fn handle_current_stage(_args: &CalldataReader) -> Result<(), i32> {
     let stored = storage::get_u64(KEY_CUR_STAGE);
+    if storage::get_u64(KEY_IS_MULTISTEP_ISSUANCE) == 1 {
+        if storage::get_u64(KEY_AUCTION_STARTED) != 1 {
+            ret::write_u64_word(0);
+            return Ok(());
+        }
+        let now = context::block_number();
+        let step1_dl = storage::get_u64(KEY_STEP1_DL);
+        let step2_dl = storage::get_u64(KEY_STEP2_DL);
+        if now <= step1_dl {
+            ret::write_u64_word(1);
+        } else if now <= step2_dl {
+            ret::write_u64_word(2);
+        } else {
+            ret::write_u64_word(3);
+        }
+        return Ok(());
+    }
     if storage::get_u64(KEY_IS_ISSUANCE) == 1
         && stored == 0
         && context::block_number() > storage::get_u64(KEY_STEP1_DL)
@@ -1722,10 +1992,23 @@ fn handle_active_step1_bid_count(_args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
+fn total_issuance_subscribed_at_or_above(book: &AuctionBook, min_price: u64) -> u64 {
+    let mut sum = 0u64;
+    let mut i = 0usize;
+    while i < book.order_count {
+        let o = &book.orders[i];
+        if !o.is_cancelled() && o.is_buy() && o.quantity > 0 && o.price >= min_price {
+            sum = sum.saturating_add(o.quantity);
+        }
+        i += 1;
+    }
+    sum
+}
+
 fn handle_subscribed_at_or_above_offer(_args: &CalldataReader) -> Result<(), i32> {
     let offer_px = storage::get_u64(KEY_MIN_ISSUE_PRICE);
     let sub = load_auction_book()
-        .map(|b| b.total_step1_subscribed_at_or_above(offer_px))
+        .map(|b| total_issuance_subscribed_at_or_above(&b, offer_px))
         .unwrap_or(0);
     ret::write_u64_word(sub);
     Ok(())
@@ -1750,7 +2033,7 @@ fn handle_issuance_terms(_args: &CalldataReader) -> Result<(), i32> {
 fn handle_equity_financing_terms(_args: &CalldataReader) -> Result<(), i32> {
     let offer_px = storage::get_u64(KEY_MIN_ISSUE_PRICE);
     let sub = load_auction_book()
-        .map(|b| b.total_step1_subscribed_at_or_above(offer_px))
+        .map(|b| total_issuance_subscribed_at_or_above(&b, offer_px))
         .unwrap_or(0);
     let mut out = [0u8; 9 * 32];
     let vals = [
@@ -1770,6 +2053,65 @@ fn handle_equity_financing_terms(_args: &CalldataReader) -> Result<(), i32> {
         i += 1;
     }
     ret::write(&out);
+    Ok(())
+}
+
+/// Returns the current Multi-Step Share Issuance Phase:
+/// - `0`: Not a multi-step share issuance
+/// - `1`: Step 1 — Shareholder Super-Majority Resolution (voting in progress)
+/// - `2`: Step 2 — External / Prospective Investor Bidding Mode
+/// - `3`: Step 3 — Existing Shareholders' Right of First Refusal (ROFR) Mode
+/// - `4`: Step 4 — Ready for Allocation Determination (ROFR window completed)
+/// - `5`: Consumed (Allocation Determined on `ShareCapital`)
+/// - `9`: Failed / Expired (`0` bids in Step 2 or Step 1 vote expired)
+fn handle_issuance_phase(_args: &CalldataReader) -> Result<(), i32> {
+    if storage::get_u64(KEY_IS_ISSUANCE) != 1 {
+        ret::write_u64_word(0);
+        return Ok(());
+    }
+    let st = effective_status();
+    if st == STATE_CONSUMED {
+        ret::write_u64_word(5);
+        return Ok(());
+    }
+    if st == STATE_EXPIRED {
+        ret::write_u64_word(9);
+        return Ok(());
+    }
+    if storage::get_u64(KEY_IS_MULTISTEP_ISSUANCE) == 1 {
+        if storage::get_u64(KEY_AUCTION_STARTED) != 1 {
+            ret::write_u64_word(1);
+            return Ok(());
+        }
+        let now = context::block_number();
+        let step1_dl = storage::get_u64(KEY_STEP1_DL);
+        let step2_dl = storage::get_u64(KEY_STEP2_DL);
+        if now <= step1_dl {
+            ret::write_u64_word(2);
+        } else if now <= step2_dl {
+            ret::write_u64_word(3);
+        } else {
+            ret::write_u64_word(4);
+        }
+        return Ok(());
+    }
+    ret::write_u64_word(if st == STATE_FINALIZED { 4 } else { 2 });
+    Ok(())
+}
+
+fn handle_issuance_class_label(_args: &CalldataReader) -> Result<(), i32> {
+    let lbl = storage::get_bytes32(KEY_EQ_CLASS_LABEL).unwrap_or([0u8; 32]);
+    ret::write_word(&lbl);
+    Ok(())
+}
+
+fn handle_projected_issuance_clearing_price(_args: &CalldataReader) -> Result<(), i32> {
+    let offer_px = storage::get_u64(KEY_MIN_ISSUE_PRICE);
+    let target_sh = storage::get_u64(KEY_MAX_NEW_SHARES);
+    let p_star = load_auction_book()
+        .map(|b| compute_projected_step2_clearing_price(&b, target_sh, offer_px))
+        .unwrap_or(offer_px);
+    ret::write_u64_word(p_star);
     Ok(())
 }
 
@@ -2950,5 +3292,259 @@ mod tests {
         )
         .unwrap();
         assert!(consumed.len() >= 160);
+    }
+
+    #[test]
+    fn five_step_share_issuance_round_resolution_bidding_rofr_and_zero_bid_failure() {
+        mock::reset();
+        let reg = [0x10; 20];
+        let con = [0x20; 20];
+        let pref_z_led = [0x35; 20];
+        let auth_round_ok = [0x61; 20];
+        let auth_round_zero = [0x62; 20];
+
+        const SH_MAJOR: [u8; 20] = [0xB1; 20]; // 80,000 Common (80%)
+        const SH_MINOR: [u8; 20] = [0xB2; 20]; // 20,000 Common (20%)
+        let sh_major = SH_MAJOR;
+        let sh_minor = SH_MINOR;
+        let ext_inv_1 = [0xC1; 20];
+        let ext_inv_2 = [0xC2; 20];
+
+        mock::register_hps(reg, reg_and_con_sim::reg_dispatch);
+        mock::register_hps(pref_z_led, |raw| {
+            let Some((sel, _args)) = CalldataReader::parse(raw) else {
+                return -1;
+            };
+            if sel == const { selector("balanceOf(address)") }
+                || sel == const { selector("totalOutstanding()") }
+            {
+                ret::write_u64_word(0);
+                return 0;
+            }
+            -2
+        });
+        mock::register_hps(con, |raw| {
+            let Some((sel, args)) = CalldataReader::parse(raw) else {
+                return -1;
+            };
+            if sel == const { selector("state()") } {
+                ret::write_u64_word(CONSTITUTION_STATE_ACTIVE);
+                return 0;
+            }
+            if sel == const { selector("convertedCommonTotals(address)") } {
+                let who = args.address(0).unwrap();
+                let h = if who == SH_MAJOR {
+                    80_000u64
+                } else if who == SH_MINOR {
+                    20_000u64
+                } else {
+                    0u64
+                };
+                let mut out = [0u8; 64];
+                out[24..32].copy_from_slice(&h.to_be_bytes());
+                out[56..64].copy_from_slice(&100_000u64.to_be_bytes());
+                ret::write(&out);
+                return 0;
+            }
+            if sel == const { selector("shareholderVotingPower(address)") } {
+                let who = args.address(0).unwrap();
+                let vp = if who == SH_MAJOR {
+                    80_000u64
+                } else if who == SH_MINOR {
+                    20_000u64
+                } else {
+                    0u64
+                };
+                let mut out = [0u8; 128];
+                out[24..32].copy_from_slice(&vp.to_be_bytes());
+                out[56..64].copy_from_slice(&100_000u64.to_be_bytes());
+                out[88..96].copy_from_slice(&75_000u64.to_be_bytes());
+                out[120..128].copy_from_slice(&vp.to_be_bytes());
+                ret::write(&out);
+                return 0;
+            }
+            if sel == const { selector("getPolicyRaw(address,bytes32)") } {
+                let spec = share_issuance_auction_policy_spec(10, 30, 200).unwrap();
+                let mut b = [0u8; 512];
+                let n = spec.encode(&mut b).unwrap();
+                ret::write_abi_bytes(&b[..n]);
+                return 0;
+            }
+            -2
+        });
+
+        mock::register_hps(auth_round_ok, dispatch_calldata);
+        mock::register_hps(auth_round_zero, dispatch_calldata);
+
+        // Initialize "Preferred Z": $1,000,000 raise, 20% post-money ownership (`2000` bps), 1:1 conversion -> 25,000 shares @ 40 SGD!
+        mock::set_block_number(100);
+        let mut lbl_z = [0u8; 32];
+        lbl_z[..11].copy_from_slice(b"Preferred Z");
+        let init_cd = CallEncoder::<288>::new(const {
+            selector("initializeShareIssuanceRound(address,address,address,uint64,bytes32,uint64,uint64,uint64)")
+        })
+        .push_address(&reg)
+        .push_address(&con)
+        .push_address(&pref_z_led)
+        .push_u64(3)
+        .push_bytes32(&lbl_z)
+        .push_u64(1)
+        .push_u64(1_000_000)
+        .push_u64(2_000);
+
+        let init_ret = mock::transact_as(sh_major, auth_round_ok, init_cd.as_slice()).unwrap();
+        assert_eq!(u64::from_be_bytes(init_ret[24..32].try_into().unwrap()), 25_000);
+        assert_eq!(u64::from_be_bytes(init_ret[56..64].try_into().unwrap()), 40);
+
+        // Starts in Step 1 (`issuancePhase() == 1`): Bidding BEFORE >=75% Shareholder Resolution MUST revert (`-74`)!
+        let ph_1 = mock::transact_as(
+            sh_major,
+            auth_round_ok,
+            CallEncoder::<16>::new(const { selector("issuancePhase()") }).as_slice(),
+        )
+        .unwrap();
+        assert_eq!(ph_1[31], 1);
+        assert_eq!(
+            mock::transact_as(
+                ext_inv_1,
+                auth_round_ok,
+                CallEncoder::<96>::new(const { selector("placeBuyOrder(uint64,uint64)") })
+                    .push_u64(45)
+                    .push_u64(15_000)
+                    .as_slice(),
+            ),
+            Err(ERR_WRONG_AUCTION_STEP)
+        );
+
+        // `sh_minor` (20%) votes -> still in Step 1 (`20% < 75%`)
+        mock::transact_as(
+            sh_minor,
+            auth_round_ok,
+            CallEncoder::<16>::new(const { selector("approve()") }).as_slice(),
+        )
+        .unwrap();
+        assert_eq!(
+            mock::transact_as(
+                sh_major,
+                auth_round_ok,
+                CallEncoder::<16>::new(const { selector("issuancePhase()") }).as_slice(),
+            )
+            .unwrap()[31],
+            1
+        );
+
+        // `sh_major` (80%) votes at block 102 -> 100% >= 75% -> transitions into Step 2 Bidding (`102..=112`) & Step 3 ROFR (`113..=122`)!
+        mock::set_block_number(102);
+        mock::transact_as(
+            sh_major,
+            auth_round_ok,
+            CallEncoder::<16>::new(const { selector("approveAndFinalize()") }).as_slice(),
+        )
+        .unwrap();
+        assert_eq!(
+            mock::transact_as(
+                sh_major,
+                auth_round_ok,
+                CallEncoder::<16>::new(const { selector("issuancePhase()") }).as_slice(),
+            )
+            .unwrap()[31],
+            2
+        );
+
+        // Step 2 Bidding (`block 105`): `ext_inv_1` bids 20,000 @ 44 SGD
+        mock::set_block_number(105);
+        mock::transact_as(
+            ext_inv_1,
+            auth_round_ok,
+            CallEncoder::<96>::new(const { selector("placeBuyOrder(uint64,uint64)") })
+                .push_u64(44)
+                .push_u64(20_000)
+                .as_slice(),
+        )
+        .unwrap();
+
+        // Step 3 ROFR (`block 115`): external non-shareholder `ext_inv_2` MUST be rejected (`-75`), while existing shareholder `sh_minor` succeeds!
+        mock::set_block_number(115);
+        assert_eq!(
+            mock::transact_as(
+                sh_major,
+                auth_round_ok,
+                CallEncoder::<16>::new(const { selector("issuancePhase()") }).as_slice(),
+            )
+            .unwrap()[31],
+            3
+        );
+        assert_eq!(
+            mock::transact_as(
+                ext_inv_2,
+                auth_round_ok,
+                CallEncoder::<96>::new(const { selector("placeBuyOrder(uint64,uint64)") })
+                    .push_u64(44)
+                    .push_u64(5_000)
+                    .as_slice(),
+            ),
+            Err(ERR_NOT_EXISTING_SHAREHOLDER)
+        );
+        mock::transact_as(
+            sh_minor,
+            auth_round_ok,
+            CallEncoder::<96>::new(const { selector("placeBuyOrder(uint64,uint64)") })
+                .push_u64(44)
+                .push_u64(10_000)
+                .as_slice(),
+        )
+        .unwrap();
+
+        // Step 4 (`block 125 > 122`): `issuancePhase() == 4`, `isReadyToConsume() == true`!
+        mock::set_block_number(125);
+        assert_eq!(
+            mock::transact_as(
+                sh_major,
+                auth_round_ok,
+                CallEncoder::<16>::new(const { selector("issuancePhase()") }).as_slice(),
+            )
+            .unwrap()[31],
+            4
+        );
+        assert_eq!(
+            mock::transact_as(
+                sh_major,
+                auth_round_ok,
+                CallEncoder::<16>::new(const { selector("isReadyToConsume()") }).as_slice(),
+            )
+            .unwrap()[31],
+            1
+        );
+
+        // Zero-bid Step 2 gate: Step 1 passes at block 200 (`step1_dl = 210`), 0 bids placed -> fails at block 211 (`issuancePhase() == 9`, `-97`)!
+        mock::set_block_number(200);
+        mock::transact_as(sh_major, auth_round_zero, init_cd.as_slice()).unwrap();
+        mock::transact_as(
+            sh_major,
+            auth_round_zero,
+            CallEncoder::<16>::new(const { selector("approveAndFinalize()") }).as_slice(),
+        )
+        .unwrap();
+        mock::set_block_number(211);
+        assert_eq!(
+            mock::transact_as(
+                sh_major,
+                auth_round_zero,
+                CallEncoder::<16>::new(const { selector("issuancePhase()") }).as_slice(),
+            )
+            .unwrap()[31],
+            9
+        );
+        assert_eq!(
+            mock::transact_as(
+                sh_minor,
+                auth_round_zero,
+                CallEncoder::<96>::new(const { selector("placeBuyOrder(uint64,uint64)") })
+                    .push_u64(44)
+                    .push_u64(5_000)
+                    .as_slice(),
+            ),
+            Err(ERR_NO_BIDS_IN_STAGE)
+        );
     }
 }
