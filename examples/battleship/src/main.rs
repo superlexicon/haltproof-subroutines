@@ -98,10 +98,12 @@ fn addr_topic(addr: &[u8; 20]) -> [u8; 32] {
 // ---------------------------------------------------------------------------
 
 hps_entry! {
-    "createBattle(bytes32)"                                       => handle_create_battle,
-    "joinBattle(bytes32,uint64)"                                  => handle_join_battle,
-    "joinAndDeploy(bytes32,uint64,uint64,uint64,uint64)"          => handle_join_and_deploy,
-    "buyShip(bytes32,uint64,uint64,uint64,uint64,uint64)"         => handle_buy_ship,
+    "createBattle(bytes32)"                                                       => handle_create_battle,
+    "joinBattle(bytes32,uint64)"                                                  => handle_join_battle,
+    "joinAndDeploy(bytes32,uint64,uint64,uint64,uint64)"                          => handle_join_and_deploy,
+    "joinAndDeployWithIdentity(bytes32,uint64,address,uint64,uint64,uint64)"      => handle_join_and_deploy_with_identity,
+    "setPlayerIdentity(bytes32,address)"                                          => handle_set_player_identity,
+    "buyShip(bytes32,uint64,uint64,uint64,uint64,uint64)"                         => handle_buy_ship,
     "moveShip(bytes32,uint64,uint64,uint64)"                      => handle_move_ship,
     "fireWeapon(bytes32,uint64,uint64,uint64)"                    => handle_fire_weapon,
     "upgradeGun(bytes32,uint64,uint64)"                           => handle_upgrade_gun,
@@ -175,9 +177,10 @@ struct PlayerRec {
     pad: u8,
     credits: u64,
     score: u64,
+    identity_addr: [u8; 20],
 }
 
-const PLR_LEN: usize = 40;
+const PLR_LEN: usize = 60;
 
 impl PlayerRec {
     fn encode(&self) -> [u8; PLR_LEN] {
@@ -188,12 +191,15 @@ impl PlayerRec {
         b[23] = self.pad;
         b[24..32].copy_from_slice(&self.credits.to_be_bytes());
         b[32..40].copy_from_slice(&self.score.to_be_bytes());
+        b[40..60].copy_from_slice(&self.identity_addr);
         b
     }
 
     fn decode(b: &[u8; PLR_LEN]) -> Self {
         let mut addr = [0u8; 20];
         addr.copy_from_slice(&b[0..20]);
+        let mut id_addr = [0u8; 20];
+        id_addr.copy_from_slice(&b[40..60]);
         Self {
             addr,
             team: b[20],
@@ -201,6 +207,7 @@ impl PlayerRec {
             pad: b[23],
             credits: u64::from_be_bytes(b[24..32].try_into().unwrap()),
             score: u64::from_be_bytes(b[32..40].try_into().unwrap()),
+            identity_addr: id_addr,
         }
     }
 }
@@ -771,6 +778,7 @@ fn join_player_internal(
         pad: 0,
         credits: STARTING_CREDITS,
         score: 0,
+        identity_addr: [0u8; 20],
     };
     save_plr(bid, pid, &rec);
     storage::set(addr_pid_key(bid, &caller).as_slice(), &[pid]);
@@ -802,23 +810,22 @@ fn handle_join_battle(args: &CalldataReader) -> Result<i32, i32> {
     Ok(assigned_team as i32)
 }
 
-/// 1-Block Atomic Onboarding: joins battle (if not already joined) and auto-spawns up to 3 starter
-/// ships (`s0, s1, s2`, pass `255` for empty slot) anywhere across the open ocean!
-fn handle_join_and_deploy(args: &CalldataReader) -> Result<i32, i32> {
-    let bid = args.bytes32(0).ok_or(-10)?;
-    let preferred_team = args.u64(1).ok_or(-10)?;
-    let s0 = args.u64(2).ok_or(-10)?;
-    let s1 = args.u64(3).ok_or(-10)?;
-    let s2 = args.u64(4).ok_or(-10)?;
-
+fn join_and_deploy_common(
+    bid: [u8; 32],
+    preferred_team: u64,
+    identity_addr: [u8; 20],
+    classes: [u64; 3],
+) -> Result<i32, i32> {
     let mut hdr = load_hdr(&bid).ok_or(-13)?;
     sync_pending_shells(&bid, &mut hdr);
 
     let caller = context::msg_sender();
     let (pid, team) = join_player_internal(&bid, &mut hdr, caller, preferred_team)?;
     let mut plr = load_plr(&bid, pid).ok_or(-21)?;
+    if identity_addr != [0u8; 20] {
+        plr.identity_addr = identity_addr;
+    }
 
-    let classes = [s0, s1, s2];
     let mut slot = 0usize;
     while slot < 3 {
         let cid = classes[slot];
@@ -886,6 +893,40 @@ fn handle_join_and_deploy(args: &CalldataReader) -> Result<i32, i32> {
     save_hdr(&bid, &hdr);
     ret::write_u64_word(team as u64);
     Ok(team as i32)
+}
+
+/// 1-Block Atomic Onboarding: joins battle (if not already joined) and auto-spawns up to 3 starter
+/// ships (`s0, s1, s2`, pass `255` for empty slot) anywhere across the open ocean!
+fn handle_join_and_deploy(args: &CalldataReader) -> Result<i32, i32> {
+    let bid = args.bytes32(0).ok_or(-10)?;
+    let preferred_team = args.u64(1).ok_or(-10)?;
+    let s0 = args.u64(2).ok_or(-10)?;
+    let s1 = args.u64(3).ok_or(-10)?;
+    let s2 = args.u64(4).ok_or(-10)?;
+    join_and_deploy_common(bid, preferred_team, [0u8; 20], [s0, s1, s2])
+}
+
+/// 1-Block Atomic Onboarding with Identity HFS binding (`identity_addr` exposed in `getPlayersSlice`
+/// so all peers resolve `Identity.nickname()` for every vessel on the ocean!).
+fn handle_join_and_deploy_with_identity(args: &CalldataReader) -> Result<i32, i32> {
+    let bid = args.bytes32(0).ok_or(-10)?;
+    let preferred_team = args.u64(1).ok_or(-10)?;
+    let identity_addr = args.address(2).ok_or(-10)?;
+    let s0 = args.u64(3).ok_or(-10)?;
+    let s1 = args.u64(4).ok_or(-10)?;
+    let s2 = args.u64(5).ok_or(-10)?;
+    join_and_deploy_common(bid, preferred_team, identity_addr, [s0, s1, s2])
+}
+
+fn handle_set_player_identity(args: &CalldataReader) -> Result<(), i32> {
+    let bid = args.bytes32(0).ok_or(-10)?;
+    let identity_addr = args.address(1).ok_or(-10)?;
+    let caller = context::msg_sender();
+    let pid = find_pid(&bid, &caller).ok_or(-21)?;
+    let mut plr = load_plr(&bid, pid).ok_or(-21)?;
+    plr.identity_addr = identity_addr;
+    save_plr(&bid, pid, &plr);
+    Ok(())
 }
 
 fn handle_buy_ship(args: &CalldataReader) -> Result<(), i32> {

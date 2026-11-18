@@ -17,6 +17,7 @@ use hps_sdk::storage::KeyBuilder;
 use hps_sdk::{context, event_topic, events, hps_entry, ret, selector, storage};
 
 const IDENTITY_INITIALIZED: [u8; 32] = event_topic("IdentityInitialized(address,string)");
+const NICKNAME_UPDATED: [u8; 32] = event_topic("NicknameUpdated(address,string)");
 const DELEGATE_UPDATED: [u8; 32] = event_topic("DelegateUpdated(address,bool)");
 const EXECUTED_CALL: [u8; 32] = event_topic("Executed(address,bytes4)");
 const AUTH_SIGNED: [u8; 32] = event_topic("AuthorizationSigned(address,uint64)");
@@ -24,9 +25,12 @@ const AUTH_SIGNED: [u8; 32] = event_topic("AuthorizationSigned(address,uint64)")
 const KEY_INIT: &[u8] = b"id:init";
 const KEY_OWNER: &[u8] = b"id:owner";
 const KEY_HANDLE: &[u8] = b"id:handle";
+const KEY_NICKNAME: &[u8] = b"id:nick";
 
 hps_entry! {
     "initialize(address,string)"                                                      => handle_initialize,
+    "initializeWithNickname(address,string,string)"                                   => handle_initialize_with_nickname,
+    "setNickname(string)"                                                             => handle_set_nickname,
     "setDelegate(address,bool)"                                                       => handle_set_delegate,
     "transferOwnership(address)"                                                      => handle_transfer_ownership,
     "execute(address,bytes)"                                                          => handle_execute,
@@ -77,6 +81,7 @@ hps_entry! {
     "isAuthorized(address)"                                                           => handle_is_authorized,
     "hasApprovedAuth(address)"                                                        => handle_has_approved_auth,
     "handle()"                                                                        => handle_handle,
+    "nickname()"                                                                      => handle_nickname,
     "balanceIn(address)"                                                              => handle_balance_in,
 }
 
@@ -147,9 +152,49 @@ fn handle_initialize(args: &CalldataReader) -> Result<(), i32> {
 
     storage::set_address(KEY_OWNER, &owner);
     storage::set(KEY_HANDLE, handle_str);
+    storage::set(KEY_NICKNAME, handle_str);
     storage::set_u64(KEY_INIT, 1);
 
     events::emit(&[IDENTITY_INITIALIZED, addr_topic(&owner)], handle_str);
+    Ok(())
+}
+
+fn handle_initialize_with_nickname(args: &CalldataReader) -> Result<(), i32> {
+    if storage::get_u64(KEY_INIT) != 0 {
+        return Err(-22); // already initialized
+    }
+    let owner = args.address(0).ok_or(-3)?;
+    let handle_str = args.dynamic_bytes(1).ok_or(-3)?;
+    let nick_str = args.dynamic_bytes(2).ok_or(-3)?;
+    if owner == [0u8; 20]
+        || handle_str.is_empty()
+        || handle_str.len() > 64
+        || nick_str.is_empty()
+        || nick_str.len() > 32
+    {
+        return Err(-23);
+    }
+
+    storage::set_address(KEY_OWNER, &owner);
+    storage::set(KEY_HANDLE, handle_str);
+    storage::set(KEY_NICKNAME, nick_str);
+    storage::set_u64(KEY_INIT, 1);
+
+    events::emit(&[IDENTITY_INITIALIZED, addr_topic(&owner)], handle_str);
+    events::emit(&[NICKNAME_UPDATED, addr_topic(&owner)], nick_str);
+    Ok(())
+}
+
+fn handle_set_nickname(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let nick_str = args.dynamic_bytes(0).ok_or(-3)?;
+    if nick_str.is_empty() || nick_str.len() > 32 {
+        return Err(-23);
+    }
+    storage::set(KEY_NICKNAME, nick_str);
+    let owner = storage::get_address(KEY_OWNER).unwrap_or([0u8; 20]);
+    events::emit(&[NICKNAME_UPDATED, addr_topic(&owner)], nick_str);
+    ret::write_bool(true);
     Ok(())
 }
 
@@ -928,6 +973,17 @@ fn handle_handle(_args: &CalldataReader) -> Result<(), i32> {
     match storage::get_ref(KEY_HANDLE) {
         Some(h) => ret::write_abi_bytes(h),
         None => ret::write_abi_bytes(&[]),
+    }
+    Ok(())
+}
+
+fn handle_nickname(_args: &CalldataReader) -> Result<(), i32> {
+    if let Some(n) = storage::get_ref(KEY_NICKNAME) {
+        ret::write_abi_bytes(n);
+    } else if let Some(h) = storage::get_ref(KEY_HANDLE) {
+        ret::write_abi_bytes(h);
+    } else {
+        ret::write_abi_bytes(&[]);
     }
     Ok(())
 }
