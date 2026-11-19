@@ -2,7 +2,7 @@
 //!
 //! Organizes all deployed HFS instances on Subnet 1 by logical `typeId` (`bytes32`, e.g.
 //! `DEX_CLOB`, `PHANTOM_FLEET`, `CORPORATE_CHARTER`, `PRODUCT_LEDGER`, `SOCIAL_CHARTER`,
-//! `DEAD_DROP`) so any dApp page can render a live selector dropdown and allow users to
+//! `FRACTURED_HEGEMONY`, `CIPHER_NOIR`) so any dApp page can render a live selector dropdown and allow users to
 //! deploy & register new HFS instances directly from the browser:
 //! - Verifies `context::code_hash_of(&primaryAddr)` on registration against approved WASM
 //!   `code_hash` entries per `typeId` (preventing EOA or mismatched-contract spoofing).
