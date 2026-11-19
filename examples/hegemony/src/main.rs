@@ -837,21 +837,36 @@ fn handle_stage_directives(args: &CalldataReader) -> Result<i32, i32> {
         return Err(-22);
     }
 
-    let mut total_dep: u32 = 0;
+    let mut clean_buf = [0u8; 64];
+    let mut rem_supply = sov.supply;
+    let mut valid_dep = 0usize;
+    let mut dep_pos = 1usize;
+
     let mut i = 0;
     while i < dep_n {
         let off = 1 + i * 3;
         let sec = raw_orders[off] as usize;
         let cnt = u16::from_be_bytes([raw_orders[off + 1], raw_orders[off + 2]]);
-        if sec >= SECTOR_COUNT || world[sec].owner != sid || cnt == 0 {
+        if sec >= SECTOR_COUNT || cnt == 0 {
             return Err(-25);
         }
-        total_dep += cnt as u32;
+        if world[sec].owner == sid && rem_supply > 0 {
+            let give = cnt.min(rem_supply);
+            rem_supply -= give;
+            clean_buf[dep_pos] = sec as u8;
+            let gb = give.to_be_bytes();
+            clean_buf[dep_pos + 1] = gb[0];
+            clean_buf[dep_pos + 2] = gb[1];
+            dep_pos += 3;
+            valid_dep += 1;
+        }
         i += 1;
     }
-    if total_dep > (sov.supply as u32) {
-        return Err(-26);
-    }
+    clean_buf[0] = valid_dep as u8;
+
+    let str_cnt_pos = dep_pos;
+    let mut str_pos = str_cnt_pos + 1;
+    let mut valid_str = 0usize;
 
     let mut j = 0;
     while j < str_n {
@@ -863,15 +878,27 @@ fn handle_stage_directives(args: &CalldataReader) -> Result<i32, i32> {
             || to_s >= SECTOR_COUNT
             || from_s == to_s
             || ((ADJ[from_s] >> to_s) & 1) == 0
-            || world[from_s].owner != sid
             || cnt == 0
         {
             return Err(-27);
         }
+        if world[from_s].owner == sid {
+            clean_buf[str_pos] = from_s as u8;
+            clean_buf[str_pos + 1] = to_s as u8;
+            let cb = cnt.to_be_bytes();
+            clean_buf[str_pos + 2] = cb[0];
+            clean_buf[str_pos + 3] = cb[1];
+            str_pos += 4;
+            valid_str += 1;
+        }
         j += 1;
     }
+    clean_buf[str_cnt_pos] = valid_str as u8;
 
-    storage::set(key_dir(&rid, hdr.cycle, sid).as_slice(), raw_orders);
+    storage::set(
+        key_dir(&rid, hdr.cycle, sid).as_slice(),
+        &clean_buf[..str_pos],
+    );
     if (sid as u32) < 32 {
         hdr.staged_mask |= 1u32 << sid;
     }
@@ -880,8 +907,8 @@ fn handle_stage_directives(args: &CalldataReader) -> Result<i32, i32> {
     let mut ev_data = [0u8; 128];
     push_u64_word(&mut ev_data, 0, sid as u64);
     push_u64_word(&mut ev_data, 1, hdr.cycle as u64);
-    push_u64_word(&mut ev_data, 2, dep_n as u64);
-    push_u64_word(&mut ev_data, 3, str_n as u64);
+    push_u64_word(&mut ev_data, 2, valid_dep as u64);
+    push_u64_word(&mut ev_data, 3, valid_str as u64);
     events::emit(&[EV_DIRECTIVES_STAGED, rid, addr_topic(&caller)], &ev_data);
 
     ret::write_u64_word(1);
