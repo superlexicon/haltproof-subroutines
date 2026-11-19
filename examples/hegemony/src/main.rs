@@ -67,35 +67,38 @@ pub const REGION_BONUSES: [u16; REGION_COUNT] = [4, 3, 6, 4, 3, 5];
 
 /// Undirected sector links (intra-confederation corridors, cross-plate bridges, and 3 Sub-Orbital Warp Gates).
 const EDGES: &[(u8, u8)] = &[
-    // Boreal Crown (0..5)
-    (0, 1), (0, 2), (1, 2), (1, 3), (2, 4), (3, 4), (3, 5), (4, 5),
-    // Solstice Meridian (6..10)
-    (6, 7), (6, 8), (7, 8), (7, 9), (8, 10), (9, 10),
-    // Obsidian Reach (11..17) — 13 is Basalt Spire Relay
-    (11, 12), (11, 13), (12, 13), (12, 14), (13, 15), (14, 15), (14, 16), (15, 16), (15, 17), (16, 17),
-    // Verdant Expanse (18..23) — 21 is Rivercrown Relay
-    (18, 19), (18, 20), (19, 21), (20, 21), (20, 22), (21, 22), (21, 23), (22, 23),
-    // Zephyr Archipelago (24..28)
-    (24, 25), (24, 26), (25, 27), (26, 27), (26, 28), (27, 28),
-    // Aetherium Core (29..35) — 29 is Nexus Prime Relay
-    (29, 30), (29, 31), (29, 32), (30, 31), (30, 33), (31, 32), (31, 34), (32, 34), (33, 34), (33, 35), (34, 35),
-    // Cross-Confederation Land & Strait Bridges
-    (2, 6),   // Ironfjord <-> Helios Basin
-    (5, 11),  // Pale Citadel <-> Valkyr Steppe
-    (5, 29),  // Pale Citadel <-> Nexus Prime
-    (8, 18),  // Aurelia <-> Emerald Canopy
-    (9, 19),  // Red Canyon <-> Briarwood
-    (13, 30), // Basalt Spire <-> Chronos Vault
-    (14, 32), // Cindergate <-> Arcforge
-    (16, 25), // Blackiron Forge <-> Tempest Atoll
-    (21, 29), // Rivercrown <-> Nexus Prime
-    (23, 24), // Sylvan Bastion <-> Coral Spire
-    (23, 31), // Sylvan Bastion <-> Prism Spire
-    (27, 35), // Driftport <-> Sovereign Keep
-    // 3 Sub-Orbital Warp Gates (wrapping East-West & Polar theatres)
-    (0, 28),  // Frostspire <-> Azure Haven
-    (4, 17),  // Glacier Reach <-> Nightwatch
-    (10, 24), // Mirage Crossing <-> Coral Spire
+    // Boreal Atlantic / North America (0..5)
+    (0, 1), (0, 3), (1, 2), (1, 3), (1, 4), (2, 4), (3, 4), (3, 5), (4, 5),
+    // Andean & Austral / South America (6..10)
+    (6, 7), (6, 8), (7, 8), (7, 9), (8, 9), (9, 10),
+    // Northern Eurasia & Steppe (11..17) — 13 is Baikal Relay
+    (11, 12), (12, 13), (13, 14), (13, 15), (14, 15), (14, 16), (15, 17), (16, 17),
+    // Afro-Mediterranean League (18..23) — 21 is Nile Nexus Relay
+    (18, 19), (18, 21), (19, 20), (19, 21), (20, 21), (20, 22), (21, 23), (22, 23),
+    // Indo-Pacific Archipelago (24..28)
+    (24, 25), (24, 26), (25, 26), (26, 27), (26, 28), (27, 28),
+    // Continental Core & Silk Crossroads (29..35) — 29 is Geneva Prime Relay
+    (29, 30), (30, 31), (30, 32), (31, 32), (31, 33), (32, 33), (32, 34), (33, 34), (33, 35), (34, 35),
+    // Real-World Land Isthmuses & Sea Straits
+    (5, 6),   // Sierra Isthmus <-> Orinoco Delta (Panama)
+    (2, 11),  // Thule Station <-> Nordkapp (North Atlantic)
+    (8, 18),  // Amazonia <-> Atlas Littoral (Mid-Atlantic Narrows)
+    (11, 29), // Nordkapp <-> Geneva Prime (North Sea)
+    (11, 30), // Nordkapp <-> Danube Bastion (Baltic)
+    (12, 30), // Ural Frontier <-> Danube Bastion (East European Plain)
+    (12, 32), // Ural Frontier <-> Caspian Gate (Steppe)
+    (13, 34), // Baikal Relay <-> Yangtze Heartland (Mongolian Corridor)
+    (14, 34), // Amur Basin <-> Yangtze Heartland (North China Plain)
+    (16, 25), // Kuroshio Arc <-> Luzon Trench (East China Sea)
+    (18, 29), // Atlas Littoral <-> Geneva Prime (Gibraltar)
+    (21, 31), // Nile Nexus <-> Levant Crossroads (Suez)
+    (23, 24), // Malagasy Reef <-> Sunda Strait (Indian Ocean Lane)
+    (24, 35), // Sunda Strait <-> Mekong Delta (Malacca Strait)
+    (25, 35), // Luzon Trench <-> Mekong Delta (South China Sea)
+    // 3 Trans-Oceanic Sub-Orbital Warp Gates (wrap-around East-West & Southern Polar)
+    (0, 17),  // Yukon Spire <-> Bering Watch (Bering Trans-Pacific Gate)
+    (3, 16),  // Cascadia <-> Kuroshio Arc (North Pacific Slip Gate)
+    (10, 28), // Tierra Austral <-> Zealandia Spire (Southern Polar Gate)
 ];
 
 const fn build_adj() -> [u64; SECTOR_COUNT] {
