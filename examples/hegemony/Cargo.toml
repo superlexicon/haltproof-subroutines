@@ -1,0 +1,13 @@
+[package]
+name = "hegemony"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Fractured Hegemony: Simultaneous-Epoch Sovereign Conquest & Diplomacy — Haltproof Subroutine (HPS #15)"
+
+[[bin]]
+name = "hegemony"
+path = "src/main.rs"
+
+[dependencies]
+hps-sdk = { path = "../../crates/hps-sdk" }

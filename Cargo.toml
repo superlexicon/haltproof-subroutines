@@ -22,6 +22,8 @@ members = [
     "examples/social-feed",
     "examples/social-events",
     "examples/hfs-registry",
+    "examples/hegemony",
+    "examples/cipher-noir",
 ]
 
 [workspace.package]

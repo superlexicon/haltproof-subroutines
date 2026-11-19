@@ -1,0 +1,13 @@
+[package]
+name = "cipher-noir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cipher Noir: Zero-Knowledge Vault Sabotage Tribunal — Haltproof Subroutine (HPS #16) with secp256k1 ECDH private alibi proofs and keccak256 vault commitments"
+
+[[bin]]
+name = "cipher-noir"
+path = "src/main.rs"
+
+[dependencies]
+hps-sdk = { path = "../../crates/hps-sdk" }
