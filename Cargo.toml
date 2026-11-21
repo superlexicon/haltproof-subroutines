@@ -23,6 +23,8 @@ members = [
     "examples/hfs-registry",
     "examples/hegemony",
     "examples/cipher-noir",
+    "examples/vrf-beacon",
+    "examples/lottery",
 ]
 
 [workspace.package]

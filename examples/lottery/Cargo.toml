@@ -1,0 +1,13 @@
+[package]
+name = "lottery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Quantum 4D Jackpot — Provably-Fair Validator-Quorum Threshold VRF Lottery Haltproof Subroutine (HPS)"
+
+[[bin]]
+name = "lottery"
+path = "src/main.rs"
+
+[dependencies]
+hps-sdk = { path = "../../crates/hps-sdk" }

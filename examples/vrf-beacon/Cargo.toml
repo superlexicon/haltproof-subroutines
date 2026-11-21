@@ -1,0 +1,13 @@
+[package]
+name = "vrf-beacon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Validator-Quorum Threshold ECVRF & Dealerless DKG Randomness Beacon — Haltproof Subroutine (HPS)"
+
+[[bin]]
+name = "vrf-beacon"
+path = "src/main.rs"
+
+[dependencies]
+hps-sdk = { path = "../../crates/hps-sdk" }

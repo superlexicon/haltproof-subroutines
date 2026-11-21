@@ -17,6 +17,7 @@
 pub mod governance;
 pub mod keccak;
 pub mod social;
+pub mod vrf;
 
 /// Fixed linear-memory layout expected by Lexicon's `WasmtimeAdapter`.
 pub mod layout {
