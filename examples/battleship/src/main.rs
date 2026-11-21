@@ -41,6 +41,15 @@ pub const CLASS_SCORE_BONUS: [u64; 4] = [250, 450, 750, 1500];
 pub const TEAM_RED: u8 = 0;
 pub const TEAM_BLUE: u8 = 1;
 
+pub const SHIP_DEAD: u8 = 0;
+pub const SHIP_ALIVE: u8 = 1;
+pub const SHIP_DOCKED: u8 = 2;
+pub const SHIP_RECALLING_VIEW: u8 = 3;
+
+/// Number of blocks (~13s) required for Open-Sea Out-of-Combat Recall AND post-fire/hit/sortie cooldowns.
+pub const BASE_RECALL_BLOCKS: u32 = 3;
+pub const BASE_COOLDOWN_BLOCKS: u32 = 3;
+
 pub const BASE_GRID_W: u8 = 40;
 pub const BASE_GRID_H: u8 = 25;
 pub const MAX_GRID_W: u8 = 200;
@@ -90,6 +99,14 @@ const EV_WEAPON_FIRED: [u8; 32] =
 const EV_SHIP_SUNK: [u8; 32] = event_topic("ShipSunk(bytes32,uint64,uint64,uint64)");
 const EV_PLAYER_RESTARTED: [u8; 32] =
     event_topic("PlayerRestarted(bytes32,address,uint64,uint64,uint64)");
+const EV_SHIP_DOCKED: [u8; 32] =
+    event_topic("ShipDocked(bytes32,address,uint64,uint64,uint64)");
+const EV_SHIP_RECALL_STARTED: [u8; 32] =
+    event_topic("ShipRecallStarted(bytes32,address,uint64,uint64)");
+const EV_SHIP_RECALL_CANCELLED: [u8; 32] =
+    event_topic("ShipRecallCancelled(bytes32,uint64,uint64)");
+const EV_SHIP_SORTIED: [u8; 32] =
+    event_topic("ShipSortied(bytes32,address,uint64,uint64,uint64,uint64)");
 
 fn addr_topic(addr: &[u8; 20]) -> [u8; 32] {
     let mut t = [0u8; 32];
@@ -114,6 +131,11 @@ hps_entry! {
     "upgradeGun(bytes32,uint64,uint64)"                           => handle_upgrade_gun,
     "upgradeArmor(bytes32,uint64)"                                => handle_upgrade_engine,
     "repairShip(bytes32,uint64)"                                  => handle_repair_ship,
+    "returnShipToBase(bytes32,uint64)"                            => handle_return_ship_to_base,
+    "returnFleetToBase(bytes32)"                                  => handle_return_fleet_to_base,
+    "sortieShipFromBase(bytes32,uint64)"                          => handle_sortie_ship_from_base,
+    "sortieFleetFromBase(bytes32)"                                => handle_sortie_fleet_from_base,
+    "cancelRecall(bytes32,uint64)"                                => handle_cancel_recall,
     "resolvePendingShells(bytes32)"                               => handle_resolve_shells,
     "getBattleState(bytes32)"                                     => handle_get_battle_state,
     "getPlayersSlice(bytes32,uint64,uint64)"                      => handle_get_players_slice,
@@ -440,6 +462,133 @@ fn save_shell(bid: &[u8; 32], idx: u16, sh: &PendingShell) {
     storage::set(shell_key(bid, idx).as_slice(), &sh.encode());
 }
 
+/// Per-ship Naval Base & anti-abuse tracking (`12 bytes` under `"n:bas:" || bid || gidx`).
+#[derive(Clone, Copy, Default)]
+struct ShipBaseMeta {
+    recall_ready_block: u32,
+    last_hit_block: u32,
+    last_sortie_block: u32,
+}
+
+const BAS_LEN: usize = 12;
+
+impl ShipBaseMeta {
+    fn empty() -> Self {
+        Self {
+            recall_ready_block: 0,
+            last_hit_block: 0,
+            last_sortie_block: 0,
+        }
+    }
+
+    fn encode(&self) -> [u8; BAS_LEN] {
+        let mut b = [0u8; BAS_LEN];
+        b[0..4].copy_from_slice(&self.recall_ready_block.to_be_bytes());
+        b[4..8].copy_from_slice(&self.last_hit_block.to_be_bytes());
+        b[8..12].copy_from_slice(&self.last_sortie_block.to_be_bytes());
+        b
+    }
+
+    fn decode(b: &[u8; BAS_LEN]) -> Self {
+        Self {
+            recall_ready_block: u32::from_be_bytes([b[0], b[1], b[2], b[3]]),
+            last_hit_block: u32::from_be_bytes([b[4], b[5], b[6], b[7]]),
+            last_sortie_block: u32::from_be_bytes([b[8], b[9], b[10], b[11]]),
+        }
+    }
+}
+
+fn base_meta_key(bid: &[u8; 32], gidx: u16) -> KeyBuilder<48> {
+    KeyBuilder::<48>::new()
+        .push(b"n:bas:")
+        .push(bid)
+        .push(&gidx.to_be_bytes())
+}
+
+fn load_base_meta(bid: &[u8; 32], gidx: u16) -> ShipBaseMeta {
+    let k = base_meta_key(bid, gidx);
+    let mut b = [0u8; BAS_LEN];
+    match storage::get_into(k.as_slice(), &mut b) {
+        Some(BAS_LEN) => ShipBaseMeta::decode(&b),
+        _ => ShipBaseMeta::empty(),
+    }
+}
+
+fn save_base_meta(bid: &[u8; 32], gidx: u16, m: &ShipBaseMeta) {
+    storage::set(base_meta_key(bid, gidx).as_slice(), &m.encode());
+}
+
+/// Returns `(x0, y0, x1_incl, y1_incl)` for `team`'s fortified `4×5` corner Naval Base harbor basin:
+/// - Red (`TEAM_RED = 0`): North-West Harbor `x = 0..=3`, `y = 0..=4`
+/// - Blue (`TEAM_BLUE = 1`): South-East Harbor `x = grid_w-4 ..= grid_w-1`, `y = grid_h-5 ..= grid_h-1`
+pub fn naval_base_rect(team: u8, grid_w: u8, grid_h: u8) -> (u8, u8, u8, u8) {
+    if team == TEAM_RED {
+        (
+            0,
+            0,
+            3.min(grid_w.saturating_sub(1)),
+            4.min(grid_h.saturating_sub(1)),
+        )
+    } else {
+        (
+            grid_w.saturating_sub(4),
+            grid_h.saturating_sub(5),
+            grid_w.saturating_sub(1),
+            grid_h.saturating_sub(1),
+        )
+    }
+}
+
+fn ship_overlaps_rect(ship: &ShipRec, x0: u8, y0: u8, x1: u8, y1: u8) -> bool {
+    let (w, h) = ship_dims(ship.class_id, ship.dir);
+    let sx1 = ship.x.saturating_add(w).saturating_sub(1);
+    let sy1 = ship.y.saturating_add(h).saturating_sub(1);
+    !(sx1 < x0 || ship.x > x1 || sy1 < y0 || ship.y > y1)
+}
+
+fn ship_in_friendly_base(ship: &ShipRec, grid_w: u8, grid_h: u8) -> bool {
+    let (x0, y0, x1, y1) = naval_base_rect(ship.team, grid_w, grid_h);
+    ship_overlaps_rect(ship, x0, y0, x1, y1)
+}
+
+fn ship_in_enemy_base(ship: &ShipRec, grid_w: u8, grid_h: u8) -> bool {
+    let enemy_team = if ship.team == TEAM_RED { TEAM_BLUE } else { TEAM_RED };
+    let (x0, y0, x1, y1) = naval_base_rect(enemy_team, grid_w, grid_h);
+    ship_overlaps_rect(ship, x0, y0, x1, y1)
+}
+
+/// If `ship` is at sea (`SHIP_ALIVE`) with a matured Out-of-Combat Recall (`blk32 >= recall_ready_block`),
+/// atomically promotes it to `SHIP_DOCKED` (`2`) so a player who closed their browser after clicking
+/// "Return to Base" is guaranteed 100% drydock immunity as soon as the 3-block tow completes!
+fn promote_matured_recall(
+    bid: &[u8; 32],
+    gidx: u16,
+    ship: &mut ShipRec,
+    blk32: u32,
+) -> ShipBaseMeta {
+    let mut meta = load_base_meta(bid, gidx);
+    if ship.alive == SHIP_ALIVE && meta.recall_ready_block > 0 && blk32 >= meta.recall_ready_block {
+        let ready_blk = meta.recall_ready_block;
+        let (bx0, by0, bx1, by1) = naval_base_rect(ship.team, BASE_GRID_W, BASE_GRID_H);
+        let _ = (bx1, by1);
+        ship.alive = SHIP_DOCKED;
+        ship.x = bx0;
+        ship.y = by0;
+        meta.recall_ready_block = 0;
+        save_ship(bid, gidx, ship);
+        save_base_meta(bid, gidx, &meta);
+        if let Some(plr) = load_plr(bid, ship.owner_pid) {
+            let slot_idx = (gidx % 3) as u64;
+            let mut ev = [0u8; 24];
+            ev[0..8].copy_from_slice(&slot_idx.to_be_bytes());
+            ev[8..16].copy_from_slice(&1u64.to_be_bytes()); // mode = 1 (recall tow completed)
+            ev[16..24].copy_from_slice(&(ready_blk as u64).to_be_bytes());
+            events::emit(&[EV_SHIP_DOCKED, *bid, addr_topic(&plr.addr)], &ev);
+        }
+    }
+    meta
+}
+
 // ---------------------------------------------------------------------------
 // Dynamic Grid Math, Geometry, & Instant 100% Square Hit Resolution
 // ---------------------------------------------------------------------------
@@ -476,7 +625,7 @@ fn effective_max_speed(ship: &ShipRec) -> u8 {
 }
 
 fn cell_index_on_ship(ship: &ShipRec, cx: u8, cy: u8) -> Option<usize> {
-    if ship.alive == 0 {
+    if ship.alive != SHIP_ALIVE {
         return None;
     }
     let l = CLASS_LEN[ship.class_id as usize];
@@ -522,12 +671,16 @@ fn check_ship_placement_free(
     {
         return false;
     }
+    let blk32 = context::block_number() as u32;
     let total_slots = (player_count as u16).min(MAX_PLAYERS as u16) * 3;
     let mut g = 0u16;
     while g < total_slots {
         if g != ignore_gidx {
-            let other = load_ship(bid, g);
-            if other.alive != 0 && ships_overlap(cand, &other) {
+            let mut other = load_ship(bid, g);
+            if other.alive == SHIP_ALIVE {
+                let _ = promote_matured_recall(bid, g, &mut other, blk32);
+            }
+            if other.alive == SHIP_ALIVE && ships_overlap(cand, &other) {
                 return false;
             }
         }
@@ -581,27 +734,40 @@ fn detonate_salvo_at(
     let mut score_earned = 0u64;
     let mut kills_scored = 0u16;
 
+    let blk32 = context::block_number() as u32;
     let total_ships = (hdr.player_count as u16).min(MAX_PLAYERS as u16) * 3;
     let mut s_idx = 0u16;
     while s_idx < total_ships {
         let mut ship = load_ship(bid, s_idx);
-        if ship.alive != 0 && ship.team != attacker_team {
+        if ship.alive == SHIP_ALIVE {
+            let _ = promote_matured_recall(bid, s_idx, &mut ship, blk32);
+        }
+        if ship.alive == SHIP_ALIVE && ship.team != attacker_team {
             let mut touched = false;
             let mut c = 0usize;
             while c < cell_n {
                 let (ix, iy) = cells[c];
                 if let Some(h_idx) = cell_index_on_ship(&ship, ix, iy) {
+                    touched = true;
                     if ship.cell_dmg[h_idx] < 100 {
                         ship.cell_dmg[h_idx] = 100; // 100% square hit!
                         credits_earned += CREDITS_PER_CELL_HIT;
                         score_earned += SCORE_PER_CELL_HIT;
-                        touched = true;
                     }
                 }
                 c += 1;
             }
 
             if touched {
+                let mut meta = load_base_meta(bid, s_idx);
+                meta.last_hit_block = blk32;
+                if meta.recall_ready_block > blk32 {
+                    meta.recall_ready_block = 0;
+                    let mut cev = [0u8; 16];
+                    cev[0..8].copy_from_slice(&(s_idx as u64).to_be_bytes());
+                    cev[8..16].copy_from_slice(&(attacker_pid as u64).to_be_bytes());
+                    events::emit(&[EV_SHIP_RECALL_CANCELLED, *bid], &cev);
+                }
                 let n_cells = CLASS_CELLS[ship.class_id as usize] as usize;
                 let mut breached = 0u8;
                 let mut k = 0usize;
@@ -613,6 +779,7 @@ fn detonate_salvo_at(
                 }
                 if breached >= CLASS_SINK_CELLS[ship.class_id as usize] {
                     ship.alive = 0;
+                    meta = ShipBaseMeta::empty();
                     let bounty = CLASS_BOUNTY[ship.class_id as usize];
                     let score_bonus = CLASS_SCORE_BONUS[ship.class_id as usize];
                     credits_earned += bounty;
@@ -630,6 +797,7 @@ fn detonate_salvo_at(
                     sev[16..24].copy_from_slice(&bounty.to_be_bytes());
                     events::emit(&[EV_SHIP_SUNK, *bid], &sev);
                 }
+                save_base_meta(bid, s_idx, &meta);
                 save_ship(bid, s_idx, &ship);
             }
         }
@@ -651,8 +819,18 @@ fn detonate_salvo_at(
 
 fn sync_pending_shells(bid: &[u8; 32], hdr: &mut BattleHeader) {
     let blk = context::block_number();
+    let blk32 = blk as u32;
     if blk <= hdr.last_resolved_block {
         return;
+    }
+    let total_ships = (hdr.player_count as u16).min(MAX_PLAYERS as u16) * 3;
+    let mut g = 0u16;
+    while g < total_ships {
+        let mut sh = load_ship(bid, g);
+        if sh.alive == SHIP_ALIVE {
+            let _ = promote_matured_recall(bid, g, &mut sh, blk32);
+        }
+        g += 1;
     }
     let count = (hdr.shell_count as usize).min(MAX_INFLIGHT_SHELLS);
     let mut write_idx = 0u16;
@@ -758,7 +936,7 @@ fn join_player_internal(
             let mut s = 0u16;
             while s < existing_ships {
                 let mut sh = load_ship(bid, s);
-                if sh.alive != 0 {
+                if sh.alive == SHIP_ALIVE {
                     sh.x = sh.x.saturating_add(dx);
                     sh.y = sh.y.saturating_add(dy);
                     if sh.flash_x < 250 {
@@ -878,16 +1056,19 @@ fn spawn_starter_ships_internal(
                             flash_y: 255,
                             pad2: [0; 2],
                         };
-                        if check_ship_placement_free(
-                            bid,
-                            hdr.player_count,
-                            hdr.grid_w,
-                            hdr.grid_h,
-                            gidx,
-                            &cand,
-                        ) {
+                        if !ship_in_enemy_base(&cand, hdr.grid_w, hdr.grid_h)
+                            && check_ship_placement_free(
+                                bid,
+                                hdr.player_count,
+                                hdr.grid_w,
+                                hdr.grid_h,
+                                gidx,
+                                &cand,
+                            )
+                        {
                             plr.credits -= cost;
                             save_ship(bid, gidx, &cand);
+                            save_base_meta(bid, gidx, &ShipBaseMeta::empty());
                             let mut ev = [0u8; 40];
                             ev[0..8].copy_from_slice(&(gidx as u64).to_be_bytes());
                             ev[8..16].copy_from_slice(&(team as u64).to_be_bytes());
@@ -1073,6 +1254,10 @@ fn handle_buy_ship(args: &CalldataReader) -> Result<(), i32> {
         pad2: [0; 2],
     };
 
+    if ship_in_enemy_base(&cand, hdr.grid_w, hdr.grid_h) {
+        return Err(-29);
+    }
+
     if !check_ship_placement_free(&bid, hdr.player_count, hdr.grid_w, hdr.grid_h, gidx, &cand) {
         return Err(-26);
     }
@@ -1080,6 +1265,7 @@ fn handle_buy_ship(args: &CalldataReader) -> Result<(), i32> {
     plr.credits -= cost;
     save_plr(&bid, pid, &plr);
     save_ship(&bid, gidx, &cand);
+    save_base_meta(&bid, gidx, &ShipBaseMeta::empty());
     save_hdr(&bid, &hdr);
 
     let mut ev = [0u8; 40];
@@ -1130,14 +1316,33 @@ fn resolve_vessel_collisions(
     let mut mover_kills = 0u16;
     let mut last_enemy_collider: Option<(u8, u8)> = None;
 
+    let blk32 = context::block_number() as u32;
     let mut other_gidx = 0u16;
     while other_gidx < total_slots {
         if other_gidx != mover_gidx {
             let mut other = load_ship(bid, other_gidx);
-            if other.alive != 0 && ships_overlap(ship, &other) {
+            if other.alive == SHIP_ALIVE {
+                let _ = promote_matured_recall(bid, other_gidx, &mut other, blk32);
+            }
+            if other.alive == SHIP_ALIVE && ships_overlap(ship, &other) {
                 let is_enemy = ship.team != other.team;
                 if is_enemy {
                     last_enemy_collider = Some((other.owner_pid, other.team));
+                    let mut o_meta = load_base_meta(bid, other_gidx);
+                    o_meta.last_hit_block = blk32;
+                    if o_meta.recall_ready_block > blk32 {
+                        o_meta.recall_ready_block = 0;
+                        let mut cev = [0u8; 16];
+                        cev[0..8].copy_from_slice(&(other_gidx as u64).to_be_bytes());
+                        cev[8..16].copy_from_slice(&(mover_pid as u64).to_be_bytes());
+                        events::emit(&[EV_SHIP_RECALL_CANCELLED, *bid], &cev);
+                    }
+                    save_base_meta(bid, other_gidx, &o_meta);
+
+                    let mut m_meta = load_base_meta(bid, mover_gidx);
+                    m_meta.last_hit_block = blk32;
+                    m_meta.recall_ready_block = 0;
+                    save_base_meta(bid, mover_gidx, &m_meta);
                 }
 
                 let mut overlap_squares = 0u64;
@@ -1331,11 +1536,12 @@ fn handle_move_ship(args: &CalldataReader) -> Result<i32, i32> {
     let pid = find_pid(&bid, &caller).ok_or(-21)?;
     let gidx = (pid as u16) * 3 + (slot_idx as u16);
     let mut ship = load_ship(&bid, gidx);
-    if ship.alive == 0 {
+    let blk = context::block_number() as u32;
+    let mut meta = promote_matured_recall(&bid, gidx, &mut ship, blk);
+    if ship.alive != SHIP_ALIVE {
         return Err(-31);
     }
 
-    let blk = context::block_number() as u32;
     if ship.last_move_block == blk {
         return Err(-32);
     }
@@ -1386,8 +1592,15 @@ fn handle_move_ship(args: &CalldataReader) -> Result<i32, i32> {
     ship.x = best_x;
     ship.y = best_y;
     ship.dir = best_dir;
+    if ship_in_enemy_base(&ship, hdr.grid_w, hdr.grid_h) {
+        return Err(-36);
+    }
     ship.pad = heading8;
     ship.last_move_block = blk;
+    if meta.recall_ready_block > 0 {
+        meta.recall_ready_block = 0;
+        save_base_meta(&bid, gidx, &meta);
+    }
 
     // Emit 8-word (64-byte) `ShipMoved` payload first so UI always teleports to `(best_x, best_y)`!
     let mut ev = [0u8; 64];
@@ -1433,12 +1646,15 @@ fn handle_fire_weapon(args: &CalldataReader) -> Result<(), i32> {
     let pid = find_pid(&bid, &caller).ok_or(-21)?;
     let gidx = (pid as u16) * 3 + (slot_idx as u16);
     let mut ship = load_ship(&bid, gidx);
-    if ship.alive == 0 {
-        return Err(-42);
-    }
-
     let blk = context::block_number();
     let blk32 = blk as u32;
+    let meta = promote_matured_recall(&bid, gidx, &mut ship, blk32);
+    if ship.alive != SHIP_ALIVE {
+        return Err(-42);
+    }
+    if meta.recall_ready_block > blk32 {
+        return Err(-84);
+    }
     if ship.last_fire_block == blk32 {
         return Err(-43);
     }
@@ -1616,6 +1832,287 @@ fn handle_repair_ship(args: &CalldataReader) -> Result<i32, i32> {
     Ok(cells_repaired as i32)
 }
 
+/// Core per-ship Naval Base entry logic with anti-abuse protections:
+/// - Returns `Ok(1)` if docked immediately (inside friendly Naval Base zone),
+/// - Returns `Ok(2)` if a `BASE_RECALL_BLOCKS` (`3`-block) Out-of-Combat Recall started,
+/// - Returns `Err(...)`:
+///     `-80` = ship is dead/empty,
+///     `-81` = already docked or recall already active,
+///     `-82` = post-sortie cooldown (`< 3` blocks since undocking),
+///     `-83` = in-combat cooldown (fired or took enemy damage within last `3` blocks).
+fn return_ship_internal(
+    bid: &[u8; 32],
+    hdr: &BattleHeader,
+    caller: &[u8; 20],
+    pid: u8,
+    slot_idx: u64,
+    blk32: u32,
+) -> Result<u64, i32> {
+    let gidx = (pid as u16) * 3 + (slot_idx as u16);
+    let mut ship = load_ship(bid, gidx);
+    let mut meta = promote_matured_recall(bid, gidx, &mut ship, blk32);
+    if ship.alive == SHIP_DEAD {
+        return Err(-80);
+    }
+    if ship.alive == SHIP_DOCKED || meta.recall_ready_block > blk32 {
+        return Err(-81);
+    }
+
+    // Anti-Sniping Rule: must stay at sea >= 3 blocks after undocking before re-entering Base
+    if meta.last_sortie_block > 0
+        && blk32 < meta.last_sortie_block.saturating_add(BASE_COOLDOWN_BLOCKS)
+    {
+        return Err(-82);
+    }
+
+    if ship_in_friendly_base(&ship, hdr.grid_w, hdr.grid_h) {
+        // Inside friendly Naval Base: instant 1-block docking, provided ship didn't fire this block!
+        if ship.last_fire_block > 0 && ship.last_fire_block == blk32 {
+            return Err(-83);
+        }
+        let (bx0, by0, _, _) = naval_base_rect(ship.team, hdr.grid_w, hdr.grid_h);
+        ship.alive = SHIP_DOCKED;
+        ship.x = bx0;
+        ship.y = by0;
+        meta.recall_ready_block = 0;
+        save_ship(bid, gidx, &ship);
+        save_base_meta(bid, gidx, &meta);
+
+        let mut ev = [0u8; 24];
+        ev[0..8].copy_from_slice(&slot_idx.to_be_bytes());
+        ev[8..16].copy_from_slice(&0u64.to_be_bytes()); // mode = 0 (instant harbor dock)
+        ev[16..24].copy_from_slice(&(blk32 as u64).to_be_bytes());
+        events::emit(&[EV_SHIP_DOCKED, *bid, addr_topic(caller)], &ev);
+        Ok(1)
+    } else {
+        // Open-Sea Recall: strictly requires being Out of Combat (no shots fired & no hits taken in last 3 blocks)
+        if ship.last_fire_block > 0
+            && blk32 < ship.last_fire_block.saturating_add(BASE_COOLDOWN_BLOCKS)
+        {
+            return Err(-83);
+        }
+        if meta.last_hit_block > 0
+            && blk32 < meta.last_hit_block.saturating_add(BASE_COOLDOWN_BLOCKS)
+        {
+            return Err(-83);
+        }
+        let ready_blk = blk32.saturating_add(BASE_RECALL_BLOCKS);
+        meta.recall_ready_block = ready_blk;
+        save_base_meta(bid, gidx, &meta);
+
+        let mut ev = [0u8; 16];
+        ev[0..8].copy_from_slice(&slot_idx.to_be_bytes());
+        ev[8..16].copy_from_slice(&(ready_blk as u64).to_be_bytes());
+        events::emit(&[EV_SHIP_RECALL_STARTED, *bid, addr_topic(caller)], &ev);
+        Ok(2)
+    }
+}
+
+/// Launches a drydocked ship (`SHIP_DOCKED`) onto a clear coastal launch tile near its Team's Naval Base.
+/// Scans outward across the entire home coast (`12` columns deep × full grid height) so enemy blockades
+/// can NEVER trap or spawn-camp a returning player!
+fn sortie_ship_internal(
+    bid: &[u8; 32],
+    hdr: &BattleHeader,
+    caller: &[u8; 20],
+    pid: u8,
+    slot_idx: u64,
+    blk32: u32,
+) -> Result<(u8, u8), i32> {
+    let gidx = (pid as u16) * 3 + (slot_idx as u16);
+    let mut ship = load_ship(bid, gidx);
+    let mut meta = promote_matured_recall(bid, gidx, &mut ship, blk32);
+    if ship.alive != SHIP_DOCKED {
+        return Err(-85);
+    }
+
+    let (w, h) = ship_dims(ship.class_id, 0);
+    let (_bx0, by0, _bx1, by1) = naval_base_rect(ship.team, hdr.grid_w, hdr.grid_h);
+    let mid_y = ((by0 as u16 + by1 as u16) / 2) as i16;
+    let max_y = (hdr.grid_h.saturating_sub(h)) as i16;
+    let max_x = (hdr.grid_w.saturating_sub(w)) as i16;
+
+    let mut chosen: Option<(u8, u8)> = None;
+    let mut col_step = 0i16;
+    while col_step <= max_x && chosen.is_none() {
+        let cand_x = if ship.team == TEAM_RED {
+            col_step
+        } else {
+            (max_x - col_step).max(0)
+        };
+        let mut dy_mag = 0i16;
+        while dy_mag <= (hdr.grid_h as i16) {
+            let signs: [i16; 2] = if dy_mag == 0 { [0, 0] } else { [-1, 1] };
+            let sign_count = if dy_mag == 0 { 1usize } else { 2usize };
+            let mut si = 0usize;
+            while si < sign_count {
+                let cy = mid_y + signs[si] * dy_mag + (slot_idx as i16 - 1);
+                if cy >= 0 && cy <= max_y && cand_x >= 0 && cand_x <= max_x {
+                    let mut cand = ship;
+                    cand.alive = SHIP_ALIVE;
+                    cand.dir = 0;
+                    cand.x = cand_x as u8;
+                    cand.y = cy as u8;
+                    cand.pad = if ship.team == TEAM_RED { 2 } else { 6 };
+                    if !ship_in_enemy_base(&cand, hdr.grid_w, hdr.grid_h)
+                        && check_ship_placement_free(
+                            bid,
+                            hdr.player_count,
+                            hdr.grid_w,
+                            hdr.grid_h,
+                            gidx,
+                            &cand,
+                        )
+                    {
+                        chosen = Some((cand.x, cand.y));
+                        break;
+                    }
+                }
+                si += 1;
+            }
+            if chosen.is_some() {
+                break;
+            }
+            dy_mag += 1;
+        }
+        col_step += 1;
+    }
+
+    let (sx, sy) = chosen.ok_or(-86)?;
+    ship.alive = SHIP_ALIVE;
+    ship.dir = 0;
+    ship.x = sx;
+    ship.y = sy;
+    ship.pad = if ship.team == TEAM_RED { 2 } else { 6 };
+    ship.last_move_block = blk32;
+    ship.flash_x = 255;
+    ship.flash_y = 255;
+    meta.recall_ready_block = 0;
+    meta.last_sortie_block = blk32;
+
+    save_ship(bid, gidx, &ship);
+    save_base_meta(bid, gidx, &meta);
+
+    let mut ev = [0u8; 32];
+    ev[0..8].copy_from_slice(&slot_idx.to_be_bytes());
+    ev[8..16].copy_from_slice(&(sx as u64).to_be_bytes());
+    ev[16..24].copy_from_slice(&(sy as u64).to_be_bytes());
+    ev[24..32].copy_from_slice(&(ship.pad as u64).to_be_bytes());
+    events::emit(&[EV_SHIP_SORTIED, *bid, addr_topic(caller)], &ev);
+    Ok((sx, sy))
+}
+
+fn handle_return_ship_to_base(args: &CalldataReader) -> Result<i32, i32> {
+    let bid = args.bytes32(0).ok_or(-10)?;
+    let slot_idx = args.u64(1).ok_or(-10)?;
+    if slot_idx >= SHIPS_PER_PLAYER {
+        return Err(-80);
+    }
+    let mut hdr = load_hdr(&bid).ok_or(-13)?;
+    sync_pending_shells(&bid, &mut hdr);
+    let caller = context::msg_sender();
+    let pid = find_pid(&bid, &caller).ok_or(-21)?;
+    let blk32 = context::block_number() as u32;
+    let mode = return_ship_internal(&bid, &hdr, &caller, pid, slot_idx, blk32)?;
+    save_hdr(&bid, &hdr);
+    ret::write_u64_word(mode);
+    Ok(mode as i32)
+}
+
+fn handle_return_fleet_to_base(args: &CalldataReader) -> Result<i32, i32> {
+    let bid = args.bytes32(0).ok_or(-10)?;
+    let mut hdr = load_hdr(&bid).ok_or(-13)?;
+    sync_pending_shells(&bid, &mut hdr);
+    let caller = context::msg_sender();
+    let pid = find_pid(&bid, &caller).ok_or(-21)?;
+    let blk32 = context::block_number() as u32;
+
+    let mut processed = 0u64;
+    let mut last_err: i32 = -80;
+    let mut slot = 0u64;
+    while slot < SHIPS_PER_PLAYER {
+        match return_ship_internal(&bid, &hdr, &caller, pid, slot, blk32) {
+            Ok(_) => processed += 1,
+            Err(e) => {
+                if e != -80 && e != -81 {
+                    last_err = e;
+                } else if last_err == -80 {
+                    last_err = e;
+                }
+            }
+        }
+        slot += 1;
+    }
+    if processed == 0 {
+        return Err(last_err);
+    }
+    save_hdr(&bid, &hdr);
+    ret::write_u64_word(processed);
+    Ok(processed as i32)
+}
+
+fn handle_sortie_ship_from_base(args: &CalldataReader) -> Result<i32, i32> {
+    let bid = args.bytes32(0).ok_or(-10)?;
+    let slot_idx = args.u64(1).ok_or(-10)?;
+    if slot_idx >= SHIPS_PER_PLAYER {
+        return Err(-85);
+    }
+    let mut hdr = load_hdr(&bid).ok_or(-13)?;
+    sync_pending_shells(&bid, &mut hdr);
+    let caller = context::msg_sender();
+    let pid = find_pid(&bid, &caller).ok_or(-21)?;
+    let blk32 = context::block_number() as u32;
+    let (sx, sy) = sortie_ship_internal(&bid, &hdr, &caller, pid, slot_idx, blk32)?;
+    save_hdr(&bid, &hdr);
+    let packed = ((sx as u64) << 8) | (sy as u64);
+    ret::write_u64_word(packed);
+    Ok(packed as i32)
+}
+
+fn handle_sortie_fleet_from_base(args: &CalldataReader) -> Result<i32, i32> {
+    let bid = args.bytes32(0).ok_or(-10)?;
+    let mut hdr = load_hdr(&bid).ok_or(-13)?;
+    sync_pending_shells(&bid, &mut hdr);
+    let caller = context::msg_sender();
+    let pid = find_pid(&bid, &caller).ok_or(-21)?;
+    let blk32 = context::block_number() as u32;
+
+    let mut launched = 0u64;
+    let mut slot = 0u64;
+    while slot < SHIPS_PER_PLAYER {
+        if sortie_ship_internal(&bid, &hdr, &caller, pid, slot, blk32).is_ok() {
+            launched += 1;
+        }
+        slot += 1;
+    }
+    if launched == 0 {
+        return Err(-85);
+    }
+    save_hdr(&bid, &hdr);
+    ret::write_u64_word(launched);
+    Ok(launched as i32)
+}
+
+fn handle_cancel_recall(args: &CalldataReader) -> Result<(), i32> {
+    let bid = args.bytes32(0).ok_or(-10)?;
+    let slot_idx = args.u64(1).ok_or(-10)?;
+    if slot_idx >= SHIPS_PER_PLAYER {
+        return Err(-80);
+    }
+    let caller = context::msg_sender();
+    let pid = find_pid(&bid, &caller).ok_or(-21)?;
+    let gidx = (pid as u16) * 3 + (slot_idx as u16);
+    let blk32 = context::block_number() as u32;
+    let mut ship = load_ship(&bid, gidx);
+    let mut meta = promote_matured_recall(&bid, gidx, &mut ship, blk32);
+    if ship.alive != SHIP_ALIVE || meta.recall_ready_block <= blk32 {
+        return Err(-87);
+    }
+    meta.recall_ready_block = 0;
+    save_base_meta(&bid, gidx, &meta);
+    Ok(())
+}
+
 /// Permissionless periodic shell-resolution sweep (no authentication or authorization required;
 /// guarded against being called more than once per block per battle).
 fn handle_resolve_shells(args: &CalldataReader) -> Result<(), i32> {
@@ -1648,13 +2145,32 @@ fn handle_get_battle_state(args: &CalldataReader) -> Result<i32, i32> {
     let mut out = [0u8; 36 + MAX_SHIPS * 34 + MAX_INFLIGHT_SHELLS * 16];
     out[0..32].copy_from_slice(&hdr.encode());
 
+    let blk32 = context::block_number() as u32;
     let mut pos = 36usize;
     let mut alive_n = 0u16;
     let total_slots = (hdr.player_count as u16).min(MAX_PLAYERS as u16) * 3;
     let mut g = 0u16;
     while g < total_slots {
-        let sh = load_ship(&bid, g);
+        let mut sh = load_ship(&bid, g);
         if sh.alive != 0 {
+            if sh.alive == SHIP_ALIVE {
+                let meta = load_base_meta(&bid, g);
+                if meta.recall_ready_block > 0 {
+                    if blk32 >= meta.recall_ready_block {
+                        let (bx0, by0, _, _) = naval_base_rect(sh.team, hdr.grid_w, hdr.grid_h);
+                        sh.alive = SHIP_DOCKED;
+                        sh.x = bx0;
+                        sh.y = by0;
+                    } else {
+                        sh.alive = SHIP_RECALLING_VIEW;
+                        sh.flash_x = (meta.recall_ready_block - blk32).min(250) as u8;
+                    }
+                }
+            } else if sh.alive == SHIP_DOCKED {
+                let (bx0, by0, _, _) = naval_base_rect(sh.team, hdr.grid_w, hdr.grid_h);
+                sh.x = bx0;
+                sh.y = by0;
+            }
             out[pos..pos + 2].copy_from_slice(&g.to_be_bytes());
             out[pos + 2..pos + 34].copy_from_slice(&sh.encode());
             pos += 34;
@@ -2283,6 +2799,267 @@ mod tests {
         assert_eq!(
             mock::transact_as([0xEE; 20], CONTRACT, res_cd.as_slice()),
             Err(ERR_ALREADY_EXECUTED_IN_BLOCK)
+        );
+    }
+
+    #[test]
+    fn naval_base_dock_out_of_combat_recall_and_anti_teleport_abuse() {
+        mock::reset();
+        mock::register_hps(CONTRACT, dispatch_calldata);
+        mock::set_block_number(1000);
+
+        let bid = [0x77; 32];
+        let red_p = [0xC1; 20];
+        let blue_p = [0xD2; 20];
+
+        mock::transact_as(
+            red_p,
+            CONTRACT,
+            CallEncoder::<128>::new(selector("createBattle(bytes32)"))
+                .push_bytes32(&bid)
+                .as_slice(),
+        )
+        .unwrap();
+
+        mock::transact_as(
+            red_p,
+            CONTRACT,
+            CallEncoder::<128>::new(selector("joinBattle(bytes32,uint64)"))
+                .push_bytes32(&bid)
+                .push_u64(0)
+                .as_slice(),
+        )
+        .unwrap();
+        mock::transact_as(
+            blue_p,
+            CONTRACT,
+            CallEncoder::<128>::new(selector("joinBattle(bytes32,uint64)"))
+                .push_bytes32(&bid)
+                .push_u64(1)
+                .as_slice(),
+        )
+        .unwrap();
+
+        // 1. Enemy harbor exclusion: Red cannot deploy inside Blue's SE Harbor (`x=36..=39, y=20..=24`)!
+        assert_eq!(
+            mock::transact_as(
+                red_p,
+                CONTRACT,
+                CallEncoder::<256>::new(selector("buyShip(bytes32,uint64,uint64,uint64,uint64,uint64)"))
+                    .push_bytes32(&bid)
+                    .push_u64(0)
+                    .push_u64(0)
+                    .push_u64(37)
+                    .push_u64(22)
+                    .push_u64(0)
+                    .as_slice(),
+            ),
+            Err(-29)
+        );
+
+        // 2. Red deploys Slot 0 inside Red NW Harbor `(1, 2)` and Slot 1 mid-ocean `(15, 12)`
+        mock::transact_as(
+            red_p,
+            CONTRACT,
+            CallEncoder::<256>::new(selector("buyShip(bytes32,uint64,uint64,uint64,uint64,uint64)"))
+                .push_bytes32(&bid)
+                .push_u64(0)
+                .push_u64(1) // Frigate
+                .push_u64(1)
+                .push_u64(2)
+                .push_u64(0)
+                .as_slice(),
+        )
+        .unwrap();
+        mock::transact_as(
+            red_p,
+            CONTRACT,
+            CallEncoder::<256>::new(selector("buyShip(bytes32,uint64,uint64,uint64,uint64,uint64)"))
+                .push_bytes32(&bid)
+                .push_u64(1)
+                .push_u64(2) // Cruiser (4 cells)
+                .push_u64(15)
+                .push_u64(12)
+                .push_u64(0)
+                .as_slice(),
+        )
+        .unwrap();
+
+        // Blue deploys Cruiser within gun range at `(21, 12)`
+        mock::transact_as(
+            blue_p,
+            CONTRACT,
+            CallEncoder::<256>::new(selector("buyShip(bytes32,uint64,uint64,uint64,uint64,uint64)"))
+                .push_bytes32(&bid)
+                .push_u64(0)
+                .push_u64(2)
+                .push_u64(21)
+                .push_u64(12)
+                .push_u64(0)
+                .as_slice(),
+        )
+        .unwrap();
+
+        // 3. Inside Harbor: Slot 0 docks INSTANTLY (`mode = 1 -> SHIP_DOCKED = 2`)!
+        let dock0 = mock::transact_as(
+            red_p,
+            CONTRACT,
+            CallEncoder::<128>::new(selector("returnShipToBase(bytes32,uint64)"))
+                .push_bytes32(&bid)
+                .push_u64(0)
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(u64::from_be_bytes(dock0[24..32].try_into().unwrap()), 1);
+
+        // 4. Anti-Panic-Teleport: Blue hits Red's mid-ocean Slot 1 at block 1001 -> Red CANNOT recall (`-83`)!
+        mock::set_block_number(1001);
+        mock::transact_as(
+            blue_p,
+            CONTRACT,
+            CallEncoder::<192>::new(selector("fireWeapon(bytes32,uint64,uint64,uint64)"))
+                .push_bytes32(&bid)
+                .push_u64(0)
+                .push_u64(15)
+                .push_u64(12)
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(
+            mock::transact_as(
+                red_p,
+                CONTRACT,
+                CallEncoder::<128>::new(selector("returnShipToBase(bytes32,uint64)"))
+                    .push_bytes32(&bid)
+                    .push_u64(1)
+                    .as_slice(),
+            ),
+            Err(-83)
+        );
+
+        // 5. After 3 quiet blocks (`1004 >= 1001 + 3`), Red starts Out-of-Combat Recall (`mode = 2`, ready at 1007)!
+        mock::set_block_number(1004);
+        let rec1 = mock::transact_as(
+            red_p,
+            CONTRACT,
+            CallEncoder::<128>::new(selector("returnShipToBase(bytes32,uint64)"))
+                .push_bytes32(&bid)
+                .push_u64(1)
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(u64::from_be_bytes(rec1[24..32].try_into().unwrap()), 2);
+
+        // While recalling (block 1005), Red Slot 1 cannot fire (`-84`), and if Blue hits it at 1005, recall CANCELS!
+        mock::set_block_number(1005);
+        assert_eq!(
+            mock::transact_as(
+                red_p,
+                CONTRACT,
+                CallEncoder::<192>::new(selector("fireWeapon(bytes32,uint64,uint64,uint64)"))
+                    .push_bytes32(&bid)
+                    .push_u64(1)
+                    .push_u64(21)
+                    .push_u64(12)
+                    .as_slice(),
+            ),
+            Err(-84)
+        );
+        mock::transact_as(
+            blue_p,
+            CONTRACT,
+            CallEncoder::<192>::new(selector("fireWeapon(bytes32,uint64,uint64,uint64)"))
+                .push_bytes32(&bid)
+                .push_u64(0)
+                .push_u64(16)
+                .push_u64(12)
+                .as_slice(),
+        )
+        .unwrap();
+        let read_ship_from_state = |target_gidx: u16| -> ShipRec {
+            let st = mock::transact_as(
+                red_p,
+                CONTRACT,
+                CallEncoder::<128>::new(selector("getBattleState(bytes32)"))
+                    .push_bytes32(&bid)
+                    .as_slice(),
+            )
+            .unwrap();
+            let count = u16::from_be_bytes([st[32], st[33]]) as usize;
+            let mut pos = 36usize;
+            for _ in 0..count {
+                let g = u16::from_be_bytes([st[pos], st[pos + 1]]);
+                let sh = ShipRec::decode(st[pos + 2..pos + 34].try_into().unwrap());
+                if g == target_gidx {
+                    return sh;
+                }
+                pos += 34;
+            }
+            ShipRec::empty()
+        };
+
+        // Verify recall was cancelled (still `SHIP_ALIVE == 1` even at block 1008!)
+        mock::set_block_number(1008);
+        assert_eq!(read_ship_from_state(1).alive, SHIP_ALIVE);
+
+        // 6. Out-of-combat again at block 1009 (`>= 1005 + 3`): 1-click `returnFleetToBase` starts tow -> matures at 1012!
+        mock::set_block_number(1009);
+        mock::transact_as(
+            red_p,
+            CONTRACT,
+            CallEncoder::<128>::new(selector("returnFleetToBase(bytes32)"))
+                .push_bytes32(&bid)
+                .as_slice(),
+        )
+        .unwrap();
+        // At block 1010 (`2` blocks remaining), view reports `SHIP_RECALLING_VIEW == 3` with `flash_x == 2`!
+        mock::set_block_number(1010);
+        let towing_sh = read_ship_from_state(1);
+        assert_eq!(towing_sh.alive, SHIP_RECALLING_VIEW);
+        assert_eq!(towing_sh.flash_x, 2);
+
+        // Even with ZERO transactions from Red after block 1009, Blue shooting `(17, 12)` at block 1012 deals 0 damage because Slot 1 auto-docked!
+        mock::set_block_number(1012);
+        mock::transact_as(
+            blue_p,
+            CONTRACT,
+            CallEncoder::<192>::new(selector("fireWeapon(bytes32,uint64,uint64,uint64)"))
+                .push_bytes32(&bid)
+                .push_u64(0)
+                .push_u64(17)
+                .push_u64(12)
+                .as_slice(),
+        )
+        .unwrap();
+        let docked_sh = read_ship_from_state(1);
+        assert_eq!(docked_sh.alive, SHIP_DOCKED);
+        assert_eq!(docked_sh.cell_dmg[2], 0); // Intact!
+
+        // 7. 1-click `sortieFleetFromBase` launches both Red ships (`Slot 0` and `Slot 1`) back to sea, and blocks immediate re-dock (`-82`)!
+        mock::set_block_number(1015);
+        let sort_out = mock::transact_as(
+            red_p,
+            CONTRACT,
+            CallEncoder::<128>::new(selector("sortieFleetFromBase(bytes32)"))
+                .push_bytes32(&bid)
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(u64::from_be_bytes(sort_out[24..32].try_into().unwrap()), 2);
+        assert_eq!(read_ship_from_state(0).alive, SHIP_ALIVE);
+        assert_eq!(read_ship_from_state(1).alive, SHIP_ALIVE);
+
+        // Anti-Sniping: immediate re-dock right after sortie MUST fail (`-82`)!
+        assert_eq!(
+            mock::transact_as(
+                red_p,
+                CONTRACT,
+                CallEncoder::<128>::new(selector("returnShipToBase(bytes32,uint64)"))
+                    .push_bytes32(&bid)
+                    .push_u64(0)
+                    .as_slice(),
+            ),
+            Err(-82)
         );
     }
 }

@@ -315,13 +315,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dead-drop"
-version = "0.1.0"
-dependencies = [
- "hps-sdk",
-]
-
-[[package]]
 name = "dex-clob"
 version = "0.1.0"
 dependencies = [
