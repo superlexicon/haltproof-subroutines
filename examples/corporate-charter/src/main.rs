@@ -26,21 +26,22 @@
 use hps_sdk::abi::CalldataReader;
 use hps_sdk::call::{self, CallEncoder};
 use hps_sdk::governance::{
-    compute_sha_doc_hash, require_valid_authorization_hps, require_valid_identity,
-    verify_and_consume_auth, ActionHasher, AuthorizedModuleSpec, FunctionAuthRule, PolicySpec,
-    ShareClassSpec, StageSpec, ACTION_ACTIVATE_CHARTER, ACTION_ADD_DIRECTOR,
-    ACTION_AUTHORIZE_MODULE, ACTION_DEFINE_ROLE, ACTION_GRANT_ROLE, ACTION_REGISTER_SHARE_CLASS,
-    ACTION_REMOVE_DIRECTOR, ACTION_REVOKE_ROLE, ACTION_SET_FUNCTION_AUTH, ACTION_SET_TREASURY,
-    CAP_EQUITY_SETTLEMENT, CHARTER_STATE_ACTIVE, CHARTER_STATE_PENDING_RATIFICATION,
-    CHARTER_STATE_UNINITIALIZED, ERR_CHARTER_ALREADY_ACTIVE, ERR_CHARTER_MISMATCH,
-    ERR_CHARTER_NOT_ACTIVE, ERR_DIRECTOR_CONSENT_REQUIRED, ERR_FUNCTION_AUTH_NOT_SET,
-    ERR_GOVERNANCE_DOWNGRADE, ERR_NOT_EXISTING_SHAREHOLDER, ERR_NO_BIDS_IN_STAGE,
-    ERR_POLICY_INVALID, ERR_RESERVED_GOVERNANCE_ROLE, ERR_ROLE_NOT_DEFINED,
+    compute_sha_doc_hash, require_approved_hfs_code_hash, require_valid_authorization_hps,
+    require_valid_identity, verify_and_consume_auth, ActionHasher, AuthorizedModuleSpec,
+    FunctionAuthRule, PolicySpec, ShareClassSpec, StageSpec, ACTION_ACTIVATE_CHARTER,
+    ACTION_ADD_DIRECTOR, ACTION_AUTHORIZE_MODULE, ACTION_DEFINE_ROLE, ACTION_GRANT_ROLE,
+    ACTION_REGISTER_SHARE_CLASS, ACTION_REMOVE_DIRECTOR, ACTION_REVOKE_ROLE,
+    ACTION_SET_ACCOUNTING_LEDGER, ACTION_SET_FUNCTION_AUTH, ACTION_SET_TREASURY,
+    CAP_EQUITY_SETTLEMENT, CAP_IFRS_RECORDER, CAP_MERCHANT_PAYMENT, CHARTER_STATE_ACTIVE,
+    CHARTER_STATE_PENDING_RATIFICATION, CHARTER_STATE_UNINITIALIZED, ERR_CHARTER_ALREADY_ACTIVE,
+    ERR_CHARTER_MISMATCH, ERR_CHARTER_NOT_ACTIVE, ERR_DIRECTOR_CONSENT_REQUIRED,
+    ERR_FUNCTION_AUTH_NOT_SET, ERR_GOVERNANCE_DOWNGRADE, ERR_NOT_EXISTING_SHAREHOLDER,
+    ERR_NO_BIDS_IN_STAGE, ERR_POLICY_INVALID, ERR_RESERVED_GOVERNANCE_ROLE, ERR_ROLE_NOT_DEFINED,
     ERR_SHA_SIGNATURE_REQUIRED, ERR_STALE_CAPITAL_SNAPSHOT, ERR_UNAUTHORIZED_MODULE,
-    MAX_AUTHORIZED_MODULES, MAX_DEFINED_ROLES, MAX_ENCODED_POLICY_BYTES, MAX_MEMBERS_PER_STAGE,
-    MAX_SHARE_CLASSES, POLICY_BANK_ORACLE, POLICY_BOARD_RESOLUTION,
-    POLICY_FIRST_SHAREHOLDER_RESOLUTION, POLICY_PRODUCT_MANAGEMENT,
-    POLICY_SHAREHOLDER_SUPERMAJORITY, POLICY_SHARE_ISSUANCE_AUCTION,
+    HFS_TYPE_IFRS_LEDGER, HFS_TYPE_PRODUCT_LEDGER, HFS_TYPE_SHARE_CAPITAL, MAX_AUTHORIZED_MODULES,
+    MAX_DEFINED_ROLES, MAX_ENCODED_POLICY_BYTES, MAX_MEMBERS_PER_STAGE, MAX_SHARE_CLASSES,
+    POLICY_BANK_ORACLE, POLICY_BOARD_RESOLUTION, POLICY_FIRST_SHAREHOLDER_RESOLUTION,
+    POLICY_PRODUCT_MANAGEMENT, POLICY_SHAREHOLDER_SUPERMAJORITY, POLICY_SHARE_ISSUANCE_AUCTION,
     POLICY_SHARE_TRANSFER_AUCTION, POLICY_SUPER_GOVERNANCE, ROLE_BANK_ORACLE, ROLE_DIRECTOR,
     ROLE_PRODUCT_MANAGER, ROLE_SHAREHOLDER, ROLE_TREASURY_MANAGER,
 };
@@ -66,6 +67,8 @@ const MODULE_AUTHORIZED: [u8; 32] = event_topic("ModuleAuthorized(address,bytes3
 const SHARE_CLASS_REGISTERED: [u8; 32] =
     event_topic("ShareClassRegistered(address,uint64,uint64,uint64)");
 const TREASURY_UPDATED: [u8; 32] = event_topic("TreasuryAccountUpdated(address,address)");
+const ACCOUNTING_LEDGER_SET: [u8; 32] =
+    event_topic("AccountingLedgerPinned(address,address,address)");
 
 const TAG_SET_POLICY: [u8; 32] = keccak256(b"CHARTER_SET_POLICY");
 const TAG_DEACTIVATE_POLICY: [u8; 32] = keccak256(b"CHARTER_DEACTIVATE_POLICY");
@@ -85,6 +88,8 @@ const SEL_REVOKE_ROLE: [u8; 4] = selector("revokeRole(bytes32,address,address)")
 const SEL_REGISTER_SHARE_CLASS: [u8; 4] =
     selector("registerShareClass(address,uint64,uint64,uint64,address)");
 const SEL_SET_TREASURY: [u8; 4] = selector("setTreasuryAccount(address,address)");
+const SEL_SET_ACCOUNTING_LEDGER: [u8; 4] =
+    selector("setAccountingLedger(address,address,address)");
 
 const KEY_INIT: &[u8] = b"chr:init";
 const KEY_STATE: &[u8] = b"chr:state";
@@ -94,6 +99,8 @@ const KEY_DEFINED_ROLES_COUNT: &[u8] = b"chr:role_cnt";
 const KEY_REGISTRY: &[u8] = b"chr:reg";
 const KEY_INITIALIZER: &[u8] = b"chr:init_by";
 const KEY_TREASURY: &[u8] = b"chr:treasury";
+const KEY_ACCOUNTING_LEDGER: &[u8] = b"chr:acc_led";
+const KEY_HFS_REGISTRY: &[u8] = b"chr:hfs_reg";
 const KEY_EQ_SETTLEMENT_MOD: &[u8] = b"chr:eq_mod";
 const KEY_DIRECTORS_BLOB: &[u8] = b"chr:directors";
 const KEY_PENDING_DIRECTORS_BLOB: &[u8] = b"chr:dpend_list";
@@ -147,6 +154,10 @@ hps_entry! {
     "treasuryAccount()"                                                         => handle_treasury_account,
     "setTreasuryAccount(address,address)"                                       => handle_set_treasury_account,
     "hashSetTreasuryAccount(address)"                                           => handle_hash_set_treasury_account,
+    "accountingLedger()"                                                        => handle_accounting_ledger,
+    "hfsRegistry()"                                                             => handle_hfs_registry,
+    "setAccountingLedger(address,address,address)"                              => handle_set_accounting_ledger,
+    "hashSetAccountingLedger(address,address)"                                  => handle_hash_set_accounting_ledger,
     "equitySettlementModule()"                                                  => handle_equity_settlement_module,
     "getShareClassByLedger(address)"                                            => handle_get_share_class_by_ledger,
     "shareClassCount()"                                                         => handle_share_class_count,
@@ -855,7 +866,7 @@ fn seed_default_function_auths(me: &[u8; 20]) {
         super_pol
     };
 
-    let defaults: [([u8; 4], [u8; 32]); 13] = [
+    let defaults: [([u8; 4], [u8; 32]); 14] = [
         (SEL_ACTIVATE_CHARTER, activate_pol),
         (SEL_SET_FUNCTION_AUTH, super_pol),
         (SEL_AUTHORIZE_MODULE, board_pol),
@@ -866,6 +877,7 @@ fn seed_default_function_auths(me: &[u8; 20]) {
         (SEL_REMOVE_DIRECTOR, super_pol),
         (SEL_REGISTER_SHARE_CLASS, super_pol),
         (SEL_SET_TREASURY, super_pol),
+        (SEL_SET_ACCOUNTING_LEDGER, super_pol),
         (SEL_GRANT_ROLE, board_pol),
         (SEL_REVOKE_ROLE, board_pol),
         (
@@ -1424,6 +1436,33 @@ fn is_constitutional_super_selector(sel: &[u8; 4]) -> bool {
         || *sel == SEL_REMOVE_DIRECTOR
         || *sel == SEL_REGISTER_SHARE_CLASS
         || *sel == SEL_SET_TREASURY
+        || *sel == SEL_SET_ACCOUNTING_LEDGER
+}
+
+/// When `KEY_HFS_REGISTRY` is configured on this `CorporateCharter`, enforce that cash-clearing
+/// and IFRS-recorder capabilities can ONLY be granted to canonical whitelisted WASM `code_hash`es!
+fn verify_module_code_hash_if_hfs_registry_set(
+    module_hps: &[u8; 20],
+    capability: &[u8; 32],
+) -> Result<(), i32> {
+    let hfs_reg = storage::get_address(KEY_HFS_REGISTRY).unwrap_or([0u8; 20]);
+    if hfs_reg == [0u8; 20] {
+        return Ok(());
+    }
+    if *capability == CAP_EQUITY_SETTLEMENT {
+        let _ = require_approved_hfs_code_hash(&hfs_reg, &HFS_TYPE_SHARE_CAPITAL, module_hps)?;
+    } else if *capability == CAP_MERCHANT_PAYMENT {
+        let _ = require_approved_hfs_code_hash(&hfs_reg, &HFS_TYPE_PRODUCT_LEDGER, module_hps)?;
+    } else if *capability == CAP_IFRS_RECORDER {
+        let ok_prod =
+            require_approved_hfs_code_hash(&hfs_reg, &HFS_TYPE_PRODUCT_LEDGER, module_hps).is_ok();
+        let ok_sc =
+            require_approved_hfs_code_hash(&hfs_reg, &HFS_TYPE_SHARE_CAPITAL, module_hps).is_ok();
+        if !ok_prod && !ok_sc {
+            return Err(ERR_UNAUTHORIZED_MODULE);
+        }
+    }
+    Ok(())
 }
 
 fn spec_satisfies_shareholder_super(spec: &PolicySpec) -> bool {
@@ -1516,6 +1555,7 @@ fn handle_authorize_module(args: &CalldataReader) -> Result<(), i32> {
     }
     if active {
         verify_subroutine_pinned_to_self(&module_hps)?;
+        verify_module_code_hash_if_hfs_registry_set(&module_hps, &capability)?;
     }
 
     let cfg_key = module_configured_key(&module_hps, &capability);
@@ -2437,6 +2477,99 @@ fn handle_set_treasury_account(args: &CalldataReader) -> Result<(), i32> {
 fn handle_hash_set_treasury_account(args: &CalldataReader) -> Result<(), i32> {
     let new_treasury = args.address(0).ok_or(-3)?;
     ret::write_word(&compute_set_treasury_hash(&new_treasury));
+    Ok(())
+}
+
+fn compute_set_accounting_ledger_hash(
+    accounting_ledger: &[u8; 20],
+    hfs_registry: &[u8; 20],
+) -> [u8; 32] {
+    ActionHasher::<160>::new(&context::self_address(), &ACTION_SET_ACCOUNTING_LEDGER)
+        .push_address(accounting_ledger)
+        .push_address(hfs_registry)
+        .finish()
+}
+
+fn handle_accounting_ledger(_args: &CalldataReader) -> Result<(), i32> {
+    ret::write_address(&storage::get_address(KEY_ACCOUNTING_LEDGER).unwrap_or([0u8; 20]));
+    Ok(())
+}
+
+fn handle_hfs_registry(_args: &CalldataReader) -> Result<(), i32> {
+    ret::write_address(&storage::get_address(KEY_HFS_REGISTRY).unwrap_or([0u8; 20]));
+    Ok(())
+}
+
+fn handle_hash_set_accounting_ledger(args: &CalldataReader) -> Result<(), i32> {
+    let acc = args.address(0).ok_or(-3)?;
+    let hfs_reg = args.address(1).ok_or(-3)?;
+    ret::write_word(&compute_set_accounting_ledger_hash(&acc, &hfs_reg));
+    Ok(())
+}
+
+/// Pin a canonical IFRS `AccountingLedger` (and optional `HfsRegistry` module `code_hash` root of
+/// trust) to this `CorporateCharter`, syncing `treasuryAccount()` to `AccountingLedger.treasuryIdentity()`.
+fn handle_set_accounting_ledger(args: &CalldataReader) -> Result<(), i32> {
+    let (registry, caller) = ensure_initialized_any_state_caller()?;
+    let accounting_ledger = args.address(0).ok_or(-3)?;
+    let hfs_registry = args.address(1).ok_or(-3)?;
+    let super_auth = args.address(2).ok_or(-3)?;
+    if accounting_ledger == [0u8; 20] {
+        return Err(-59);
+    }
+
+    verify_subroutine_pinned_to_self(&accounting_ledger)?;
+    if hfs_registry != [0u8; 20] {
+        let _ =
+            require_approved_hfs_code_hash(&hfs_registry, &HFS_TYPE_IFRS_LEDGER, &accounting_ledger)?;
+    }
+
+    let existing_acc = storage::get_address(KEY_ACCOUNTING_LEDGER).unwrap_or([0u8; 20]);
+    if super_auth == [0u8; 20]
+        && existing_acc == [0u8; 20]
+        && !is_fn_auth_explicit(&[0u8; 20], &SEL_SET_ACCOUNTING_LEDGER)
+    {
+        let init_by = storage::get_address(KEY_INITIALIZER).unwrap_or([0u8; 20]);
+        if caller != init_by {
+            return Err(-61);
+        }
+    } else {
+        if storage::get_u64(KEY_STATE) != CHARTER_STATE_ACTIVE {
+            return Err(ERR_CHARTER_NOT_ACTIVE);
+        }
+        let req_pol = require_charter_function_auth(&SEL_SET_ACCOUNTING_LEDGER)?;
+        let action_hash = compute_set_accounting_ledger_hash(&accounting_ledger, &hfs_registry);
+        let me = context::self_address();
+        verify_and_consume_auth(&registry, &super_auth, &me, &req_pol, &action_hash, &caller)?;
+    }
+
+    // Sync `treasuryAccount()` directly to `accountingLedger.treasuryIdentity()` if exposed!
+    let tr_cd = CallEncoder::<16>::new(const { selector("treasuryIdentity()") });
+    if let Ok(raw_tr) = call::call_raw(&accounting_ledger, tr_cd.as_slice()) {
+        if raw_tr.len() >= 32 {
+            let mut tr = [0u8; 20];
+            tr.copy_from_slice(&raw_tr[12..32]);
+            if tr != [0u8; 20] {
+                require_valid_identity(&registry, &tr)?;
+                storage::set_address(KEY_TREASURY, &tr);
+            }
+        }
+    }
+
+    storage::set_address(KEY_ACCOUNTING_LEDGER, &accounting_ledger);
+    if hfs_registry != [0u8; 20] {
+        storage::set_address(KEY_HFS_REGISTRY, &hfs_registry);
+    }
+    events::emit(
+        &[
+            ACCOUNTING_LEDGER_SET,
+            addr_topic(&accounting_ledger),
+            addr_topic(&hfs_registry),
+            addr_topic(&super_auth),
+        ],
+        &[],
+    );
+    ret::write_bool(true);
     Ok(())
 }
 

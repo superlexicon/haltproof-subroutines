@@ -20,20 +20,23 @@
 use hps_sdk::abi::CalldataReader;
 use hps_sdk::call::{self, CallEncoder};
 use hps_sdk::governance::{
-    compute_esop_exercise_letter_hash, compute_sha_doc_hash, query_charter_function_auth,
-    query_charter_share_class_spec, query_charter_treasury, require_active_charter,
-    require_valid_authorization_hps, require_valid_identity, validate_charter_capital_auth,
-    verify_and_consume_auth, verify_and_consume_issuance_auction_auth, ActionHasher, AuctionBook,
+    compute_esop_exercise_letter_hash, compute_sha_doc_hash, query_charter_accounting_ledger,
+    query_charter_function_auth, query_charter_share_class_spec, query_charter_treasury,
+    require_active_charter, require_valid_authorization_hps, require_valid_identity,
+    validate_charter_capital_auth, verify_and_consume_auth,
+    verify_and_consume_issuance_auction_auth, ActionHasher, AuctionBook,
     ACTION_AUTHORIZE_FUTURES_UNDERWRITING, ACTION_AWARD_ESOP_OPTIONS, ACTION_CREATE_ESOP_PROGRAM,
     ACTION_EXECUTE_REVERSE_SPLIT, ACTION_EXECUTE_SHARE_BUYBACK, ACTION_EXECUTE_SHARE_SPLIT,
-    ACTION_SET_SHARE_ESCROW, ERR_ALREADY_EXECUTED_IN_BLOCK, ERR_CHARTER_MISMATCH,
-    ERR_ESOP_CLIFF_NOT_PASSED, ERR_ESOP_POOL_EXCEEDED, ERR_FUTURES_BACKING_LOCKED,
-    ERR_FUTURES_CAP_EXCEEDED, ERR_INVALID_FUTURES_CONFIG, ERR_NO_BIDS_IN_STAGE,
-    ERR_POLICY_INVALID, ERR_SELLER_CONSENT_REQUIRED, ERR_SHA_SIGNATURE_REQUIRED,
-    ERR_STALE_CAPITAL_SNAPSHOT, MAX_AUCTION_ORDERS, MAX_ENCODED_AUCTION_BOOK_BYTES,
-    ORDER_SIDE_BUY_STEP1, ORDER_SIDE_BUY_STEP3, POLICY_BOARD_RESOLUTION,
-    POLICY_SHAREHOLDER_SUPERMAJORITY, POLICY_SHARE_ISSUANCE_AUCTION, POLICY_SUPER_GOVERNANCE,
+    ACTION_SET_ACCOUNTING_LEDGER, ACTION_SET_SHARE_ESCROW, ERR_ALREADY_EXECUTED_IN_BLOCK,
+    ERR_CHARTER_MISMATCH, ERR_ESOP_CLIFF_NOT_PASSED, ERR_ESOP_POOL_EXCEEDED,
+    ERR_FUTURES_BACKING_LOCKED, ERR_FUTURES_CAP_EXCEEDED, ERR_INVALID_FUTURES_CONFIG,
+    ERR_NO_BIDS_IN_STAGE, ERR_POLICY_INVALID, ERR_SELLER_CONSENT_REQUIRED,
+    ERR_SHA_SIGNATURE_REQUIRED, ERR_STALE_CAPITAL_SNAPSHOT, MAX_AUCTION_ORDERS,
+    MAX_ENCODED_AUCTION_BOOK_BYTES, ORDER_SIDE_BUY_STEP1, ORDER_SIDE_BUY_STEP3,
+    POLICY_BOARD_RESOLUTION, POLICY_SHAREHOLDER_SUPERMAJORITY, POLICY_SHARE_ISSUANCE_AUCTION,
+    POLICY_SUPER_GOVERNANCE,
 };
+use hps_sdk::ifrs;
 use hps_sdk::storage::KeyBuilder;
 use hps_sdk::{context, event_topic, events, hps_entry, ret, selector, storage};
 
@@ -81,6 +84,7 @@ const SEL_CREATE_ESOP_PROGRAM: [u8; 4] =
     selector("createEsopProgram(address,address,uint64,uint64,uint64,uint64,address)");
 const SEL_AWARD_ESOP_OPTIONS: [u8; 4] =
     selector("awardEmployeeOptions(uint64,address,uint64,uint64,bytes,address)");
+const SEL_SET_ACCOUNTING_LEDGER: [u8; 4] = selector("setAccountingLedger(address,address)");
 
 const KEY_INIT: &[u8] = b"shc:init";
 const KEY_REGISTRY: &[u8] = b"shc:reg";
@@ -88,6 +92,7 @@ const KEY_CHARTER: &[u8] = b"shc:chr";
 const KEY_INITIALIZER: &[u8] = b"shc:init_by";
 const KEY_BANK_LEDGER: &[u8] = b"shc:bank_led";
 const KEY_SHARE_ESCROW_ACCT: &[u8] = b"shc:escrow_acct";
+const KEY_ACCOUNTING_LEDGER: &[u8] = b"shc:acc_led";
 const KEY_FUTURES_LEDGER: &[u8] = b"shc:fut_led";
 const KEY_FUTURES_PCT: &[u8] = b"shc:fut_pct";
 const KEY_ESOP_PROG_CNT: &[u8] = b"shc:esop_pcnt";
@@ -102,6 +107,9 @@ const MAX_ESOP_TRANCHES: usize = 24;
 hps_entry! {
     "initialize(address,address,address,address)"                               => handle_initialize,
     "setShareEscrowAccount(address,address,address)"                            => handle_set_share_escrow_account,
+    "setAccountingLedger(address,address)"                                      => handle_set_accounting_ledger,
+    "accountingLedger()"                                                        => handle_accounting_ledger,
+    "hashSetAccountingLedger(address)"                                          => handle_hash_set_accounting_ledger,
     "associatedCharter()"                                                       => handle_associated_charter,
     "associatedConstitution()"                                                  => handle_associated_charter,
     "identityRegistry()"                                                        => handle_identity_registry,
@@ -353,6 +361,58 @@ fn resolve_treasury_recipient(charter: &[u8; 20]) -> Option<[u8; 20]> {
     query_charter_treasury(charter)
         .or_else(|| storage::get_address(KEY_INITIALIZER))
         .or_else(|| storage::get_address(KEY_SHARE_ESCROW_ACCT))
+}
+
+fn resolve_accounting_ledger(charter: &[u8; 20]) -> Option<[u8; 20]> {
+    storage::get_address(KEY_ACCOUNTING_LEDGER)
+        .filter(|a| *a != [0u8; 20])
+        .or_else(|| query_charter_accounting_ledger(charter))
+}
+
+fn compute_set_accounting_ledger_hash(acc: &[u8; 20]) -> [u8; 32] {
+    ActionHasher::<128>::new(&context::self_address(), &ACTION_SET_ACCOUNTING_LEDGER)
+        .push_address(acc)
+        .finish()
+}
+
+fn handle_accounting_ledger(_args: &CalldataReader) -> Result<(), i32> {
+    let charter = storage::get_address(KEY_CHARTER).unwrap_or([0u8; 20]);
+    ret::write_address(&resolve_accounting_ledger(&charter).unwrap_or([0u8; 20]));
+    Ok(())
+}
+
+fn handle_hash_set_accounting_ledger(args: &CalldataReader) -> Result<(), i32> {
+    let acc = args.address(0).ok_or(-3)?;
+    ret::write_word(&compute_set_accounting_ledger_hash(&acc));
+    Ok(())
+}
+
+fn handle_set_accounting_ledger(args: &CalldataReader) -> Result<(), i32> {
+    let (registry, charter, caller) = ensure_active_and_valid_caller()?;
+    let acc = args.address(0).ok_or(-3)?;
+    let auth_obj = args.address(1).ok_or(-3)?;
+    if acc == [0u8; 20] {
+        return Err(-59);
+    }
+    verify_ledger_pinned_to_charter(&acc, &charter)?;
+    let me = context::self_address();
+    let explicit_pol = query_charter_function_auth(&charter, &me, &SEL_SET_ACCOUNTING_LEDGER);
+    if auth_obj == [0u8; 20]
+        && storage::get_address(KEY_ACCOUNTING_LEDGER).is_none()
+        && explicit_pol.is_none()
+    {
+        let init_by = storage::get_address(KEY_INITIALIZER).unwrap_or([0u8; 20]);
+        if caller != init_by {
+            return Err(-61);
+        }
+    } else {
+        let req_pol = explicit_pol.unwrap_or(POLICY_BOARD_RESOLUTION);
+        let ah = compute_set_accounting_ledger_hash(&acc);
+        verify_and_consume_auth(&registry, &auth_obj, &charter, &req_pol, &ah, &caller)?;
+    }
+    storage::set_address(KEY_ACCOUNTING_LEDGER, &acc);
+    ret::write_bool(true);
+    Ok(())
 }
 
 /// Verify that `auth_obj` is an approved `Authorization` HPS in `IdentityRegistry`, bound to
@@ -1532,6 +1592,12 @@ fn execute_determine_issuance_allocation(
                     if !ok {
                         return Err(-16);
                     }
+                    if let Some(acc) = resolve_accounting_ledger(charter) {
+                        let par = if clearing_price >= 1 { 1 } else { 0 };
+                        if par > 0 {
+                            let _ = ifrs::call_book_equity_issuance(&acc, &inv, sh, par, cost)?;
+                        }
+                    }
                 }
             }
             let iss_cd = CallEncoder::<96>::new(const {
@@ -1691,6 +1757,12 @@ fn handle_sign_sha_and_claim_shares(args: &CalldataReader) -> Result<(), i32> {
             let ok = call::call_bool(&bank_ledger, pay_cd.as_slice())?;
             if !ok {
                 return Err(-16);
+            }
+            if let Some(acc) = resolve_accounting_ledger(&charter) {
+                let par = if summary.clearing_price >= 1 { 1 } else { 0 };
+                if par > 0 {
+                    let _ = ifrs::call_book_equity_issuance(&acc, &caller, allot.shares, par, cost)?;
+                }
             }
         }
         if rem_escrow == 0 {
@@ -2245,6 +2317,9 @@ fn handle_execute_share_buyback(args: &CalldataReader) -> Result<(), i32> {
         if !ok {
             return Err(-16);
         }
+        if let Some(acc) = resolve_accounting_ledger(&charter) {
+            let _ = ifrs::call_book_share_buyback(&acc, &seller, shares, total_paid)?;
+        }
     }
 
     let cancel_cd = CallEncoder::<96>::new(const { selector("charterModuleCancel(address,uint64)") })
@@ -2706,7 +2781,7 @@ fn handle_award_employee_options(args: &CalldataReader) -> Result<(), i32> {
 /// guarded against being called more than once per block): issues due option tranches onto each
 /// Master ESOP Program's dedicated `optionLedger`.
 fn handle_process_due_esop_issuances(_args: &CalldataReader) -> Result<(), i32> {
-    let _charter = ensure_charter_active_only()?;
+    let charter = ensure_charter_active_only()?;
     let now = context::block_number();
     if storage::get_u64(KEY_ESOP_LAST_SWEEP_SET) == 1
         && storage::get_u64(KEY_ESOP_LAST_SWEEP_BLK) == now
@@ -2746,6 +2821,10 @@ fn handle_process_due_esop_issuances(_args: &CalldataReader) -> Result<(), i32> 
                                     .push_address(&g.employee)
                                     .push_u64(amt);
                                     let _ = call::call_u64(&prog.option_ledger, iss_cd.as_slice())?;
+                                    if let Some(acc) = resolve_accounting_ledger(&charter) {
+                                        let fv = amt.saturating_mul(prog.exercise_price.max(1));
+                                        let _ = ifrs::call_book_esop_vesting(&acc, &g.employee, amt, fv)?;
+                                    }
                                     sched[off] = 1;
                                     g.issued_options = g.issued_options.saturating_add(amt);
                                     prog.issued_options = prog.issued_options.saturating_add(amt);
@@ -2889,7 +2968,7 @@ fn handle_exercise_employee_options(args: &CalldataReader) -> Result<(), i32> {
         }
     }
 
-    if prog.exercise_price > 0 {
+    let strike_paid = if prog.exercise_price > 0 {
         let strike_total = amount.checked_mul(prog.exercise_price).ok_or(-15)?;
         let bank_ledger = storage::get_address(KEY_BANK_LEDGER).ok_or(-63)?;
         let treasury = resolve_treasury_recipient(&charter).ok_or(-63)?;
@@ -2905,6 +2984,13 @@ fn handle_exercise_employee_options(args: &CalldataReader) -> Result<(), i32> {
                 return Err(-16);
             }
         }
+        strike_total
+    } else {
+        0
+    };
+    if let Some(acc) = resolve_accounting_ledger(&charter) {
+        let reserve_transfer = amount.saturating_mul(prog.exercise_price.max(1));
+        let _ = ifrs::call_book_esop_exercise(&acc, &caller, amount, strike_paid, reserve_transfer, amount)?;
     }
 
     // Burn options on `optionLedger` & mint underlying shares on `underlyingShareLedger`!

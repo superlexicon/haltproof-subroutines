@@ -68,31 +68,56 @@ pub const ACTION_EXECUTE_REVERSE_SPLIT: [u8; 32] = keccak256(b"EXECUTE_REVERSE_S
 pub const ACTION_CREATE_ESOP_PROGRAM: [u8; 32] = keccak256(b"CREATE_ESOP_PROGRAM");
 pub const ACTION_AWARD_ESOP_OPTIONS: [u8; 32] = keccak256(b"AWARD_ESOP_OPTIONS");
 pub const ACTION_SET_TREASURY: [u8; 32] = keccak256(b"CHARTER_SET_TREASURY");
+pub const ACTION_SET_ACCOUNTING_LEDGER: [u8; 32] = keccak256(b"SET_ACCOUNTING_LEDGER");
+pub const ACTION_SET_HFS_REGISTRY: [u8; 32] = keccak256(b"SET_HFS_REGISTRY");
+pub const ACTION_CLOSE_FISCAL_PERIOD: [u8; 32] = keccak256(b"CLOSE_FISCAL_PERIOD");
+pub const ACTION_IFRS_DISBURSE: [u8; 32] = keccak256(b"IFRS_DISBURSE");
+pub const ACTION_REFUND_PRODUCT_RETURN: [u8; 32] = keccak256(b"REFUND_PRODUCT_RETURN");
 
 pub const DOC_TAG_SUBSCRIPTION_AGREEMENT: [u8; 32] = keccak256(b"SHARE_SUBSCRIPTION_AGREEMENT");
 pub const DOC_TAG_SHAREHOLDERS_AGREEMENT: [u8; 32] = keccak256(b"SHAREHOLDERS_AGREEMENT");
 pub const DOC_TAG_ESOP_EXERCISE_LETTER: [u8; 32] = keccak256(b"ESOP_EXERCISE_LETTER");
 
-/// Governed sibling-module capabilities registered in `CorporateCharter` so pinned `AssetLedger`
-/// and `Authorization` instances trust authorized company modules (`ShareCapital`, `ProductLedger`)
-/// without violating single-Charter pinning or segregation of duties.
+/// Governed sibling-module capabilities registered in `CorporateCharter` so pinned `AssetLedger`,
+/// `AccountingLedger`, and `Authorization` instances trust authorized company modules
+/// (`ShareCapital`, `ProductLedger`) without violating single-Charter pinning or segregation of duties.
 pub const CAP_EQUITY_SETTLEMENT: [u8; 32] = keccak256(b"CAP_EQUITY_SETTLEMENT");
 pub const CAP_MERCHANT_PAYMENT: [u8; 32] = keccak256(b"CAP_MERCHANT_PAYMENT");
+pub const CAP_IFRS_RECORDER: [u8; 32] = keccak256(b"CAP_IFRS_RECORDER");
+
+/// Encode a logical `HfsRegistry` `typeName` as a right-padded 32-byte UTF-8 word (matching JS `encodeHfsTypeId`).
+pub const fn hfs_type_id(name: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let n = if name.len() < 32 { name.len() } else { 32 };
+    let mut i = 0;
+    while i < n {
+        out[i] = name[i];
+        i += 1;
+    }
+    out
+}
+
+/// Canonical `HfsRegistry` logical `typeId` constants used to enforce module `code_hash` allowlists.
+pub const HFS_TYPE_IFRS_LEDGER: [u8; 32] = hfs_type_id(b"IFRS_LEDGER");
+pub const HFS_TYPE_PRODUCT_LEDGER: [u8; 32] = hfs_type_id(b"PRODUCT_LEDGER");
+pub const HFS_TYPE_SHARE_CAPITAL: [u8; 32] = hfs_type_id(b"SHARE_CAPITAL");
 
 /// Canonical governance & administrative Role IDs defined in `CorporateCharter`.
 pub const ROLE_SHAREHOLDER: [u8; 32] = keccak256(b"ROLE_SHAREHOLDER");
 pub const ROLE_DIRECTOR: [u8; 32] = keccak256(b"ROLE_DIRECTOR");
 pub const ROLE_PRODUCT_MANAGER: [u8; 32] = keccak256(b"ROLE_PRODUCT_MANAGER");
 pub const ROLE_TREASURY_MANAGER: [u8; 32] = keccak256(b"ROLE_TREASURY_MANAGER");
+pub const ROLE_CHIEF_ACCOUNTANT: [u8; 32] = keccak256(b"ROLE_CHIEF_ACCOUNTANT");
 pub const ROLE_BANK_ORACLE: [u8; 32] = keccak256(b"ROLE_BANK_ORACLE");
 
-/// Canonical policy IDs for `CorporateCharter`, `ShareCapital`, `AssetLedger`, `ProductLedger`, and `IdentityRegistry` governance.
+/// Canonical policy IDs for `CorporateCharter`, `ShareCapital`, `AssetLedger`, `ProductLedger`, `AccountingLedger`, and `IdentityRegistry` governance.
 pub const POLICY_SUPER_GOVERNANCE: [u8; 32] = keccak256(b"SUPER_GOVERNANCE");
 pub const POLICY_SHAREHOLDER_SUPERMAJORITY: [u8; 32] = keccak256(b"SHAREHOLDER_SUPERMAJORITY");
 pub const POLICY_FIRST_SHAREHOLDER_RESOLUTION: [u8; 32] =
     keccak256(b"FIRST_SHAREHOLDER_RESOLUTION");
 pub const POLICY_BOARD_RESOLUTION: [u8; 32] = keccak256(b"BOARD_RESOLUTION");
 pub const POLICY_PRODUCT_MANAGEMENT: [u8; 32] = keccak256(b"PRODUCT_MANAGEMENT");
+pub const POLICY_ACCOUNTING_OPS: [u8; 32] = keccak256(b"ACCOUNTING_OPS");
 pub const POLICY_SHARE_TRANSFER_AUCTION: [u8; 32] = keccak256(b"SHARE_TRANSFER_AUCTION");
 pub const POLICY_SHARE_ISSUANCE_AUCTION: [u8; 32] = keccak256(b"SHARE_ISSUANCE_AUCTION");
 pub const POLICY_FUTURES_UNDERWRITING: [u8; 32] = keccak256(b"FUTURES_UNDERWRITING");
@@ -1370,3 +1395,51 @@ pub fn compute_esop_exercise_letter_hash(
         .push_u64(amount)
         .finish()
 }
+
+/// Verify via `HfsRegistry.allowedAbiVersion(typeId, codeHash) > 0` that `candidate` is deployed
+/// from an approved canonical WASM binary for `type_id`.
+pub fn require_approved_hfs_code_hash(
+    hfs_registry: &[u8; 20],
+    type_id: &[u8; 32],
+    candidate: &[u8; 20],
+) -> Result<u64, i32> {
+    if *hfs_registry == [0u8; 20] || *candidate == [0u8; 20] {
+        return Err(ERR_UNAPPROVED_CODE_HASH);
+    }
+    let Some(ch) = crate::context::code_hash_of(candidate) else {
+        return Err(ERR_UNAPPROVED_CODE_HASH);
+    };
+    if ch == [0u8; 32] {
+        return Err(ERR_UNAPPROVED_CODE_HASH);
+    }
+    let cd = CallEncoder::<96>::new(const { selector("allowedAbiVersion(bytes32,bytes32)") })
+        .push_bytes32(type_id)
+        .push_bytes32(&ch);
+    let ver = call::call_u64(hfs_registry, cd.as_slice()).map_err(|_| ERR_UNAPPROVED_CODE_HASH)?;
+    if ver == 0 {
+        return Err(ERR_UNAPPROVED_CODE_HASH);
+    }
+    Ok(ver)
+}
+
+/// Query `CorporateCharter.accountingLedger()` if configured (`None` if unset or unimplemented).
+pub fn query_charter_accounting_ledger(charter: &[u8; 20]) -> Option<[u8; 20]> {
+    if *charter == [0u8; 20] {
+        return None;
+    }
+    let cd = CallEncoder::<16>::new(const { selector("accountingLedger()") });
+    let Ok(raw) = call::call_raw(charter, cd.as_slice()) else {
+        return None;
+    };
+    if raw.len() < 32 {
+        return None;
+    }
+    let mut addr = [0u8; 20];
+    addr.copy_from_slice(&raw[12..32]);
+    if addr == [0u8; 20] {
+        None
+    } else {
+        Some(addr)
+    }
+}
+

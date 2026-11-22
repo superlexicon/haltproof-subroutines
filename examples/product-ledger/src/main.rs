@@ -21,12 +21,13 @@ use hps_sdk::abi::CalldataReader;
 use hps_sdk::call::{self, CallEncoder};
 use hps_sdk::governance::{
     query_charter_function_auth, require_active_charter, require_valid_identity,
-    verify_and_consume_auth, ActionHasher, ACTION_RESTOCK_PRODUCT, ACTION_SET_OPERATING_ACCOUNT,
-    ACTION_SET_PRODUCT_PRICE, ACTION_UPSERT_PRODUCT, ERR_AUTH_CONSUME_FAILED, ERR_CHARTER_MISMATCH,
-    ERR_INSUFFICIENT_PRODUCT_UNITS, ERR_INVALID_PRODUCT_PARAMS, ERR_MISSING_ROLE,
-    ERR_PRODUCT_NOT_FOUND, POLICY_BOARD_RESOLUTION, POLICY_PRODUCT_MANAGEMENT,
-    ROLE_PRODUCT_MANAGER,
+    verify_and_consume_auth, ActionHasher, ACTION_REFUND_PRODUCT_RETURN, ACTION_RESTOCK_PRODUCT,
+    ACTION_SET_OPERATING_ACCOUNT, ACTION_SET_PRODUCT_PRICE, ACTION_UPSERT_PRODUCT,
+    ERR_AUTH_CONSUME_FAILED, ERR_CHARTER_MISMATCH, ERR_INSUFFICIENT_PRODUCT_UNITS,
+    ERR_INVALID_PRODUCT_PARAMS, ERR_MISSING_ROLE, ERR_PRODUCT_NOT_FOUND, POLICY_BOARD_RESOLUTION,
+    POLICY_PRODUCT_MANAGEMENT, ROLE_PRODUCT_MANAGER,
 };
+use hps_sdk::ifrs;
 use hps_sdk::social::{
     adjust_standing_from_module, require_active_member, require_mutual_rf_proximity,
 };
@@ -52,6 +53,10 @@ const SEL_SET_OPERATING_ACCOUNT: [u8; 4] =
 const SEL_UPSERT_PRODUCT: [u8; 4] =
     selector("upsertProduct(bytes32,uint64,uint64,bytes,address)");
 const SEL_RESTOCK_PRODUCT: [u8; 4] = selector("restockProduct(bytes32,uint64,uint64,address)");
+const SEL_RESTOCK_WITH_COST: [u8; 4] =
+    selector("restockProductWithCost(bytes32,address,uint64,uint64,uint64,bool,address)");
+const SEL_REFUND_RETURN: [u8; 4] =
+    selector("refundSalesReturn(bytes32,address,uint64,uint64,address)");
 const SEL_SET_PRODUCT_PRICE: [u8; 4] = selector("setProductPrice(bytes32,uint64,address)");
 
 const KEY_INIT: &[u8] = b"prd:init";
@@ -127,6 +132,8 @@ hps_entry! {
     "setOperatingAccount(address,address,address)"                              => handle_set_operating_account,
     "upsertProduct(bytes32,uint64,uint64,bytes,address)"                        => handle_upsert_product,
     "restockProduct(bytes32,uint64,uint64,address)"                             => handle_restock_product,
+    "restockProductWithCost(bytes32,address,uint64,uint64,uint64,bool,address)" => handle_restock_product_with_cost,
+    "refundSalesReturn(bytes32,address,uint64,uint64,address)"                  => handle_refund_sales_return,
     "setProductPrice(bytes32,uint64,address)"                                   => handle_set_product_price,
     "buyProduct(bytes32,uint64)"                                                => handle_buy_product,
     "getProduct(bytes32)"                                                       => handle_get_product,
@@ -675,6 +682,117 @@ fn handle_restock_product(args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
+fn handle_restock_product_with_cost(args: &CalldataReader) -> Result<(), i32> {
+    if storage::get_u64(KEY_INIT) != MODE_CORPORATE_CHARTER {
+        return Err(ERR_INVALID_PRODUCT_PARAMS);
+    }
+    let (registry, charter, caller) = ensure_active_and_valid_caller()?;
+    let product_id = args.bytes32(0).ok_or(-3)?;
+    let supplier = args.address(1).ok_or(-3)?;
+    let additional_units = args.u64(2).ok_or(-3)?;
+    let total_cost = args.u64(3).ok_or(-3)?;
+    let new_price = args.u64(4).ok_or(-3)?;
+    let pay_cash = args.bool(5).ok_or(-3)?;
+    let auth_obj = args.address(6).ok_or(-3)?;
+
+    if additional_units == 0 || total_cost == 0 {
+        return Err(ERR_INVALID_PRODUCT_PARAMS);
+    }
+    let mut row = load_product(&product_id).ok_or(ERR_PRODUCT_NOT_FOUND)?;
+    if !row.active {
+        return Err(ERR_PRODUCT_NOT_FOUND);
+    }
+    let action_hash = ActionHasher::<192>::new(&context::self_address(), &ACTION_RESTOCK_PRODUCT)
+        .push_bytes32(&product_id)
+        .push_address(&supplier)
+        .push_u64(additional_units)
+        .push_u64(total_cost)
+        .push_u64(new_price)
+        .finish();
+    require_product_catalog_auth(
+        &registry,
+        &charter,
+        &SEL_RESTOCK_WITH_COST,
+        &action_hash,
+        &auth_obj,
+        &caller,
+    )?;
+
+    let accounting = storage::get_address(KEY_ACCOUNTING).ok_or(-10)?;
+    let _ = ifrs::call_book_inventory_restock(
+        &accounting,
+        &product_id,
+        &supplier,
+        additional_units,
+        total_cost,
+        pay_cash,
+    )?;
+
+    row.units_available = row
+        .units_available
+        .checked_add(additional_units)
+        .ok_or(-15)?;
+    if new_price > 0 {
+        row.latest_price = new_price;
+    }
+    save_product(&product_id, &row);
+
+    let mut ev = [0u8; 24];
+    ev[0..8].copy_from_slice(&additional_units.to_be_bytes());
+    ev[8..16].copy_from_slice(&row.units_available.to_be_bytes());
+    ev[16..24].copy_from_slice(&row.latest_price.to_be_bytes());
+    events::emit(&[PRODUCT_RESTOCKED, product_id, addr_topic(&caller)], &ev);
+
+    ret::write_u64_word(row.units_available);
+    Ok(())
+}
+
+fn handle_refund_sales_return(args: &CalldataReader) -> Result<(), i32> {
+    if storage::get_u64(KEY_INIT) != MODE_CORPORATE_CHARTER {
+        return Err(ERR_INVALID_PRODUCT_PARAMS);
+    }
+    let (registry, charter, caller) = ensure_active_and_valid_caller()?;
+    let product_id = args.bytes32(0).ok_or(-3)?;
+    let buyer = args.address(1).ok_or(-3)?;
+    let quantity = args.u64(2).ok_or(-3)?;
+    let refund_amount = args.u64(3).ok_or(-3)?;
+    let auth_obj = args.address(4).ok_or(-3)?;
+
+    if quantity == 0 || refund_amount == 0 {
+        return Err(ERR_INVALID_PRODUCT_PARAMS);
+    }
+    let mut row = load_product(&product_id).ok_or(ERR_PRODUCT_NOT_FOUND)?;
+    if !row.active {
+        return Err(ERR_PRODUCT_NOT_FOUND);
+    }
+    let action_hash =
+        ActionHasher::<160>::new(&context::self_address(), &ACTION_REFUND_PRODUCT_RETURN)
+            .push_bytes32(&product_id)
+            .push_address(&buyer)
+            .push_u64(quantity)
+            .push_u64(refund_amount)
+            .finish();
+    require_product_catalog_auth(
+        &registry,
+        &charter,
+        &SEL_REFUND_RETURN,
+        &action_hash,
+        &auth_obj,
+        &caller,
+    )?;
+
+    let accounting = storage::get_address(KEY_ACCOUNTING).ok_or(-10)?;
+    let j_id =
+        ifrs::call_book_sales_return(&accounting, &product_id, &buyer, quantity, refund_amount)?;
+
+    row.units_available = row.units_available.checked_add(quantity).ok_or(-15)?;
+    row.total_units_sold = row.total_units_sold.saturating_sub(quantity);
+    save_product(&product_id, &row);
+
+    ret::write_u64_word(j_id);
+    Ok(())
+}
+
 fn handle_set_product_price(args: &CalldataReader) -> Result<(), i32> {
     let mode = storage::get_u64(KEY_INIT);
     let product_id = args.bytes32(0).ok_or(-3)?;
@@ -809,17 +927,16 @@ fn handle_buy_product(args: &CalldataReader) -> Result<(), i32> {
     row.total_units_sold = row.total_units_sold.saturating_add(quantity);
     save_product(&product_id, &row);
 
-    // 3. Record sale entry in the linked AccountingLedger (bookkeeping only)
+    // 3. Record IFRS 15 Revenue + automatic IAS 2 WAC COGS in the linked AccountingLedger
     let accounting = storage::get_address(KEY_ACCOUNTING).ok_or(-10)?;
-    let rec_cd = CallEncoder::<192>::new(const {
-        selector("recordSale(bytes32,address,uint64,uint64,uint64)")
-    })
-    .push_bytes32(&product_id)
-    .push_address(&buyer)
-    .push_u64(quantity)
-    .push_u64(unit_price)
-    .push_u64(total_cost);
-    let sale_idx = call::call_u64(&accounting, rec_cd.as_slice())?;
+    let sale_idx = ifrs::call_book_cash_sale(
+        &accounting,
+        &product_id,
+        &buyer,
+        quantity,
+        unit_price,
+        total_cost,
+    )?;
 
     let mut ev = [0u8; 40];
     ev[0..8].copy_from_slice(&quantity.to_be_bytes());
@@ -1100,7 +1217,7 @@ mod tests {
 
         mock::register_hps(accounting, |raw| {
             let Some((sel, args)) = CalldataReader::parse(raw) else { return -1; };
-            if sel == const { selector("recordSale(bytes32,address,uint64,uint64,uint64)") } {
+            if sel == const { selector("bookCashSale(bytes32,address,uint64,uint64,uint64)") } {
                 let qty = args.u64(2).unwrap();
                 let total = args.u64(4).unwrap();
                 let idx = storage::get_u64(b"macc:cnt");
