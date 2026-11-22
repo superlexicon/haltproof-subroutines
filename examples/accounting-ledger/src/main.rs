@@ -51,9 +51,19 @@ use hps_sdk::{context, event_topic, events, hps_entry, ret, selector, storage};
 const EV_INITIALIZED: [u8; 32] =
     event_topic("IfrsLedgerInitialized(address,address,address,address)");
 const EV_JOURNAL_POSTED: [u8; 32] =
-    event_topic("IfrsJournalPosted(uint64,uint64,uint64,address,uint64)");
+    event_topic("IfrsJournalPosted(uint64,address,bytes32,bytes)");
+const EV_SUBLEDGER_UPDATED: [u8; 32] =
+    event_topic("IfrsSubledgerUpdated(uint64,bytes32,bytes)");
 const EV_PERIOD_CLOSED: [u8; 32] =
     event_topic("IfrsFiscalPeriodClosed(uint64,int64,uint64,address)");
+
+const SUBLEDGER_KIND_INV_SKU: u64 = 1;
+const SUBLEDGER_KIND_FIXED_ASSET: u64 = 2;
+const SUBLEDGER_KIND_LEASE: u64 = 3;
+const SUBLEDGER_KIND_DEFERRED_REV: u64 = 4;
+const SUBLEDGER_KIND_CREDIT_INVOICE: u64 = 5;
+const SUBLEDGER_KIND_TERM_LOAN: u64 = 6;
+const SUBLEDGER_KIND_AUX_COUNTERS: u64 = 7;
 
 const KEY_INIT: &[u8] = b"ifrs:init";
 const KEY_REGISTRY: &[u8] = b"ifrs:reg";
@@ -73,6 +83,12 @@ const KEY_JOURNAL_COUNT: &[u8] = b"ifrs:jcnt";
 const KEY_CFO_NET: &[u8] = b"ifrs:cfo"; // i64 BE
 const KEY_CFI_NET: &[u8] = b"ifrs:cfi"; // i64 BE
 const KEY_CFF_NET: &[u8] = b"ifrs:cff"; // i64 BE
+const KEY_CFO_IN: &[u8] = b"ifrs:cfo_in";
+const KEY_CFO_OUT: &[u8] = b"ifrs:cfo_out";
+const KEY_CFI_IN: &[u8] = b"ifrs:cfi_in";
+const KEY_CFI_OUT: &[u8] = b"ifrs:cfi_out";
+const KEY_CFF_IN: &[u8] = b"ifrs:cff_in";
+const KEY_CFF_OUT: &[u8] = b"ifrs:cff_out";
 
 const KEY_RP_TX_CNT: &[u8] = b"ifrs:rp_cnt";
 const KEY_RP_INFLOW: &[u8] = b"ifrs:rp_in";
@@ -99,9 +115,10 @@ const MAX_INVOICES: u64 = 64;
 const MAX_LOANS: u64 = 24;
 const MAX_JOURNAL_SLICE: u64 = 24;
 
-const JOURNAL_ENTRY_BYTES: usize = 112;
+const JOURNAL_ENTRY_BYTES: usize = 140;
 const SALE_RECORD_LEN: usize = 104;
 const STATEMENTS_FRAME_BYTES: usize = 640;
+const ANCHOR_HEADER_BYTES: usize = 272;
 
 static mut SNAP_BUF: [u8; 24576] = [0u8; 24576];
 
@@ -187,6 +204,7 @@ hps_entry! {
     "hashPayDividend(address,uint64)"                                                   => handle_hash_pay_dividend,
     // Readers & Financial Statement Snapshots
     "getFinancialStatements()"                                                          => handle_get_financial_statements,
+    "getRealtimeAnchorState()"                                                          => handle_get_realtime_anchor_state,
     "getSchedulesSnapshot()"                                                            => handle_get_schedules_snapshot,
     "getJournalSlice(uint64,uint64)"                                                    => handle_get_journal_slice,
     "journalCount()"                                                                    => handle_journal_count,
@@ -279,6 +297,137 @@ fn addr_topic(addr: &[u8; 20]) -> [u8; 32] {
     let mut t = [0u8; 32];
     t[12..32].copy_from_slice(addr);
     t
+}
+
+fn u64_topic(val: u64) -> [u8; 32] {
+    let mut t = [0u8; 32];
+    t[24..32].copy_from_slice(&val.to_be_bytes());
+    t
+}
+
+fn encode_inv_sku_wire(sku: &[u8; 32], st: &InvSkuState) -> [u8; 56] {
+    let mut out = [0u8; 56];
+    out[0..32].copy_from_slice(sku);
+    out[32..40].copy_from_slice(&st.units_on_hand.to_be_bytes());
+    out[40..48].copy_from_slice(&st.carrying_cost.to_be_bytes());
+    out[48..56].copy_from_slice(&st.total_units_sold.to_be_bytes());
+    out
+}
+
+fn encode_asset_wire(id: u64, row: &CapitalAssetRow, now: u64) -> [u8; 64] {
+    let live_cum = if row.disposed {
+        row.posted_depr
+    } else {
+        ifrs::compute_linear_depreciation(
+            row.cost,
+            row.residual,
+            row.useful_life_blocks,
+            row.acquired_block,
+            now,
+        )
+    };
+    let mut out = [0u8; 64];
+    out[0..8].copy_from_slice(&id.to_be_bytes());
+    out[8] = row.asset_class;
+    out[9] = u8::from(row.disposed);
+    out[16..24].copy_from_slice(&row.cost.to_be_bytes());
+    out[24..32].copy_from_slice(&row.residual.to_be_bytes());
+    out[32..40].copy_from_slice(&row.useful_life_blocks.to_be_bytes());
+    out[40..48].copy_from_slice(&row.acquired_block.to_be_bytes());
+    out[48..56].copy_from_slice(&row.posted_depr.to_be_bytes());
+    out[56..64].copy_from_slice(&live_cum.to_be_bytes());
+    out
+}
+
+fn encode_lease_wire(id: u64, ls: &LeaseRow) -> [u8; 96] {
+    let mut out = [0u8; 96];
+    out[0..8].copy_from_slice(&id.to_be_bytes());
+    out[8..28].copy_from_slice(&ls.lessor);
+    out[28] = ls.status;
+    out[32..40].copy_from_slice(&ls.initial_pv.to_be_bytes());
+    out[40..48].copy_from_slice(&ls.rem_liability.to_be_bytes());
+    out[48..56].copy_from_slice(&ls.periodic_payment.to_be_bytes());
+    out[56..64].copy_from_slice(&ls.rate_bps.to_be_bytes());
+    out[64..68].copy_from_slice(&ls.total_periods.to_be_bytes());
+    out[68..72].copy_from_slice(&ls.paid_periods.to_be_bytes());
+    out[72..80].copy_from_slice(&ls.period_blocks.to_be_bytes());
+    out[80..88].copy_from_slice(&ls.start_block.to_be_bytes());
+    out[88..96].copy_from_slice(&ls.posted_amort.to_be_bytes());
+    out
+}
+
+fn encode_def_wire(id: u64, dc: &DeferredContractRow, now: u64) -> [u8; 80] {
+    let live_earned = ifrs::compute_linear_deferred_earned(
+        dc.total_amount,
+        dc.start_block,
+        dc.duration_blocks,
+        now,
+    );
+    let mut out = [0u8; 80];
+    out[0..8].copy_from_slice(&id.to_be_bytes());
+    out[8..28].copy_from_slice(&dc.customer);
+    out[28] = u8::from(dc.is_related);
+    out[32..40].copy_from_slice(&dc.total_amount.to_be_bytes());
+    out[40..48].copy_from_slice(&dc.posted_earned.to_be_bytes());
+    out[48..56].copy_from_slice(&live_earned.to_be_bytes());
+    out[56..64].copy_from_slice(&dc.start_block.to_be_bytes());
+    out[64..72].copy_from_slice(&dc.duration_blocks.to_be_bytes());
+    out[72..80].copy_from_slice(&dc.plan_tag);
+    out
+}
+
+fn encode_invoice_wire(id: u64, inv: &CreditInvoiceRow, now: u64) -> [u8; 72] {
+    let live_ecl = if inv.status == 2 {
+        ifrs::compute_invoice_ecl_amount(inv.open_amount, inv.due_block, now)
+    } else {
+        0
+    };
+    let mut out = [0u8; 72];
+    out[0..8].copy_from_slice(&id.to_be_bytes());
+    out[8..28].copy_from_slice(&inv.buyer);
+    out[28] = inv.status;
+    out[32..40].copy_from_slice(&inv.original_amount.to_be_bytes());
+    out[40..48].copy_from_slice(&inv.open_amount.to_be_bytes());
+    out[48..56].copy_from_slice(&live_ecl.to_be_bytes());
+    out[56..64].copy_from_slice(&inv.issued_block.to_be_bytes());
+    out[64..72].copy_from_slice(&inv.due_block.to_be_bytes());
+    out
+}
+
+fn encode_loan_wire(id: u64, row: &TermLoanRow) -> [u8; 64] {
+    let mut out = [0u8; 64];
+    out[0..8].copy_from_slice(&id.to_be_bytes());
+    out[8..28].copy_from_slice(&row.lender);
+    out[28] = row.status;
+    out[32..40].copy_from_slice(&row.initial_principal.to_be_bytes());
+    out[40..48].copy_from_slice(&row.rem_principal.to_be_bytes());
+    out[48..56].copy_from_slice(&row.rate_bps.to_be_bytes());
+    out[56..64].copy_from_slice(&row.start_block.to_be_bytes());
+    out
+}
+
+fn encode_aux_counters_wire() -> [u8; 56] {
+    let mut out = [0u8; 56];
+    out[0..8].copy_from_slice(&storage::get_u64(KEY_RP_TX_CNT).to_be_bytes());
+    out[8..16].copy_from_slice(&storage::get_u64(KEY_RP_INFLOW).to_be_bytes());
+    out[16..24].copy_from_slice(&storage::get_u64(KEY_RP_OUTFLOW).to_be_bytes());
+    out[24..32].copy_from_slice(&storage::get_u64(KEY_OPEX_RND).to_be_bytes());
+    out[32..40].copy_from_slice(&storage::get_u64(KEY_OPEX_SM).to_be_bytes());
+    out[40..48].copy_from_slice(&storage::get_u64(KEY_OPEX_GA).to_be_bytes());
+    out[48..56].copy_from_slice(&storage::get_u64(KEY_SALE_COUNT).to_be_bytes());
+    out
+}
+
+fn emit_aux_counters() {
+    let wire = encode_aux_counters_wire();
+    events::emit(
+        &[
+            EV_SUBLEDGER_UPDATED,
+            u64_topic(SUBLEDGER_KIND_AUX_COUNTERS),
+            u64_topic(storage::get_u64(KEY_JOURNAL_COUNT)),
+        ],
+        &wire,
+    );
 }
 
 fn get_i64(key: &[u8]) -> i64 {
@@ -452,6 +601,7 @@ fn record_related_party_disclosure(is_inflow: bool, amount: u64) {
             storage::get_u64(KEY_RP_OUTFLOW).saturating_add(amount),
         );
     }
+    emit_aux_counters();
 }
 
 fn journal_key(idx: u64) -> KeyBuilder<24> {
@@ -459,7 +609,8 @@ fn journal_key(idx: u64) -> KeyBuilder<24> {
 }
 
 /// Commit a verified `BalancedBatch` to the 32-account General Ledger, `IAS 7` Cash Flow totals,
-/// and append-only General Journal tape. Returns `entry_id` (`1-based`).
+/// and append-only General Journal tape, emitting a self-contained `IfrsJournalPosted` event log
+/// carrying all double-entry lines and cash-flow deltas for realtime event-sourced statement UIs.
 fn commit_batch(
     totals: &mut [(u64, u64); COA_COUNT],
     batch: &BalancedBatch,
@@ -491,10 +642,32 @@ fn commit_batch(
 
     let delta = batch.cash_delta();
     if delta != 0 {
+        let mag = delta.unsigned_abs();
         match batch.cash_flow_class() {
-            CashFlowClass::Operating => set_i64(KEY_CFO_NET, get_i64(KEY_CFO_NET).saturating_add(delta)),
-            CashFlowClass::Investing => set_i64(KEY_CFI_NET, get_i64(KEY_CFI_NET).saturating_add(delta)),
-            CashFlowClass::Financing => set_i64(KEY_CFF_NET, get_i64(KEY_CFF_NET).saturating_add(delta)),
+            CashFlowClass::Operating => {
+                set_i64(KEY_CFO_NET, get_i64(KEY_CFO_NET).saturating_add(delta));
+                if delta > 0 {
+                    storage::set_u64(KEY_CFO_IN, storage::get_u64(KEY_CFO_IN).saturating_add(mag));
+                } else {
+                    storage::set_u64(KEY_CFO_OUT, storage::get_u64(KEY_CFO_OUT).saturating_add(mag));
+                }
+            }
+            CashFlowClass::Investing => {
+                set_i64(KEY_CFI_NET, get_i64(KEY_CFI_NET).saturating_add(delta));
+                if delta > 0 {
+                    storage::set_u64(KEY_CFI_IN, storage::get_u64(KEY_CFI_IN).saturating_add(mag));
+                } else {
+                    storage::set_u64(KEY_CFI_OUT, storage::get_u64(KEY_CFI_OUT).saturating_add(mag));
+                }
+            }
+            CashFlowClass::Financing => {
+                set_i64(KEY_CFF_NET, get_i64(KEY_CFF_NET).saturating_add(delta));
+                if delta > 0 {
+                    storage::set_u64(KEY_CFF_IN, storage::get_u64(KEY_CFF_IN).saturating_add(mag));
+                } else {
+                    storage::set_u64(KEY_CFF_OUT, storage::get_u64(KEY_CFF_OUT).saturating_add(mag));
+                }
+            }
             CashFlowClass::None => {}
         }
     }
@@ -503,7 +676,7 @@ fn commit_batch(
     let entry_id = j_idx + 1;
     let blk = context::block_number();
     let period = storage::get_u64(KEY_FISCAL_PERIOD).max(1).min(255) as u8;
-    let line_cnt = lines.len().min(6);
+    let line_cnt = lines.len().min(ifrs::MAX_BATCH_LINES);
 
     let mut rec = [0u8; JOURNAL_ENTRY_BYTES];
     rec[0..8].copy_from_slice(&entry_id.to_be_bytes());
@@ -514,24 +687,41 @@ fn commit_batch(
     rec[19] = line_cnt as u8;
     rec[20..40].copy_from_slice(counterparty);
     rec[40..48].copy_from_slice(&batch.total_debit().to_be_bytes());
+    rec[48..56].copy_from_slice(&delta.to_be_bytes());
+    rec[56..60].copy_from_slice(memo_tag);
+    let mut ev_lines = [0u8; ifrs::MAX_BATCH_LINES * 10];
     let mut l = 0;
     while l < line_cnt {
-        let base = 48 + l * 10;
+        let base = 60 + l * 10;
+        let ebase = l * 10;
         rec[base] = lines[l].account;
         rec[base + 1] = lines[l].side as u8;
         rec[base + 2..base + 10].copy_from_slice(&lines[l].amount.to_be_bytes());
+        ev_lines[ebase..ebase + 10].copy_from_slice(&rec[base..base + 10]);
         l += 1;
     }
-    rec[108..112].copy_from_slice(memo_tag);
     storage::set(journal_key(j_idx).as_slice(), &rec);
     storage::set_u64(KEY_JOURNAL_COUNT, entry_id);
 
-    let mut ev = [0u8; 32];
-    ev[0..8].copy_from_slice(&entry_id.to_be_bytes());
-    ev[8..16].copy_from_slice(&(batch.standard_tag() as u64).to_be_bytes());
-    ev[16..24].copy_from_slice(&(batch.cash_flow_class() as u64).to_be_bytes());
-    ev[24..32].copy_from_slice(&batch.total_debit().to_be_bytes());
-    events::emit(&[EV_JOURNAL_POSTED, addr_topic(counterparty)], &ev);
+    let mut meta_topic = [0u8; 32];
+    meta_topic[0] = period;
+    meta_topic[1] = batch.standard_tag();
+    meta_topic[2] = batch.cash_flow_class() as u8;
+    meta_topic[3] = line_cnt as u8;
+    meta_topic[4..8].copy_from_slice(memo_tag);
+    meta_topic[8..16].copy_from_slice(&blk.to_be_bytes());
+    meta_topic[16..24].copy_from_slice(&batch.total_debit().to_be_bytes());
+    meta_topic[24..32].copy_from_slice(&delta.to_be_bytes());
+
+    events::emit(
+        &[
+            EV_JOURNAL_POSTED,
+            u64_topic(entry_id),
+            addr_topic(counterparty),
+            meta_topic,
+        ],
+        &ev_lines[..line_cnt * 10],
+    );
 
     Ok(entry_id)
 }
@@ -580,6 +770,11 @@ fn save_inv_sku(sku: &[u8; 32], st: &InvSkuState) -> Result<(), i32> {
     b[8..16].copy_from_slice(&st.carrying_cost.to_be_bytes());
     b[16..24].copy_from_slice(&st.total_units_sold.to_be_bytes());
     storage::set(k.as_slice(), &b);
+    let wire = encode_inv_sku_wire(sku, st);
+    events::emit(
+        &[EV_SUBLEDGER_UPDATED, u64_topic(SUBLEDGER_KIND_INV_SKU), *sku],
+        &wire,
+    );
     Ok(())
 }
 
@@ -596,6 +791,15 @@ fn save_asset(id: u64, row: &CapitalAssetRow) {
     b[26..34].copy_from_slice(&row.acquired_block.to_be_bytes());
     b[34..42].copy_from_slice(&row.posted_depr.to_be_bytes());
     storage::set(asset_key(id).as_slice(), &b);
+    let wire = encode_asset_wire(id, row, context::block_number());
+    events::emit(
+        &[
+            EV_SUBLEDGER_UPDATED,
+            u64_topic(SUBLEDGER_KIND_FIXED_ASSET),
+            u64_topic(id),
+        ],
+        &wire,
+    );
 }
 fn load_asset(id: u64) -> Option<CapitalAssetRow> {
     let mut b = [0u8; 42];
@@ -635,6 +839,15 @@ fn save_lease(id: u64, row: &LeaseRow) {
     b[69..77].copy_from_slice(&row.start_block.to_be_bytes());
     b[77..85].copy_from_slice(&row.posted_amort.to_be_bytes());
     storage::set(lease_key(id).as_slice(), &b);
+    let wire = encode_lease_wire(id, row);
+    events::emit(
+        &[
+            EV_SUBLEDGER_UPDATED,
+            u64_topic(SUBLEDGER_KIND_LEASE),
+            u64_topic(id),
+        ],
+        &wire,
+    );
 }
 fn load_lease(id: u64) -> Option<LeaseRow> {
     let mut b = [0u8; 85];
@@ -680,6 +893,15 @@ fn save_def(id: u64, row: &DeferredContractRow) {
     b[45..53].copy_from_slice(&row.start_block.to_be_bytes());
     b[53..61].copy_from_slice(&row.duration_blocks.to_be_bytes());
     storage::set(def_key(id).as_slice(), &b);
+    let wire = encode_def_wire(id, row, context::block_number());
+    events::emit(
+        &[
+            EV_SUBLEDGER_UPDATED,
+            u64_topic(SUBLEDGER_KIND_DEFERRED_REV),
+            u64_topic(id),
+        ],
+        &wire,
+    );
 }
 fn load_def(id: u64) -> Option<DeferredContractRow> {
     let mut b = [0u8; 61];
@@ -720,6 +942,15 @@ fn save_invoice(id: u64, row: &CreditInvoiceRow) {
     b[77..85].copy_from_slice(&row.issued_block.to_be_bytes());
     b[85..93].copy_from_slice(&row.due_block.to_be_bytes());
     storage::set(invoice_key(id).as_slice(), &b);
+    let wire = encode_invoice_wire(id, row, context::block_number());
+    events::emit(
+        &[
+            EV_SUBLEDGER_UPDATED,
+            u64_topic(SUBLEDGER_KIND_CREDIT_INVOICE),
+            u64_topic(id),
+        ],
+        &wire,
+    );
 }
 fn load_invoice(id: u64) -> Option<CreditInvoiceRow> {
     let mut b = [0u8; 93];
@@ -759,6 +990,15 @@ fn save_loan(id: u64, row: &TermLoanRow) {
     b[37..45].copy_from_slice(&row.rate_bps.to_be_bytes());
     b[45..53].copy_from_slice(&row.start_block.to_be_bytes());
     storage::set(loan_key(id).as_slice(), &b);
+    let wire = encode_loan_wire(id, row);
+    events::emit(
+        &[
+            EV_SUBLEDGER_UPDATED,
+            u64_topic(SUBLEDGER_KIND_TERM_LOAN),
+            u64_topic(id),
+        ],
+        &wire,
+    );
 }
 fn load_loan(id: u64) -> Option<TermLoanRow> {
     let mut b = [0u8; 53];
@@ -849,6 +1089,7 @@ fn append_sku_sale_subledger(
         bu.saturating_add(quantity),
         bs.saturating_add(total_amount),
     );
+    emit_aux_counters();
     sale_idx
 }
 
@@ -1601,6 +1842,7 @@ fn handle_pay_operating_expense(args: &CalldataReader) -> Result<(), i32> {
         OPEX_GENERAL_ADMIN => storage::set_u64(KEY_OPEX_GA, storage::get_u64(KEY_OPEX_GA).saturating_add(amount)),
         _ => {}
     }
+    emit_aux_counters();
     let j_id = commit_batch(&mut totals, &batch, &vendor, b"OPEX")?;
     ret::write_u64_word(j_id);
     Ok(())
@@ -2371,6 +2613,7 @@ fn handle_close_fiscal_period(args: &CalldataReader) -> Result<(), i32> {
     storage::set_u64(KEY_OPEX_RND, 0);
     storage::set_u64(KEY_OPEX_SM, 0);
     storage::set_u64(KEY_OPEX_GA, 0);
+    emit_aux_counters();
 
     let mut ev = [0u8; 24];
     ev[0..8].copy_from_slice(&cur_period.to_be_bytes());
@@ -2507,6 +2750,180 @@ fn handle_get_financial_statements(_args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
+fn pack_schedules_into_buf(out: &mut [u8], mut pos: usize, now: u64) -> (usize, [u32; 6]) {
+    let inv_cnt = storage::get_u64(KEY_INV_SKU_COUNT).min(MAX_INV_SKUS);
+    let mut written_inv = 0u32;
+    let mut i = 0u64;
+    while i < inv_cnt && pos + 56 <= out.len() {
+        let mut sku = [0u8; 32];
+        if storage::get_into(inv_idx_key(i).as_slice(), &mut sku) == Some(32) {
+            if let Some(st) = load_inv_sku(&sku) {
+                let w = encode_inv_sku_wire(&sku, &st);
+                out[pos..pos + 56].copy_from_slice(&w);
+                pos += 56;
+                written_inv += 1;
+            }
+        }
+        i += 1;
+    }
+
+    let ast_cnt = storage::get_u64(KEY_ASSET_COUNT).min(MAX_FIXED_ASSETS);
+    let mut written_ast = 0u32;
+    let mut a = 0u64;
+    while a < ast_cnt && pos + 64 <= out.len() {
+        if let Some(row) = load_asset(a) {
+            let w = encode_asset_wire(a, &row, now);
+            out[pos..pos + 64].copy_from_slice(&w);
+            pos += 64;
+            written_ast += 1;
+        }
+        a += 1;
+    }
+
+    let lse_cnt = storage::get_u64(KEY_LEASE_COUNT).min(MAX_LEASES);
+    let mut written_lse = 0u32;
+    let mut l = 0u64;
+    while l < lse_cnt && pos + 96 <= out.len() {
+        if let Some(ls) = load_lease(l) {
+            let w = encode_lease_wire(l, &ls);
+            out[pos..pos + 96].copy_from_slice(&w);
+            pos += 96;
+            written_lse += 1;
+        }
+        l += 1;
+    }
+
+    let def_cnt = storage::get_u64(KEY_DEF_COUNT).min(MAX_DEFERRED_CONTRACTS);
+    let mut written_def = 0u32;
+    let mut d = 0u64;
+    while d < def_cnt && pos + 80 <= out.len() {
+        if let Some(dc) = load_def(d) {
+            let w = encode_def_wire(d, &dc, now);
+            out[pos..pos + 80].copy_from_slice(&w);
+            pos += 80;
+            written_def += 1;
+        }
+        d += 1;
+    }
+
+    let inv_ar_cnt = storage::get_u64(KEY_INVOICE_COUNT).min(MAX_INVOICES);
+    let mut written_ar = 0u32;
+    let mut ar = 0u64;
+    while ar < inv_ar_cnt && pos + 72 <= out.len() {
+        if let Some(inv) = load_invoice(ar) {
+            let w = encode_invoice_wire(ar, &inv, now);
+            out[pos..pos + 72].copy_from_slice(&w);
+            pos += 72;
+            written_ar += 1;
+        }
+        ar += 1;
+    }
+
+    let ln_cnt = storage::get_u64(KEY_LOAN_COUNT).min(MAX_LOANS);
+    let mut written_ln = 0u32;
+    let mut ln = 0u64;
+    while ln < ln_cnt && pos + 64 <= out.len() {
+        if let Some(row) = load_loan(ln) {
+            let w = encode_loan_wire(ln, &row);
+            out[pos..pos + 64].copy_from_slice(&w);
+            pos += 64;
+            written_ln += 1;
+        }
+        ln += 1;
+    }
+
+    (
+        pos,
+        [
+            written_inv,
+            written_ast,
+            written_lse,
+            written_def,
+            written_ar,
+            written_ln,
+        ],
+    )
+}
+
+/// Atomic Realtime Event-Sourcing Anchor Snapshot (`getRealtimeAnchorState()`):
+/// Returns the exact raw 32-account General Ledger (`512B` `(dr_u64, cr_u64)`), gross & net `IAS 7`
+/// cash flow accumulators, `IAS 24` & `OpEx` counters, `actualBank`, governance flags, and all 6
+/// sub-ledger schedules in a single frame so front-end UIs can hydrate once at `anchorBlock` and
+/// stream 100% of subsequent updates from `IfrsJournalPosted` + `IfrsSubledgerUpdated` + `IfrsFiscalPeriodClosed`
+/// event logs and block headers with zero RPC polling!
+fn handle_get_realtime_anchor_state(_args: &CalldataReader) -> Result<(), i32> {
+    if storage::get_u64(KEY_INIT) != 1 {
+        return Err(-10);
+    }
+    let now = context::block_number();
+    let totals = load_coa_totals();
+    let proj = compute_live_accrual_projection(&totals, now);
+    let st = ifrs::compile_statements(&totals, &proj);
+    let period = storage::get_u64(KEY_FISCAL_PERIOD).max(1);
+    let p_start = storage::get_u64(KEY_PERIOD_START_BLK);
+    let p_closed = storage::get_u64(KEY_LAST_CLOSED_BLK);
+    let j_cnt = storage::get_u64(KEY_JOURNAL_COUNT);
+    let actual_bank = query_bank_balance_of_treasury().unwrap_or(0);
+
+    let mut flags = 0u64;
+    if st.equation_balanced {
+        flags |= 1;
+    }
+    if st.custody_clean {
+        flags |= 2;
+    }
+    if storage::get_u64(KEY_VIRGIN_CUSTODY) == 1 {
+        flags |= 4;
+    }
+    if storage::get_address(KEY_HFS_REGISTRY).unwrap_or([0u8; 20]) != [0u8; 20] {
+        flags |= 8;
+    }
+
+    unsafe {
+        let out = &mut *core::ptr::addr_of_mut!(SNAP_BUF);
+        out[0..ANCHOR_HEADER_BYTES].fill(0);
+        out[0..8].copy_from_slice(&period.to_be_bytes());
+        out[8..16].copy_from_slice(&p_start.to_be_bytes());
+        out[16..24].copy_from_slice(&p_closed.to_be_bytes());
+        out[24..32].copy_from_slice(&now.to_be_bytes());
+        out[32..40].copy_from_slice(&j_cnt.to_be_bytes());
+        out[40..48].copy_from_slice(&actual_bank.to_be_bytes());
+        out[48..56].copy_from_slice(&flags.to_be_bytes());
+        out[56..64].copy_from_slice(&get_i64(KEY_CFO_NET).to_be_bytes());
+        out[64..72].copy_from_slice(&get_i64(KEY_CFI_NET).to_be_bytes());
+        out[72..80].copy_from_slice(&get_i64(KEY_CFF_NET).to_be_bytes());
+        out[80..88].copy_from_slice(&storage::get_u64(KEY_CFO_IN).to_be_bytes());
+        out[88..96].copy_from_slice(&storage::get_u64(KEY_CFO_OUT).to_be_bytes());
+        out[96..104].copy_from_slice(&storage::get_u64(KEY_CFI_IN).to_be_bytes());
+        out[104..112].copy_from_slice(&storage::get_u64(KEY_CFI_OUT).to_be_bytes());
+        out[112..120].copy_from_slice(&storage::get_u64(KEY_CFF_IN).to_be_bytes());
+        out[120..128].copy_from_slice(&storage::get_u64(KEY_CFF_OUT).to_be_bytes());
+        let aux = encode_aux_counters_wire();
+        out[128..184].copy_from_slice(&aux);
+        out[184..204].copy_from_slice(&storage::get_address(KEY_CHARTER).unwrap_or([0u8; 20]));
+        out[204..224].copy_from_slice(&storage::get_address(KEY_BANK_LEDGER).unwrap_or([0u8; 20]));
+        out[224..244].copy_from_slice(&storage::get_address(KEY_TREASURY_ID).unwrap_or([0u8; 20]));
+
+        let mut c = 0usize;
+        while c < COA_COUNT {
+            let base = ANCHOR_HEADER_BYTES + c * 16;
+            out[base..base + 8].copy_from_slice(&totals[c].0.to_be_bytes());
+            out[base + 8..base + 16].copy_from_slice(&totals[c].1.to_be_bytes());
+            c += 1;
+        }
+
+        let sched_start = ANCHOR_HEADER_BYTES + COA_COUNT * 16; // 272 + 512 = 784
+        let (end_pos, counts) = pack_schedules_into_buf(out, sched_start, now);
+        let mut s = 0usize;
+        while s < 6 {
+            out[244 + s * 4..248 + s * 4].copy_from_slice(&counts[s].to_be_bytes());
+            s += 1;
+        }
+        ret::write(&out[..end_pos]);
+    }
+    Ok(())
+}
+
 fn handle_get_schedules_snapshot(_args: &CalldataReader) -> Result<(), i32> {
     if storage::get_u64(KEY_INIT) != 1 {
         return Err(-10);
@@ -2514,158 +2931,12 @@ fn handle_get_schedules_snapshot(_args: &CalldataReader) -> Result<(), i32> {
     let now = context::block_number();
     unsafe {
         let out = &mut *core::ptr::addr_of_mut!(SNAP_BUF);
-        let mut pos = 24usize;
-
-        let inv_cnt = storage::get_u64(KEY_INV_SKU_COUNT).min(MAX_INV_SKUS);
-        let mut written_inv = 0u32;
-        let mut i = 0u64;
-        while i < inv_cnt && pos + 56 <= out.len() {
-            let mut sku = [0u8; 32];
-            if storage::get_into(inv_idx_key(i).as_slice(), &mut sku) == Some(32) {
-                if let Some(st) = load_inv_sku(&sku) {
-                    out[pos..pos + 32].copy_from_slice(&sku);
-                    out[pos + 32..pos + 40].copy_from_slice(&st.units_on_hand.to_be_bytes());
-                    out[pos + 40..pos + 48].copy_from_slice(&st.carrying_cost.to_be_bytes());
-                    out[pos + 48..pos + 56].copy_from_slice(&st.total_units_sold.to_be_bytes());
-                    pos += 56;
-                    written_inv += 1;
-                }
-            }
-            i += 1;
+        let (pos, counts) = pack_schedules_into_buf(out, 24, now);
+        let mut s = 0usize;
+        while s < 6 {
+            out[s * 4..(s + 1) * 4].copy_from_slice(&counts[s].to_be_bytes());
+            s += 1;
         }
-
-        let ast_cnt = storage::get_u64(KEY_ASSET_COUNT).min(MAX_FIXED_ASSETS);
-        let mut written_ast = 0u32;
-        let mut a = 0u64;
-        while a < ast_cnt && pos + 64 <= out.len() {
-            if let Some(row) = load_asset(a) {
-                let live_cum = if row.disposed {
-                    row.posted_depr
-                } else {
-                    ifrs::compute_linear_depreciation(
-                        row.cost,
-                        row.residual,
-                        row.useful_life_blocks,
-                        row.acquired_block,
-                        now,
-                    )
-                };
-                out[pos..pos + 8].copy_from_slice(&a.to_be_bytes());
-                out[pos + 8] = row.asset_class;
-                out[pos + 9] = u8::from(row.disposed);
-                out[pos + 10..pos + 16].fill(0);
-                out[pos + 16..pos + 24].copy_from_slice(&row.cost.to_be_bytes());
-                out[pos + 24..pos + 32].copy_from_slice(&row.residual.to_be_bytes());
-                out[pos + 32..pos + 40].copy_from_slice(&row.useful_life_blocks.to_be_bytes());
-                out[pos + 40..pos + 48].copy_from_slice(&row.acquired_block.to_be_bytes());
-                out[pos + 48..pos + 56].copy_from_slice(&row.posted_depr.to_be_bytes());
-                out[pos + 56..pos + 64].copy_from_slice(&live_cum.to_be_bytes());
-                pos += 64;
-                written_ast += 1;
-            }
-            a += 1;
-        }
-
-        let lse_cnt = storage::get_u64(KEY_LEASE_COUNT).min(MAX_LEASES);
-        let mut written_lse = 0u32;
-        let mut l = 0u64;
-        while l < lse_cnt && pos + 88 <= out.len() {
-            if let Some(ls) = load_lease(l) {
-                out[pos..pos + 8].copy_from_slice(&l.to_be_bytes());
-                out[pos + 8..pos + 28].copy_from_slice(&ls.lessor);
-                out[pos + 28] = ls.status;
-                out[pos + 29..pos + 32].fill(0);
-                out[pos + 32..pos + 40].copy_from_slice(&ls.initial_pv.to_be_bytes());
-                out[pos + 40..pos + 48].copy_from_slice(&ls.rem_liability.to_be_bytes());
-                out[pos + 48..pos + 56].copy_from_slice(&ls.periodic_payment.to_be_bytes());
-                out[pos + 56..pos + 64].copy_from_slice(&ls.rate_bps.to_be_bytes());
-                out[pos + 64..pos + 68].copy_from_slice(&ls.total_periods.to_be_bytes());
-                out[pos + 68..pos + 72].copy_from_slice(&ls.paid_periods.to_be_bytes());
-                out[pos + 72..pos + 80].copy_from_slice(&ls.period_blocks.to_be_bytes());
-                out[pos + 80..pos + 88].copy_from_slice(&ls.start_block.to_be_bytes());
-                pos += 88;
-                written_lse += 1;
-            }
-            l += 1;
-        }
-
-        let def_cnt = storage::get_u64(KEY_DEF_COUNT).min(MAX_DEFERRED_CONTRACTS);
-        let mut written_def = 0u32;
-        let mut d = 0u64;
-        while d < def_cnt && pos + 80 <= out.len() {
-            if let Some(dc) = load_def(d) {
-                let live_earned = ifrs::compute_linear_deferred_earned(
-                    dc.total_amount,
-                    dc.start_block,
-                    dc.duration_blocks,
-                    now,
-                );
-                out[pos..pos + 8].copy_from_slice(&d.to_be_bytes());
-                out[pos + 8..pos + 28].copy_from_slice(&dc.customer);
-                out[pos + 28] = u8::from(dc.is_related);
-                out[pos + 29..pos + 32].fill(0);
-                out[pos + 32..pos + 40].copy_from_slice(&dc.total_amount.to_be_bytes());
-                out[pos + 40..pos + 48].copy_from_slice(&dc.posted_earned.to_be_bytes());
-                out[pos + 48..pos + 56].copy_from_slice(&live_earned.to_be_bytes());
-                out[pos + 56..pos + 64].copy_from_slice(&dc.start_block.to_be_bytes());
-                out[pos + 64..pos + 72].copy_from_slice(&dc.duration_blocks.to_be_bytes());
-                out[pos + 72..pos + 80].copy_from_slice(&dc.plan_tag);
-                pos += 80;
-                written_def += 1;
-            }
-            d += 1;
-        }
-
-        let inv_ar_cnt = storage::get_u64(KEY_INVOICE_COUNT).min(MAX_INVOICES);
-        let mut written_ar = 0u32;
-        let mut ar = 0u64;
-        while ar < inv_ar_cnt && pos + 72 <= out.len() {
-            if let Some(inv) = load_invoice(ar) {
-                let live_ecl = if inv.status == 2 {
-                    ifrs::compute_invoice_ecl_amount(inv.open_amount, inv.due_block, now)
-                } else {
-                    0
-                };
-                out[pos..pos + 8].copy_from_slice(&ar.to_be_bytes());
-                out[pos + 8..pos + 28].copy_from_slice(&inv.buyer);
-                out[pos + 28] = inv.status;
-                out[pos + 29..pos + 32].fill(0);
-                out[pos + 32..pos + 40].copy_from_slice(&inv.original_amount.to_be_bytes());
-                out[pos + 40..pos + 48].copy_from_slice(&inv.open_amount.to_be_bytes());
-                out[pos + 48..pos + 56].copy_from_slice(&live_ecl.to_be_bytes());
-                out[pos + 56..pos + 64].copy_from_slice(&inv.issued_block.to_be_bytes());
-                out[pos + 64..pos + 72].copy_from_slice(&inv.due_block.to_be_bytes());
-                pos += 72;
-                written_ar += 1;
-            }
-            ar += 1;
-        }
-
-        let ln_cnt = storage::get_u64(KEY_LOAN_COUNT).min(MAX_LOANS);
-        let mut written_ln = 0u32;
-        let mut ln = 0u64;
-        while ln < ln_cnt && pos + 64 <= out.len() {
-            if let Some(row) = load_loan(ln) {
-                out[pos..pos + 8].copy_from_slice(&ln.to_be_bytes());
-                out[pos + 8..pos + 28].copy_from_slice(&row.lender);
-                out[pos + 28] = row.status;
-                out[pos + 29..pos + 32].fill(0);
-                out[pos + 32..pos + 40].copy_from_slice(&row.initial_principal.to_be_bytes());
-                out[pos + 40..pos + 48].copy_from_slice(&row.rem_principal.to_be_bytes());
-                out[pos + 48..pos + 56].copy_from_slice(&row.rate_bps.to_be_bytes());
-                out[pos + 56..pos + 64].copy_from_slice(&row.start_block.to_be_bytes());
-                pos += 64;
-                written_ln += 1;
-            }
-            ln += 1;
-        }
-
-        out[0..4].copy_from_slice(&written_inv.to_be_bytes());
-        out[4..8].copy_from_slice(&written_ast.to_be_bytes());
-        out[8..12].copy_from_slice(&written_lse.to_be_bytes());
-        out[12..16].copy_from_slice(&written_def.to_be_bytes());
-        out[16..20].copy_from_slice(&written_ar.to_be_bytes());
-        out[20..24].copy_from_slice(&written_ln.to_be_bytes());
         ret::write(&out[..pos]);
     }
     Ok(())
@@ -3121,6 +3392,296 @@ mod tests {
         let (rc_sale, _) = call_at(ACC, PROD_MOD, 115, sale_cd.as_slice());
         assert_eq!(rc_sale, 0);
 
+        // Take an event-sourcing anchor snapshot right here (`block = 115`), then verify that EVERY
+        // subsequent transaction and block tick can reconstruct 100% of `getFinancialStatements()`
+        // purely from `mock::events()[ev_cursor..]` without reading storage!
+        let anchor_cd = CallEncoder::<16>::new(const { selector("getRealtimeAnchorState()") });
+        let (rc_anc, anc_raw) = call_at(ACC, CUSTOMER, 115, anchor_cd.as_slice());
+        assert_eq!(rc_anc, 0);
+        assert!(anc_raw.len() >= ANCHOR_HEADER_BYTES + COA_COUNT * 16);
+        let mut ev_cursor = mock::events().len();
+
+        struct ClientStreamState {
+            period: u64,
+            journal_cnt: u64,
+            cfo_net: i64,
+            cfi_net: i64,
+            cff_net: i64,
+            aux: [u64; 7],
+            totals: [(u64, u64); COA_COUNT],
+            assets: BTreeMap<u64, CapitalAssetRow>,
+            leases: BTreeMap<u64, LeaseRow>,
+            defs: BTreeMap<u64, DeferredContractRow>,
+            invoices: BTreeMap<u64, CreditInvoiceRow>,
+        }
+
+        let u32_be = |b: &[u8], o: usize| -> u32 {
+            u32::from_be_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+        };
+        let mut client = {
+            let mut totals = [(0u64, 0u64); COA_COUNT];
+            for c in 0..COA_COUNT {
+                let base = ANCHOR_HEADER_BYTES + c * 16;
+                totals[c] = (read_stmt_u64(&anc_raw, base), read_stmt_u64(&anc_raw, base + 8));
+            }
+            let mut aux = [0u64; 7];
+            for k in 0..7 {
+                aux[k] = read_stmt_u64(&anc_raw, 128 + k * 8);
+            }
+            let c_inv = u32_be(&anc_raw, 244) as usize;
+            let c_ast = u32_be(&anc_raw, 248) as usize;
+            let c_lse = u32_be(&anc_raw, 252) as usize;
+            let c_def = u32_be(&anc_raw, 256) as usize;
+            let c_ar = u32_be(&anc_raw, 260) as usize;
+            let mut pos = ANCHOR_HEADER_BYTES + COA_COUNT * 16 + c_inv * 56;
+            let mut assets = BTreeMap::new();
+            for _ in 0..c_ast {
+                let id = read_stmt_u64(&anc_raw, pos);
+                assets.insert(
+                    id,
+                    CapitalAssetRow {
+                        asset_class: anc_raw[pos + 8],
+                        disposed: anc_raw[pos + 9] != 0,
+                        cost: read_stmt_u64(&anc_raw, pos + 16),
+                        residual: read_stmt_u64(&anc_raw, pos + 24),
+                        useful_life_blocks: read_stmt_u64(&anc_raw, pos + 32),
+                        acquired_block: read_stmt_u64(&anc_raw, pos + 40),
+                        posted_depr: read_stmt_u64(&anc_raw, pos + 48),
+                    },
+                );
+                pos += 64;
+            }
+            let mut leases = BTreeMap::new();
+            for _ in 0..c_lse {
+                let id = read_stmt_u64(&anc_raw, pos);
+                let mut lessor = [0u8; 20];
+                lessor.copy_from_slice(&anc_raw[pos + 8..pos + 28]);
+                leases.insert(
+                    id,
+                    LeaseRow {
+                        lessor,
+                        status: anc_raw[pos + 28],
+                        initial_pv: read_stmt_u64(&anc_raw, pos + 32),
+                        rem_liability: read_stmt_u64(&anc_raw, pos + 40),
+                        periodic_payment: read_stmt_u64(&anc_raw, pos + 48),
+                        rate_bps: read_stmt_u64(&anc_raw, pos + 56),
+                        total_periods: u32_be(&anc_raw, pos + 64),
+                        paid_periods: u32_be(&anc_raw, pos + 68),
+                        period_blocks: read_stmt_u64(&anc_raw, pos + 72),
+                        start_block: read_stmt_u64(&anc_raw, pos + 80),
+                        posted_amort: read_stmt_u64(&anc_raw, pos + 88),
+                    },
+                );
+                pos += 96;
+            }
+            pos += c_def * 80 + c_ar * 72;
+            let _ = pos;
+            ClientStreamState {
+                period: read_stmt_u64(&anc_raw, 0),
+                journal_cnt: read_stmt_u64(&anc_raw, 32),
+                cfo_net: read_stmt_i64(&anc_raw, 56),
+                cfi_net: read_stmt_i64(&anc_raw, 64),
+                cff_net: read_stmt_i64(&anc_raw, 72),
+                aux,
+                totals,
+                assets,
+                leases,
+                defs: BTreeMap::new(),
+                invoices: BTreeMap::new(),
+            }
+        };
+
+        let ingest_events_and_assert_parity = |st: &mut ClientStreamState, cursor: &mut usize, blk: u64| {
+            let all_evs = mock::events();
+            for ev in &all_evs[*cursor..] {
+                if ev.address != ACC || ev.topics.is_empty() {
+                    continue;
+                }
+                let t0 = ev.topics[0];
+                if t0 == EV_JOURNAL_POSTED {
+                    let entry_id = read_stmt_u64(&ev.topics[1], 24);
+                    assert_eq!(entry_id, st.journal_cnt + 1);
+                    st.journal_cnt = entry_id;
+                    let meta = ev.topics[3];
+                    let cf_cls = meta[2];
+                    let line_cnt = meta[3] as usize;
+                    let cash_delta = read_stmt_i64(&meta, 24);
+                    match cf_cls {
+                        1 => st.cfo_net += cash_delta,
+                        2 => st.cfi_net += cash_delta,
+                        3 => st.cff_net += cash_delta,
+                        _ => {}
+                    }
+                    for l in 0..line_cnt {
+                        let b = l * 10;
+                        let acc = ev.data[b] as usize;
+                        let side = ev.data[b + 1];
+                        let amt = read_stmt_u64(&ev.data, b + 2);
+                        if side == 0 {
+                            st.totals[acc].0 += amt;
+                        } else {
+                            st.totals[acc].1 += amt;
+                        }
+                    }
+                } else if t0 == EV_SUBLEDGER_UPDATED {
+                    let kind = read_stmt_u64(&ev.topics[1], 24);
+                    let d = &ev.data;
+                    match kind {
+                        SUBLEDGER_KIND_FIXED_ASSET => {
+                            let id = read_stmt_u64(d, 0);
+                            st.assets.insert(
+                                id,
+                                CapitalAssetRow {
+                                    asset_class: d[8],
+                                    disposed: d[9] != 0,
+                                    cost: read_stmt_u64(d, 16),
+                                    residual: read_stmt_u64(d, 24),
+                                    useful_life_blocks: read_stmt_u64(d, 32),
+                                    acquired_block: read_stmt_u64(d, 40),
+                                    posted_depr: read_stmt_u64(d, 48),
+                                },
+                            );
+                        }
+                        SUBLEDGER_KIND_LEASE => {
+                            let id = read_stmt_u64(d, 0);
+                            let mut lessor = [0u8; 20];
+                            lessor.copy_from_slice(&d[8..28]);
+                            st.leases.insert(
+                                id,
+                                LeaseRow {
+                                    lessor,
+                                    status: d[28],
+                                    initial_pv: read_stmt_u64(d, 32),
+                                    rem_liability: read_stmt_u64(d, 40),
+                                    periodic_payment: read_stmt_u64(d, 48),
+                                    rate_bps: read_stmt_u64(d, 56),
+                                    total_periods: u32_be(d, 64),
+                                    paid_periods: u32_be(d, 68),
+                                    period_blocks: read_stmt_u64(d, 72),
+                                    start_block: read_stmt_u64(d, 80),
+                                    posted_amort: read_stmt_u64(d, 88),
+                                },
+                            );
+                        }
+                        SUBLEDGER_KIND_DEFERRED_REV => {
+                            let id = read_stmt_u64(d, 0);
+                            let mut customer = [0u8; 20];
+                            customer.copy_from_slice(&d[8..28]);
+                            let mut plan_tag = [0u8; 8];
+                            plan_tag.copy_from_slice(&d[72..80]);
+                            st.defs.insert(
+                                id,
+                                DeferredContractRow {
+                                    customer,
+                                    is_related: d[28] != 0,
+                                    plan_tag,
+                                    total_amount: read_stmt_u64(d, 32),
+                                    posted_earned: read_stmt_u64(d, 40),
+                                    start_block: read_stmt_u64(d, 56),
+                                    duration_blocks: read_stmt_u64(d, 64),
+                                },
+                            );
+                        }
+                        SUBLEDGER_KIND_CREDIT_INVOICE => {
+                            let id = read_stmt_u64(d, 0);
+                            let mut buyer = [0u8; 20];
+                            buyer.copy_from_slice(&d[8..28]);
+                            st.invoices.insert(
+                                id,
+                                CreditInvoiceRow {
+                                    buyer,
+                                    product_id: [0u8; 32],
+                                    quantity: 0,
+                                    status: d[28],
+                                    original_amount: read_stmt_u64(d, 32),
+                                    open_amount: read_stmt_u64(d, 40),
+                                    issued_block: read_stmt_u64(d, 56),
+                                    due_block: read_stmt_u64(d, 64),
+                                },
+                            );
+                        }
+                        SUBLEDGER_KIND_AUX_COUNTERS => {
+                            for k in 0..7 {
+                                st.aux[k] = read_stmt_u64(d, k * 8);
+                            }
+                        }
+                        _ => {}
+                    }
+                } else if t0 == EV_PERIOD_CLOSED {
+                    let _ = ifrs::roll_nominal_accounts_into_retained_earnings(&mut st.totals).unwrap();
+                    st.period += 1;
+                }
+            }
+            *cursor = all_evs.len();
+
+            // Compute client-side projection from streamed schedules + live bank balance
+            let mut proj = AccrualProjection::default();
+            for a in st.assets.values() {
+                if !a.disposed {
+                    let cum = ifrs::compute_linear_depreciation(a.cost, a.residual, a.useful_life_blocks, a.acquired_block, blk);
+                    let delta = cum.saturating_sub(a.posted_depr);
+                    if a.asset_class == ifrs::ASSET_CLASS_FINITE_INTANGIBLE {
+                        proj.unposted_intang_amort += delta;
+                    } else {
+                        proj.unposted_ppe_depr += delta;
+                    }
+                }
+            }
+            for ls in st.leases.values() {
+                if ls.status == 2 {
+                    let cum = ifrs::compute_linear_depreciation(
+                        ls.initial_pv,
+                        0,
+                        (ls.total_periods as u64) * ls.period_blocks,
+                        ls.start_block,
+                        blk,
+                    );
+                    proj.unposted_rou_amort += cum.saturating_sub(ls.posted_amort);
+                }
+            }
+            for dc in st.defs.values() {
+                let cum = ifrs::compute_linear_deferred_earned(dc.total_amount, dc.start_block, dc.duration_blocks, blk);
+                let delta = cum.saturating_sub(dc.posted_earned);
+                if dc.is_related {
+                    proj.unposted_deferred_rev_related += delta;
+                } else {
+                    proj.unposted_deferred_rev_arms += delta;
+                }
+            }
+            for inv in st.invoices.values() {
+                if inv.status == 2 && inv.open_amount > 0 {
+                    proj.target_ecl_allowance += ifrs::compute_invoice_ecl_amount(inv.open_amount, inv.due_block, blk);
+                }
+            }
+            let actual_bank = BANK_BALS.with(|b| *b.borrow().get(&TREAS).unwrap_or(&0));
+            let booked = st.totals[ACC_CASH as usize].0.saturating_sub(st.totals[ACC_CASH as usize].1);
+            if actual_bank > booked {
+                proj.unattributed_bank_inflow = actual_bank - booked;
+            }
+            let compiled = ifrs::compile_statements(&st.totals, &proj);
+
+            // Compare against live on-chain `getFinancialStatements()`!
+            let stmt_cd = CallEncoder::<16>::new(const { selector("getFinancialStatements()") });
+            let (rc, on_chain) = call_at(ACC, CUSTOMER, blk, stmt_cd.as_slice());
+            assert_eq!(rc, 0);
+            assert_eq!(st.period, read_stmt_u64(&on_chain, 0));
+            assert_eq!(st.journal_cnt, read_stmt_u64(&on_chain, 32));
+            assert_eq!(st.cfo_net, read_stmt_i64(&on_chain, 80));
+            assert_eq!(st.cfi_net, read_stmt_i64(&on_chain, 88));
+            assert_eq!(st.cff_net, read_stmt_i64(&on_chain, 96));
+            assert_eq!(compiled.total_assets as i64, read_stmt_i64(&on_chain, 200));
+            assert_eq!(compiled.total_liabilities as i64, read_stmt_i64(&on_chain, 224));
+            assert_eq!(compiled.total_equity as i64, read_stmt_i64(&on_chain, 232));
+            assert_eq!(compiled.net_revenue as i64, read_stmt_i64(&on_chain, 256));
+            assert_eq!(compiled.net_income as i64, read_stmt_i64(&on_chain, 280));
+            for c in 0..COA_COUNT {
+                assert_eq!(
+                    compiled.normal_balances[c] as i64,
+                    read_stmt_i64(&on_chain, 296 + c * 8),
+                    "CoA slot {c} mismatch at block {blk}"
+                );
+            }
+        };
         // EXPLOIT CHECK 4: IAS 24 Related-Party Credit Sale rejected; Related-Party Cash Sale segregated into 4050!
         let rp_inv_cd = CallEncoder::<224>::new(const {
             selector("issueCreditInvoice(address,bytes32,uint64,uint64,uint64,address)")
@@ -3145,6 +3706,7 @@ mod tests {
         .push_u64(2_500);
         let (rc_rp_cash, _) = call_at(ACC, PROD_MOD, 116, rp_cash_cd.as_slice());
         assert_eq!(rc_rp_cash, 0);
+        ingest_events_and_assert_parity(&mut client, &mut ev_cursor, 116);
 
         // 5. Bilateral IFRS 16 Lease: Propose -> non-lessor accept rejected -> lessor accept capitalizes ROU PV!
         let prop_lse_cd = CallEncoder::<224>::new(const {
@@ -3165,9 +3727,11 @@ mod tests {
         assert_eq!(rc_fake_lessor, ERR_IFRS_COUNTERPARTY_CONSENT_REQUIRED);
         let (rc_real_lessor, _) = call_at(ACC, LESSOR, 120, acc_lse_cd.as_slice());
         assert_eq!(rc_real_lessor, 0);
+        ingest_events_and_assert_parity(&mut client, &mut ev_cursor, 120);
 
         // 6. Unsolicited `7,777` SGD transfer into `treasuryIdentity` + 60 blocks elapsed -> verify live statement projection!
         BANK_BALS.with(|b| *b.borrow_mut().get_mut(&TREAS).unwrap() += 7_777);
+        ingest_events_and_assert_parity(&mut client, &mut ev_cursor, 170);
         let stmt_cd = CallEncoder::<16>::new(const { selector("getFinancialStatements()") });
         let (rc_st, stmt_raw) = call_at(ACC, CUSTOMER, 170, stmt_cd.as_slice());
         assert_eq!(rc_st, 0);
@@ -3198,6 +3762,7 @@ mod tests {
         .push_address(&[0u8; 20]);
         let (rc_ok_div, _) = call_at(ACC, FOUNDER_DIR, 170, ok_div_cd.as_slice());
         assert_eq!(rc_ok_div, 0);
+        ingest_events_and_assert_parity(&mut client, &mut ev_cursor, 170);
 
         // Close Fiscal Period #1 -> Period #2
         let close_cd = CallEncoder::<64>::new(const { selector("closeFiscalPeriod(address)") })
@@ -3205,5 +3770,6 @@ mod tests {
         let (rc_close, close_ret) = call_at(ACC, FOUNDER_DIR, 180, close_cd.as_slice());
         assert_eq!(rc_close, 0);
         assert_eq!(u64::from_be_bytes(close_ret[24..32].try_into().unwrap()), 2);
+        ingest_events_and_assert_parity(&mut client, &mut ev_cursor, 180);
     }
 }
