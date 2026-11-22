@@ -7,6 +7,42 @@
 
 pub const MAX_VRF_VALIDATORS: usize = 64;
 
+/// Canonical compressed `Edwards25519` basepoint `B` (RFC 8032 §5.1).
+pub const ED25519_BASEPOINT_BYTES: [u8; 32] = [
+    0x58, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+    0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+    0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+    0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+];
+
+/// Canonical compressed `Edwards25519` identity point `𝒪 = (0, 1)`.
+pub const IDENTITY_POINT_BYTES: [u8; 32] = [
+    1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+/// Additive identity ElGamal ciphertext `Enc(0; r=0) = (𝒪, 𝒪)` (`64` bytes).
+pub const IDENTITY_CIPHERTEXT_64: [u8; 64] = {
+    let mut b = [0u8; 64];
+    b[0] = 1;
+    b[32] = 1;
+    b
+};
+
+/// Canonical little-endian scalar `1 ∈ ℤ_ℓ`.
+pub const SCALAR_ONE_BYTES: [u8; 32] = [
+    1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+/// Canonical little-endian scalar `-1 mod ℓ` (`ℓ - 1`).
+pub const SCALAR_MINUS_ONE_BYTES: [u8; 32] = [
+    0xec, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58,
+    0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
+];
+
 /// Active `Full` validator record returned by [`active_validators`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ActiveValidator {
@@ -128,6 +164,46 @@ mod sys {
             ctx_ptr: i32,
             ctx_len: i32,
             proof_64_ptr: i32,
+        ) -> i32;
+        pub fn host_he_add_ciphertexts(
+            ca_64_ptr: i32,
+            cb_64_ptr: i32,
+            out_64_ptr: i32,
+        ) -> i32;
+        pub fn host_he_scale_ciphertext(
+            ct_64_ptr: i32,
+            weight: i64,
+            out_64_ptr: i32,
+        ) -> i32;
+        pub fn host_he_verify_zero_or_one(
+            pk_32_ptr: i32,
+            ct_64_ptr: i32,
+            ctx_ptr: i32,
+            ctx_len: i32,
+            proof_128_ptr: i32,
+        ) -> i32;
+        pub fn host_he_verify_pok(
+            pk_32_ptr: i32,
+            ct_64_ptr: i32,
+            ctx_ptr: i32,
+            ctx_len: i32,
+            proof_96_ptr: i32,
+        ) -> i32;
+        pub fn host_he_verify_decryption_share(
+            share_pk_ptr: i32,
+            c1_ptr: i32,
+            d_i_ptr: i32,
+            ctx_ptr: i32,
+            ctx_len: i32,
+            proof_64_ptr: i32,
+        ) -> i32;
+        pub fn host_he_lagrange_decrypt(
+            c1_ptr: i32,
+            c2_ptr: i32,
+            shares_ptr: i32,
+            shares_count: i32,
+            max_val: i64,
+            out_72_ptr: i32,
         ) -> i32;
     }
 }
@@ -431,6 +507,187 @@ pub fn ec_dleq_verify(
     {
         mock_crypto::verify_dleq_bytes(g1, y1, g2, y2, ctx, proof_64)
     }
+}
+
+/// Homomorphic addition of two 64-byte ElGamal ciphertexts: `Enc(a) + Enc(b) = Enc(a + b)`.
+pub fn he_add_ciphertexts(ca: &[u8; 64], cb: &[u8; 64]) -> Option<[u8; 64]> {
+    let mut out = [0u8; 64];
+    #[cfg(target_arch = "wasm32")]
+    let ok = unsafe {
+        sys::host_he_add_ciphertexts(
+            ca.as_ptr() as i32,
+            cb.as_ptr() as i32,
+            out.as_mut_ptr() as i32,
+        ) == 1
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let ok = match mock_crypto::he_add_ciphertexts(ca, cb) {
+        Some(r) => {
+            out = r;
+            true
+        }
+        None => false,
+    };
+    if ok {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// Homomorphic non-negative scalar scaling `weight * Enc(m) = Enc(weight * m)`.
+pub fn he_scale_ciphertext(ct: &[u8; 64], weight: u64) -> Option<[u8; 64]> {
+    if weight > (i64::MAX as u64) {
+        return None;
+    }
+    let mut out = [0u8; 64];
+    #[cfg(target_arch = "wasm32")]
+    let ok = unsafe {
+        sys::host_he_scale_ciphertext(
+            ct.as_ptr() as i32,
+            weight as i64,
+            out.as_mut_ptr() as i32,
+        ) == 1
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let ok = match mock_crypto::he_scale_ciphertext(ct, weight) {
+        Some(r) => {
+            out = r;
+            true
+        }
+        None => false,
+    };
+    if ok {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// Verifies a 128-byte Cramer-Damgård-Schoenmakers 1-of-2 Disjunctive Schnorr ZK proof
+/// `[c0_32, z0_32, c1_32, z1_32]` that `ct_64` encrypts strictly `0` OR `1` under `pk_32`.
+pub fn he_verify_zero_or_one(
+    pk_32: &[u8; 32],
+    ct_64: &[u8; 64],
+    ctx: &[u8],
+    proof_128: &[u8; 128],
+) -> bool {
+    #[cfg(target_arch = "wasm32")]
+    unsafe {
+        sys::host_he_verify_zero_or_one(
+            pk_32.as_ptr() as i32,
+            ct_64.as_ptr() as i32,
+            ctx.as_ptr() as i32,
+            ctx.len() as i32,
+            proof_128.as_ptr() as i32,
+        ) == 1
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        mock_crypto::verify_he_zero_or_one(pk_32, ct_64, ctx, proof_128)
+    }
+}
+
+/// Verifies a 96-byte Schnorr Ciphertext Proof of Knowledge `[c_32, zm_32, zr_32]`.
+pub fn he_verify_pok(
+    pk_32: &[u8; 32],
+    ct_64: &[u8; 64],
+    ctx: &[u8],
+    proof_96: &[u8; 96],
+) -> bool {
+    #[cfg(target_arch = "wasm32")]
+    unsafe {
+        sys::host_he_verify_pok(
+            pk_32.as_ptr() as i32,
+            ct_64.as_ptr() as i32,
+            ctx.as_ptr() as i32,
+            ctx.len() as i32,
+            proof_96.as_ptr() as i32,
+        ) == 1
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        mock_crypto::verify_he_ciphertext_pok(pk_32, ct_64, ctx, proof_96)
+    }
+}
+
+/// Verifies validator `j`'s partial ElGamal decryption share `(d_j_32, proof_64)`.
+pub fn he_verify_decryption_share(
+    share_pk: &[u8; 32],
+    c1: &[u8; 32],
+    d_j: &[u8; 32],
+    ctx: &[u8],
+    proof_64: &[u8; 64],
+) -> bool {
+    #[cfg(target_arch = "wasm32")]
+    unsafe {
+        sys::host_he_verify_decryption_share(
+            share_pk.as_ptr() as i32,
+            c1.as_ptr() as i32,
+            d_j.as_ptr() as i32,
+            ctx.as_ptr() as i32,
+            ctx.len() as i32,
+            proof_64.as_ptr() as i32,
+        ) == 1
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        mock_crypto::verify_validator_decryption_share(share_pk, c1, d_j, ctx, proof_64)
+    }
+}
+
+/// Lagrange-combines `shares_count` partial decryption points (`packed_36b_shares`: `[idx_u32_be || D_i_32]`)
+/// into `(D_point_32, M_point_32, Option<recovered_u64>)`.
+pub fn he_lagrange_decrypt(
+    c1: &[u8; 32],
+    c2: &[u8; 32],
+    packed_36b_shares: &[u8],
+    shares_count: usize,
+    max_val: u64,
+) -> Option<([u8; 32], [u8; 32], Option<u64>)> {
+    if shares_count > MAX_VRF_VALIDATORS
+        || packed_36b_shares.len() < shares_count * 36
+        || max_val > (i64::MAX as u64)
+    {
+        return None;
+    }
+    let mut out = [0u8; 72];
+    #[cfg(target_arch = "wasm32")]
+    let rc = unsafe {
+        sys::host_he_lagrange_decrypt(
+            c1.as_ptr() as i32,
+            c2.as_ptr() as i32,
+            packed_36b_shares.as_ptr() as i32,
+            shares_count as i32,
+            max_val as i64,
+            out.as_mut_ptr() as i32,
+        )
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let rc = mock_crypto::lagrange_decrypt_packed(
+        c1,
+        c2,
+        packed_36b_shares,
+        shares_count,
+        max_val,
+        &mut out,
+    );
+
+    if rc <= 0 {
+        return None;
+    }
+    let mut d_32 = [0u8; 32];
+    let mut m_32 = [0u8; 32];
+    d_32.copy_from_slice(&out[0..32]);
+    m_32.copy_from_slice(&out[32..64]);
+    let val = if rc == 1 {
+        let mut vb = [0u8; 8];
+        vb.copy_from_slice(&out[64..72]);
+        Some(u64::from_be_bytes(vb))
+    } else {
+        None
+    };
+    Some((d_32, m_32, val))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1134,5 +1391,373 @@ pub mod mock_crypto {
         out_64[0..32].copy_from_slice(&gamma_b);
         out_64[32..64].copy_from_slice(&rnd);
         true
+    }
+
+    pub fn he_encrypt_u64(
+        pk_bytes: &[u8; 32],
+        value: u64,
+        randomness: &Scalar,
+    ) -> Option<[u8; 64]> {
+        let y_pt = decode_prime_order_point(pk_bytes)?;
+        let c1 = randomness * ED25519_BASEPOINT_TABLE;
+        let c2 = &Scalar::from(value) * ED25519_BASEPOINT_TABLE + randomness * y_pt;
+        let mut out = [0u8; 64];
+        out[0..32].copy_from_slice(c1.compress().as_bytes());
+        out[32..64].copy_from_slice(c2.compress().as_bytes());
+        Some(out)
+    }
+
+    pub fn he_add_ciphertexts(ca: &[u8; 64], cb: &[u8; 64]) -> Option<[u8; 64]> {
+        let mut ca1 = [0u8; 32];
+        let mut ca2 = [0u8; 32];
+        let mut cb1 = [0u8; 32];
+        let mut cb2 = [0u8; 32];
+        ca1.copy_from_slice(&ca[0..32]);
+        ca2.copy_from_slice(&ca[32..64]);
+        cb1.copy_from_slice(&cb[0..32]);
+        cb2.copy_from_slice(&cb[32..64]);
+        let a1 = decode_torsion_free_or_identity(&ca1)?;
+        let a2 = decode_torsion_free_or_identity(&ca2)?;
+        let b1 = decode_torsion_free_or_identity(&cb1)?;
+        let b2 = decode_torsion_free_or_identity(&cb2)?;
+        let mut out = [0u8; 64];
+        out[0..32].copy_from_slice((a1 + b1).compress().as_bytes());
+        out[32..64].copy_from_slice((a2 + b2).compress().as_bytes());
+        Some(out)
+    }
+
+    pub fn he_scale_ciphertext(ct: &[u8; 64], weight: u64) -> Option<[u8; 64]> {
+        let mut c1_b = [0u8; 32];
+        let mut c2_b = [0u8; 32];
+        c1_b.copy_from_slice(&ct[0..32]);
+        c2_b.copy_from_slice(&ct[32..64]);
+        let c1 = decode_torsion_free_or_identity(&c1_b)?;
+        let c2 = decode_torsion_free_or_identity(&c2_b)?;
+        let w = Scalar::from(weight);
+        let mut out = [0u8; 64];
+        out[0..32].copy_from_slice((w * c1).compress().as_bytes());
+        out[32..64].copy_from_slice((w * c2).compress().as_bytes());
+        Some(out)
+    }
+
+    fn he_or01_challenge(
+        y_pt: &EdwardsPoint,
+        c1_pt: &EdwardsPoint,
+        c2_pt: &EdwardsPoint,
+        a0: &EdwardsPoint,
+        b0: &EdwardsPoint,
+        a1: &EdwardsPoint,
+        b1: &EdwardsPoint,
+        aux_ctx: &[u8],
+    ) -> Scalar {
+        let mut h = Sha512::new();
+        h.update(b"SLX_HE_OR01_V1");
+        h.update(y_pt.compress().as_bytes());
+        h.update(c1_pt.compress().as_bytes());
+        h.update(c2_pt.compress().as_bytes());
+        h.update(a0.compress().as_bytes());
+        h.update(b0.compress().as_bytes());
+        h.update(a1.compress().as_bytes());
+        h.update(b1.compress().as_bytes());
+        h.update((aux_ctx.len() as u64).to_be_bytes());
+        h.update(aux_ctx);
+        Scalar::from_bytes_mod_order_wide(&h.finalize().into())
+    }
+
+    pub fn prove_he_zero_or_one(
+        pk_bytes: &[u8; 32],
+        bit: u8,
+        randomness: &Scalar,
+        aux_ctx: &[u8],
+        entropy_32: &[u8; 32],
+    ) -> Option<([u8; 64], [u8; 128])> {
+        if bit > 1 || *randomness == Scalar::ZERO {
+            return None;
+        }
+        let y_pt = decode_prime_order_point(pk_bytes)?;
+        let ct_64 = he_encrypt_u64(pk_bytes, bit as u64, randomness)?;
+        let c1_pt = randomness * ED25519_BASEPOINT_TABLE;
+        let c2_pt = if bit == 1 {
+            ED25519_BASEPOINT_POINT + randomness * y_pt
+        } else {
+            randomness * y_pt
+        };
+        let derive_sc = |tag: u8| -> Scalar {
+            let mut h = Sha512::new();
+            h.update(b"SLX_HE_OR01_NONCE_V1");
+            h.update(randomness.as_bytes());
+            h.update(&ct_64);
+            h.update((aux_ctx.len() as u64).to_be_bytes());
+            h.update(aux_ctx);
+            h.update(entropy_32);
+            h.update([bit, tag]);
+            Scalar::from_bytes_mod_order_wide(&h.finalize().into())
+        };
+        let k = derive_sc(1);
+        let sim_c = derive_sc(2);
+        let sim_z = derive_sc(3);
+        let (c0, z0, c1, z1) = if bit == 0 {
+            let a0 = &k * ED25519_BASEPOINT_TABLE;
+            let b0 = k * y_pt;
+            let m1 = c2_pt - ED25519_BASEPOINT_POINT;
+            let a1 = &sim_z * ED25519_BASEPOINT_TABLE - sim_c * c1_pt;
+            let b1 = sim_z * y_pt - sim_c * m1;
+            let c = he_or01_challenge(&y_pt, &c1_pt, &c2_pt, &a0, &b0, &a1, &b1, aux_ctx);
+            let c0 = c - sim_c;
+            (c0, k + c0 * randomness, sim_c, sim_z)
+        } else {
+            let a0 = &sim_z * ED25519_BASEPOINT_TABLE - sim_c * c1_pt;
+            let b0 = sim_z * y_pt - sim_c * c2_pt;
+            let a1 = &k * ED25519_BASEPOINT_TABLE;
+            let b1 = k * y_pt;
+            let c = he_or01_challenge(&y_pt, &c1_pt, &c2_pt, &a0, &b0, &a1, &b1, aux_ctx);
+            let c1 = c - sim_c;
+            (sim_c, sim_z, c1, k + c1 * randomness)
+        };
+        let mut proof = [0u8; 128];
+        proof[0..32].copy_from_slice(c0.as_bytes());
+        proof[32..64].copy_from_slice(z0.as_bytes());
+        proof[64..96].copy_from_slice(c1.as_bytes());
+        proof[96..128].copy_from_slice(z1.as_bytes());
+        Some((ct_64, proof))
+    }
+
+    /// Generates a 64-byte Chaum-Pedersen DLEQ proof that the homomorphic sum ciphertext
+    /// `C_sum = (r_sum * B, 1 * B + r_sum * Y)` encrypts `1` under `pk_bytes` (`log_B(C_sum_1) == log_Y(C_sum_2 - B)`).
+    pub fn prove_he_sum_equals_one(
+        pk_bytes: &[u8; 32],
+        r_sum: &Scalar,
+        aux_ctx: &[u8],
+        entropy_32: &[u8; 32],
+    ) -> Option<[u8; 64]> {
+        if *r_sum == Scalar::ZERO {
+            return None;
+        }
+        let y_pt = decode_prime_order_point(pk_bytes)?;
+        let c_sum_1 = r_sum * ED25519_BASEPOINT_TABLE;
+        let c_sum_2_minus_b = r_sum * y_pt;
+        Some(prove_dleq(
+            r_sum,
+            &ED25519_BASEPOINT_POINT,
+            &c_sum_1,
+            &y_pt,
+            &c_sum_2_minus_b,
+            aux_ctx,
+            entropy_32,
+        ))
+    }
+
+    pub fn verify_he_zero_or_one(
+        pk_bytes: &[u8; 32],
+        ct_64: &[u8; 64],
+        aux_ctx: &[u8],
+        proof_128: &[u8; 128],
+    ) -> bool {
+        let Some(y_pt) = decode_prime_order_point(pk_bytes) else {
+            return false;
+        };
+        let mut c1_b = [0u8; 32];
+        let mut c2_b = [0u8; 32];
+        c1_b.copy_from_slice(&ct_64[0..32]);
+        c2_b.copy_from_slice(&ct_64[32..64]);
+        let (Some(c1_pt), Some(c2_pt)) = (
+            decode_prime_order_point(&c1_b),
+            decode_torsion_free_or_identity(&c2_b),
+        ) else {
+            return false;
+        };
+        let read_sc = |off: usize| -> Option<Scalar> {
+            let mut b = [0u8; 32];
+            b.copy_from_slice(&proof_128[off..off + 32]);
+            Option::<Scalar>::from(Scalar::from_canonical_bytes(b))
+        };
+        let (Some(c0), Some(z0), Some(c1), Some(z1)) =
+            (read_sc(0), read_sc(32), read_sc(64), read_sc(96))
+        else {
+            return false;
+        };
+        let m1_pt = c2_pt - ED25519_BASEPOINT_POINT;
+        let a0 = &z0 * ED25519_BASEPOINT_TABLE - c0 * c1_pt;
+        let b0 = z0 * y_pt - c0 * c2_pt;
+        let a1 = &z1 * ED25519_BASEPOINT_TABLE - c1 * c1_pt;
+        let b1 = z1 * y_pt - c1 * m1_pt;
+        (c0 + c1) == he_or01_challenge(&y_pt, &c1_pt, &c2_pt, &a0, &b0, &a1, &b1, aux_ctx)
+    }
+
+    pub fn verify_he_ciphertext_pok(
+        pk_bytes: &[u8; 32],
+        ct_64: &[u8; 64],
+        aux_ctx: &[u8],
+        proof_96: &[u8; 96],
+    ) -> bool {
+        let Some(y_pt) = decode_prime_order_point(pk_bytes) else {
+            return false;
+        };
+        let mut c1_b = [0u8; 32];
+        let mut c2_b = [0u8; 32];
+        c1_b.copy_from_slice(&ct_64[0..32]);
+        c2_b.copy_from_slice(&ct_64[32..64]);
+        let (Some(c1_pt), Some(c2_pt)) = (
+            decode_prime_order_point(&c1_b),
+            decode_torsion_free_or_identity(&c2_b),
+        ) else {
+            return false;
+        };
+        let read_sc = |off: usize| -> Option<Scalar> {
+            let mut b = [0u8; 32];
+            b.copy_from_slice(&proof_96[off..off + 32]);
+            Option::<Scalar>::from(Scalar::from_canonical_bytes(b))
+        };
+        let (Some(c), Some(zm), Some(zr)) = (read_sc(0), read_sc(32), read_sc(64)) else {
+            return false;
+        };
+        let r1_pt = &zr * ED25519_BASEPOINT_TABLE - c * c1_pt;
+        let r2_pt = &zm * ED25519_BASEPOINT_TABLE + zr * y_pt - c * c2_pt;
+        let mut h = Sha512::new();
+        h.update(b"SLX_HE_POK_V1");
+        h.update(y_pt.compress().as_bytes());
+        h.update(c1_pt.compress().as_bytes());
+        h.update(c2_pt.compress().as_bytes());
+        h.update(r1_pt.compress().as_bytes());
+        h.update(r2_pt.compress().as_bytes());
+        h.update((aux_ctx.len() as u64).to_be_bytes());
+        h.update(aux_ctx);
+        c == Scalar::from_bytes_mod_order_wide(&h.finalize().into())
+    }
+
+    pub fn compute_validator_decryption_share(
+        epoch_secret_share: &Scalar,
+        c1_bytes: &[u8; 32],
+        dec_ctx: &[u8],
+        entropy_32: &[u8; 32],
+    ) -> Option<([u8; 32], [u8; 64])> {
+        let c1_pt = decode_torsion_free_or_identity(c1_bytes)?;
+        if c1_pt.is_identity() {
+            return Some((super::IDENTITY_POINT_BYTES, [0u8; 64]));
+        }
+        let share_pk = epoch_secret_share * ED25519_BASEPOINT_TABLE;
+        let d_pt = epoch_secret_share * c1_pt;
+        let proof = prove_dleq(
+            epoch_secret_share,
+            &ED25519_BASEPOINT_POINT,
+            &share_pk,
+            &c1_pt,
+            &d_pt,
+            dec_ctx,
+            entropy_32,
+        );
+        Some((d_pt.compress().to_bytes(), proof))
+    }
+
+    pub fn verify_validator_decryption_share(
+        share_pk_bytes: &[u8; 32],
+        c1_bytes: &[u8; 32],
+        d_j_bytes: &[u8; 32],
+        dec_ctx: &[u8],
+        proof_64: &[u8; 64],
+    ) -> bool {
+        let Some(share_pk) = decode_prime_order_point(share_pk_bytes) else {
+            return false;
+        };
+        let Some(c1_pt) = decode_torsion_free_or_identity(c1_bytes) else {
+            return false;
+        };
+        if c1_pt.is_identity() {
+            return *d_j_bytes == super::IDENTITY_POINT_BYTES && *proof_64 == [0u8; 64];
+        }
+        let Some(d_pt) = decode_torsion_free_or_identity(d_j_bytes) else {
+            return false;
+        };
+        verify_dleq(
+            &ED25519_BASEPOINT_POINT,
+            &share_pk,
+            &c1_pt,
+            &d_pt,
+            dec_ctx,
+            proof_64,
+        )
+    }
+
+    pub(crate) fn lagrange_decrypt_packed(
+        c1_bytes: &[u8; 32],
+        c2_bytes: &[u8; 32],
+        packed_36b: &[u8],
+        shares_count: usize,
+        max_val: u64,
+        out_72: &mut [u8; 72],
+    ) -> i32 {
+        let (Some(c1_pt), Some(c2_pt)) = (
+            decode_torsion_free_or_identity(c1_bytes),
+            decode_torsion_free_or_identity(c2_bytes),
+        ) else {
+            return 0;
+        };
+        let combined_d = if c1_pt.is_identity() {
+            EdwardsPoint::identity()
+        } else {
+            if shares_count == 0 {
+                return 0;
+            }
+            let mut xs = Vec::with_capacity(shares_count);
+            let mut pts = Vec::with_capacity(shares_count);
+            for chunk in packed_36b[..shares_count * 36].chunks_exact(36) {
+                let idx = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                if xs.iter().any(|&(prev, _)| prev == idx) {
+                    return 0;
+                }
+                let mut db = [0u8; 32];
+                db.copy_from_slice(&chunk[4..36]);
+                let Some(pt) = decode_torsion_free_or_identity(&db) else {
+                    return 0;
+                };
+                xs.push((idx, Scalar::from((idx as u64) + 1)));
+                pts.push(pt);
+            }
+            let mut acc = EdwardsPoint::identity();
+            for i in 0..xs.len() {
+                let (_, x_i) = xs[i];
+                let mut num = Scalar::ONE;
+                let mut den = Scalar::ONE;
+                for j in 0..xs.len() {
+                    if i == j {
+                        continue;
+                    }
+                    let (_, x_j) = xs[j];
+                    num *= x_j;
+                    den *= x_j - x_i;
+                }
+                if den == Scalar::ZERO {
+                    return 0;
+                }
+                acc += (num * den.invert()) * pts[i];
+            }
+            acc
+        };
+        let m_pt = c2_pt - combined_d;
+        out_72[0..32].copy_from_slice(combined_d.compress().as_bytes());
+        out_72[32..64].copy_from_slice(m_pt.compress().as_bytes());
+
+        // Solve discrete log in `[0, max_val]` via BSGS
+        const STEP: u64 = 4096;
+        let bound = max_val.min(16_777_216);
+        let mut table = std::collections::HashMap::with_capacity(STEP as usize);
+        let mut pt = EdwardsPoint::identity();
+        for b in 0..(STEP as u32) {
+            table.insert(pt.compress().to_bytes(), b);
+            pt += ED25519_BASEPOINT_POINT;
+        }
+        let giant_neg = -(&Scalar::from(STEP) * ED25519_BASEPOINT_TABLE);
+        let mut cur = m_pt;
+        for q in 0..=(bound / STEP) {
+            if let Some(&rem) = table.get(&cur.compress().to_bytes()) {
+                let cand = q * STEP + (rem as u64);
+                if cand <= bound {
+                    out_72[64..72].copy_from_slice(&cand.to_be_bytes());
+                    return 1;
+                }
+            }
+            cur += giant_neg;
+        }
+        2
     }
 }

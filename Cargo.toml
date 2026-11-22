@@ -25,6 +25,7 @@ members = [
     "examples/cipher-noir",
     "examples/vrf-beacon",
     "examples/lottery",
+    "examples/secret-ballot",
 ]
 
 [workspace.package]

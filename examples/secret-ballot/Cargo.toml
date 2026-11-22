@@ -1,0 +1,13 @@
+[package]
+name = "secret-ballot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CipherVote — Threshold Homomorphic Zero-Knowledge Secret-Ballot Governance & Shareholder Voting HPS"
+
+[[bin]]
+name = "secret_ballot"
+path = "src/main.rs"
+
+[dependencies]
+hps-sdk = { path = "../../crates/hps-sdk" }
