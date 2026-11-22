@@ -28,7 +28,8 @@ pub const ACC_CASH: u8 = 0; // 1010 Cash & Bank Equivalents (IAS 7)
 pub const ACC_TRADE_RECEIVABLES: u8 = 1; // 1100 Trade Receivables (IFRS 15 / IFRS 9)
 pub const ACC_ALLOWANCE_ECL: u8 = 2; // 1190 Allowance for Expected Credit Losses [Contra] (IFRS 9)
 pub const ACC_INVENTORY: u8 = 3; // 1200 Merchandise Inventory — Moving WAC (IAS 2)
-pub const ACC_PREPAID_EXPENSES: u8 = 4; // 1300 Prepaid Expenses (IAS 1)
+pub const ACC_FUTURE_CONTRACT_RECEIVABLES: u8 = 4; // 1800 Future Contract Receivables — Unbilled Backlog (IFRS 15)
+pub const ACC_PREPAID_EXPENSES: u8 = ACC_FUTURE_CONTRACT_RECEIVABLES; // Legacy slot alias
 pub const ACC_PPE_COST: u8 = 5; // 1500 Property, Plant & Equipment at Cost (IAS 16)
 pub const ACC_ACCUM_DEPR_PPE: u8 = 6; // 1590 Accumulated Depreciation — PPE [Contra] (IAS 16)
 pub const ACC_ROU_ASSETS: u8 = 7; // 1600 Right-of-Use Lease Assets at PV (IFRS 16)
@@ -100,6 +101,11 @@ pub const MAX_DEFERRED_CONTRACT_BLOCKS: u64 = 500_000;
 /// Statutory credit-sale payment term bounds (in blocks).
 pub const MIN_CREDIT_SALE_DUE_BLOCKS: u64 = 10;
 pub const MAX_CREDIT_SALE_DUE_BLOCKS: u64 = 100_000;
+/// Statutory multi-period B2B / Defense service contract bounds (`IFRS 15` unbilled contract backlog).
+pub const MIN_SERVICE_CONTRACT_MONTHS: u64 = 2;
+pub const MAX_SERVICE_CONTRACT_MONTHS: u64 = 120;
+pub const MIN_SERVICE_MONTH_BLOCKS: u64 = 10;
+pub const MAX_SERVICE_MONTH_BLOCKS: u64 = 100_000;
 /// Statutory `IFRS 16` lease bounds (prevents abusive discount-rate manipulation).
 pub const MIN_LEASE_PERIODS: u64 = 2;
 pub const MAX_LEASE_PERIODS: u64 = 120;
@@ -162,7 +168,7 @@ pub const CHART_OF_ACCOUNTS: [AccountMeta; COA_COUNT] = [
     AccountMeta { index: 1, code: 1100, normal_side: Side::Debit, is_nominal: false, name: "Trade Receivables" },
     AccountMeta { index: 2, code: 1190, normal_side: Side::Credit, is_nominal: false, name: "Allowance for ECL (Contra)" },
     AccountMeta { index: 3, code: 1200, normal_side: Side::Debit, is_nominal: false, name: "Merchandise Inventory (WAC)" },
-    AccountMeta { index: 4, code: 1300, normal_side: Side::Debit, is_nominal: false, name: "Prepaid Expenses" },
+    AccountMeta { index: 4, code: 1800, normal_side: Side::Debit, is_nominal: false, name: "Future Contract Receivables (IFRS 15)" },
     AccountMeta { index: 5, code: 1500, normal_side: Side::Debit, is_nominal: false, name: "Property, Plant & Equipment" },
     AccountMeta { index: 6, code: 1590, normal_side: Side::Credit, is_nominal: false, name: "Accum. Depreciation — PPE" },
     AccountMeta { index: 7, code: 1600, normal_side: Side::Debit, is_nominal: false, name: "Right-of-Use Lease Assets" },
@@ -230,6 +236,7 @@ pub struct BalancedBatch {
 }
 
 impl BalancedBatch {
+    #[inline(never)]
     fn build(
         raw_lines: &[JournalLine],
         standard_tag: u8,
@@ -479,6 +486,57 @@ pub fn derive_deferred_revenue_recognition(
     let raw = [
         JournalLine::dr(ACC_CONTRACT_LIABILITIES, newly_earned),
         JournalLine::cr(rev_acc, newly_earned),
+    ];
+    BalancedBatch::build(&raw, STD_IFRS15_REVENUE, CashFlowClass::None)
+}
+
+/// Stage 1 of a ratified multi-period B2B / Sovereign Defense Service Contract (`IFRS 15.105`–`108`):
+/// Recognizes the bilaterally executed contract backlog as `1800 Future Contract Receivables` (Non-Current)
+/// matched 1:1 against `2300 Contract Liabilities` (Unearned Performance Obligations), with **zero**
+/// premature P&L revenue recognition! **Bans** related-party contract backlogs (`IAS 24`).
+pub fn derive_service_contract_backlog(
+    monthly_amount: u64,
+    total_months: u64,
+    month_blocks: u64,
+    is_related_party: bool,
+) -> Result<(BalancedBatch, u64), i32> {
+    if monthly_amount == 0 {
+        return Err(ERR_IFRS_ZERO_OR_OVERFLOW);
+    }
+    if is_related_party {
+        return Err(ERR_IFRS_RELATED_PARTY_CREDIT_BANNED);
+    }
+    if total_months < MIN_SERVICE_CONTRACT_MONTHS
+        || total_months > MAX_SERVICE_CONTRACT_MONTHS
+        || month_blocks < MIN_SERVICE_MONTH_BLOCKS
+        || month_blocks > MAX_SERVICE_MONTH_BLOCKS
+    {
+        return Err(ERR_IFRS_INVALID_CONTRACT_DURATION);
+    }
+    let total_value = monthly_amount
+        .checked_mul(total_months)
+        .ok_or(ERR_IFRS_ZERO_OR_OVERFLOW)?;
+    let raw = [
+        JournalLine::dr(ACC_FUTURE_CONTRACT_RECEIVABLES, total_value),
+        JournalLine::cr(ACC_CONTRACT_LIABILITIES, total_value),
+    ];
+    let batch = BalancedBatch::build(&raw, STD_IFRS15_REVENUE, CashFlowClass::None)?;
+    Ok((batch, total_value))
+}
+
+/// Stage 2 of a multi-period B2B / Defense Service Contract (`IFRS 15` + `IFRS 9`):
+/// Upon completing a monthly milestone and issuing an invoice, reclassifies one monthly installment
+/// from `1800 Future Contract Receivables` into `1100 Current Trade Receivables` while satisfying
+/// `2300 Contract Liabilities` into `4000 Operating Revenue — Arm's-Length`.
+pub fn derive_service_contract_billing(monthly_amount: u64) -> Result<BalancedBatch, i32> {
+    if monthly_amount == 0 {
+        return Err(ERR_IFRS_ZERO_OR_OVERFLOW);
+    }
+    let raw = [
+        JournalLine::dr(ACC_TRADE_RECEIVABLES, monthly_amount),
+        JournalLine::cr(ACC_FUTURE_CONTRACT_RECEIVABLES, monthly_amount),
+        JournalLine::dr(ACC_CONTRACT_LIABILITIES, monthly_amount),
+        JournalLine::cr(ACC_REVENUE_ARMS_LENGTH, monthly_amount),
     ];
     BalancedBatch::build(&raw, STD_IFRS15_REVENUE, CashFlowClass::None)
 }
@@ -1168,10 +1226,10 @@ pub fn compile_statements(
     let total_current_assets = normal_balances[ACC_CASH as usize]
         + normal_balances[ACC_TRADE_RECEIVABLES as usize]
         - normal_balances[ACC_ALLOWANCE_ECL as usize]
-        + normal_balances[ACC_INVENTORY as usize]
-        + normal_balances[ACC_PREPAID_EXPENSES as usize];
+        + normal_balances[ACC_INVENTORY as usize];
 
-    let total_non_current_assets = normal_balances[ACC_PPE_COST as usize]
+    let total_non_current_assets = normal_balances[ACC_FUTURE_CONTRACT_RECEIVABLES as usize]
+        + normal_balances[ACC_PPE_COST as usize]
         - normal_balances[ACC_ACCUM_DEPR_PPE as usize]
         + normal_balances[ACC_ROU_ASSETS as usize]
         - normal_balances[ACC_ACCUM_AMORT_ROU as usize]
@@ -1498,5 +1556,35 @@ mod tests {
         assert!(st_after.equation_balanced);
         assert_eq!(st_after.closed_retained_earnings, 19_000);
         assert_eq!(st_after.net_income, 0);
+
+        // 10. 3-Stage Defense Service Contract (`180k/mo * 12 = 2,160,000`):
+        assert_eq!(
+            derive_service_contract_backlog(180_000, 12, 32, true),
+            Err(ERR_IFRS_RELATED_PARTY_CREDIT_BANNED)
+        );
+        let (b_svc_sign, total_svc) =
+            derive_service_contract_backlog(180_000, 12, 32, false).unwrap();
+        assert_eq!(total_svc, 2_160_000);
+        apply_batch(&mut totals, &b_svc_sign);
+        let st_s1 = compile_statements(&totals, &AccrualProjection::default());
+        assert!(st_s1.equation_balanced);
+        assert_eq!(st_s1.normal_balances[ACC_FUTURE_CONTRACT_RECEIVABLES as usize], 2_160_000);
+        assert_eq!(st_s1.net_income, 0); // Stage 1 signing books 0 premature profit!
+
+        // Stage 2: Monthly invoice generated (180k Future AR -> Current AR + 4000 Revenue)
+        apply_batch(&mut totals, &derive_service_contract_billing(180_000).unwrap());
+        let st_s2 = compile_statements(&totals, &AccrualProjection::default());
+        assert!(st_s2.equation_balanced);
+        assert_eq!(st_s2.normal_balances[ACC_FUTURE_CONTRACT_RECEIVABLES as usize], 1_980_000);
+        assert_eq!(st_s2.normal_balances[ACC_TRADE_RECEIVABLES as usize], 180_000);
+        assert_eq!(st_s2.net_income, 180_000);
+
+        // Stage 3: Bank oracle settlement (180k Current AR -> Current Cash + CFO)
+        let b_s3 = derive_receivable_collection(180_000).unwrap();
+        assert_eq!(b_s3.cash_delta(), 180_000);
+        apply_batch(&mut totals, &b_s3);
+        let st_s3 = compile_statements(&totals, &AccrualProjection::default());
+        assert!(st_s3.equation_balanced);
+        assert_eq!(st_s3.normal_balances[ACC_TRADE_RECEIVABLES as usize], 0);
     }
 }

@@ -36,6 +36,7 @@ const PILN: [usize; 24] = [
     10, 7, 11, 17, 18, 3, 5, 16, 8, 21, 24, 4, 15, 23, 19, 13, 12, 2, 20, 14, 22, 9, 6, 1,
 ];
 
+#[inline(never)]
 const fn keccak_f1600(mut st: [u64; 25]) -> [u64; 25] {
     let mut round = 0;
     while round < 24 {
@@ -101,6 +102,7 @@ const fn load_u64_le(block: &[u8; 136], offset: usize) -> u64 {
 }
 
 /// Compute standard Ethereum Keccak-256 (`0x01` domain separator, rate = 136 bytes) at compile time.
+#[inline(never)]
 pub const fn keccak256(input: &[u8]) -> [u8; 32] {
     let mut state = [0u64; 25];
     let rate = 136usize;

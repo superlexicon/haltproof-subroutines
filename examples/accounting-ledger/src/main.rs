@@ -31,10 +31,11 @@ use hps_sdk::call::{self, CallEncoder};
 use hps_sdk::governance::{
     query_charter_function_auth, require_active_charter, require_approved_hfs_code_hash,
     require_valid_identity, verify_and_consume_auth, ActionHasher, ACTION_CLOSE_FISCAL_PERIOD,
-    ACTION_IFRS_DISBURSE, CAP_EQUITY_SETTLEMENT, CAP_IFRS_RECORDER, CAP_MERCHANT_PAYMENT,
-    ERR_AUTH_CONSUME_FAILED, ERR_CHARTER_MISMATCH, ERR_INVALID_PRODUCT_PARAMS, ERR_MISSING_ROLE,
-    ERR_UNAUTHORIZED_MODULE, HFS_TYPE_PRODUCT_LEDGER, HFS_TYPE_SHARE_CAPITAL, POLICY_ACCOUNTING_OPS,
-    POLICY_BOARD_RESOLUTION, ROLE_CHIEF_ACCOUNTANT, ROLE_PRODUCT_MANAGER, ROLE_TREASURY_MANAGER,
+    ACTION_IFRS_DISBURSE, ACTION_SIGN_SERVICE_CONTRACT, CAP_EQUITY_SETTLEMENT, CAP_IFRS_RECORDER,
+    CAP_MERCHANT_PAYMENT, ERR_AUTH_CONSUME_FAILED, ERR_CHARTER_MISMATCH, ERR_INVALID_PRODUCT_PARAMS,
+    ERR_MISSING_ROLE, ERR_UNAUTHORIZED_MODULE, HFS_TYPE_PRODUCT_LEDGER, HFS_TYPE_SHARE_CAPITAL,
+    POLICY_ACCOUNTING_OPS, POLICY_BOARD_RESOLUTION, ROLE_CHIEF_ACCOUNTANT, ROLE_PRODUCT_MANAGER,
+    ROLE_TREASURY_MANAGER,
 };
 use hps_sdk::ifrs::{
     self, AccrualProjection, BalancedBatch, CashFlowClass, Side, ACC_ALLOWANCE_ECL, ACC_CASH,
@@ -64,6 +65,7 @@ const SUBLEDGER_KIND_DEFERRED_REV: u64 = 4;
 const SUBLEDGER_KIND_CREDIT_INVOICE: u64 = 5;
 const SUBLEDGER_KIND_TERM_LOAN: u64 = 6;
 const SUBLEDGER_KIND_AUX_COUNTERS: u64 = 7;
+const SUBLEDGER_KIND_SERVICE_CONTRACT: u64 = 8;
 
 const KEY_INIT: &[u8] = b"ifrs:init";
 const KEY_REGISTRY: &[u8] = b"ifrs:reg";
@@ -105,14 +107,20 @@ const KEY_ASSET_COUNT: &[u8] = b"ifrs:ast_cnt";
 const KEY_LEASE_COUNT: &[u8] = b"ifrs:lse_cnt";
 const KEY_DEF_COUNT: &[u8] = b"ifrs:def_cnt";
 const KEY_INVOICE_COUNT: &[u8] = b"ifrs:inv_ar_cnt";
+const KEY_FIRST_OPEN_INVOICE: &[u8] = b"ifrs:ar_open0";
 const KEY_LOAN_COUNT: &[u8] = b"ifrs:loan_cnt";
+const KEY_SVC_COUNT: &[u8] = b"ifrs:svc_cnt";
+const KEY_FIRST_ACTIVE_SVC: &[u8] = b"ifrs:svc_act0";
 
 const MAX_INV_SKUS: u64 = 64;
 const MAX_FIXED_ASSETS: u64 = 48;
 const MAX_LEASES: u64 = 24;
 const MAX_DEFERRED_CONTRACTS: u64 = 48;
-const MAX_INVOICES: u64 = 64;
+const MAX_INVOICES: u64 = 10_000;
+const MAX_PACKED_INVOICES: usize = 64;
 const MAX_LOANS: u64 = 24;
+const MAX_SERVICE_CONTRACTS: u64 = 2_048;
+const MAX_PACKED_SERVICE_CONTRACTS: usize = 32;
 const MAX_JOURNAL_SLICE: u64 = 24;
 
 const JOURNAL_ENTRY_BYTES: usize = 140;
@@ -157,6 +165,8 @@ const SEL_REFUND_SUSPENSE: [u8; 4] =
 const SEL_PAY_DIVIDEND: [u8; 4] = selector("payDividend(address,uint64,address)");
 const SEL_RECORD_PAID_IN_CAP: [u8; 4] =
     selector("recordPaidInCapital(uint64,uint64,uint64,address)");
+const SEL_PROPOSE_SVC: [u8; 4] =
+    selector("proposeServiceContract(address,bytes32,uint64,uint64,uint64,address)");
 const SEL_CLOSE_PERIOD: [u8; 4] = selector("closeFiscalPeriod(address)");
 
 hps_entry! {
@@ -186,6 +196,10 @@ hps_entry! {
     "issueCreditInvoice(address,bytes32,uint64,uint64,uint64,address)"                  => handle_issue_credit_invoice,
     "acceptCreditInvoice(uint64)"                                                       => handle_accept_credit_invoice,
     "settleCreditInvoice(uint64,uint64)"                                                => handle_settle_credit_invoice,
+    "proposeServiceContract(address,bytes32,uint64,uint64,uint64,address)"              => handle_propose_service_contract,
+    "coSignServiceContract(uint64)"                                                     => handle_cosign_service_contract,
+    "billServiceContractMonth(uint64)"                                                  => handle_bill_service_contract_month,
+    "hashProposeServiceContract(address,bytes32,uint64,uint64,uint64)"                 => handle_hash_propose_service_contract,
     "purchaseSubscription(bytes32,uint64,uint64)"                                       => handle_purchase_subscription,
     "proposeTermLoan(address,uint64,uint64,address)"                                    => handle_propose_term_loan,
     "fundTermLoan(uint64)"                                                              => handle_fund_term_loan,
@@ -293,24 +307,89 @@ struct TermLoanRow {
     start_block: u64,
 }
 
+#[derive(Clone, Copy)]
+struct ServiceContractRow {
+    client: [u8; 20],
+    status: u8, // 1 = Board-ratified (awaiting Client co-sign), 2 = Active, 3 = Completed
+    monthly_amount: u64,
+    total_months: u32,
+    billed_months: u32,
+    month_blocks: u64,
+    start_block: u64,
+    last_invoice_id: u64, // u64::MAX when no monthly invoice generated yet
+    contract_tag: [u8; 24],
+}
+
+#[inline(never)]
+fn put_bytes(buf: &mut [u8], off: usize, src: &[u8]) {
+    let mut i = 0;
+    while i < src.len() {
+        buf[off + i] = src[i];
+        i += 1;
+    }
+}
+
+#[inline(never)]
+fn put_u64(buf: &mut [u8], off: usize, val: u64) {
+    put_bytes(buf, off, &val.to_be_bytes());
+}
+
+#[inline(never)]
+fn put_u32(buf: &mut [u8], off: usize, val: u32) {
+    put_bytes(buf, off, &val.to_be_bytes());
+}
+
+#[inline(never)]
+fn read_u64_be(buf: &[u8], off: usize) -> u64 {
+    let mut x = [0u8; 8];
+    let mut i = 0;
+    while i < 8 {
+        x[i] = buf[off + i];
+        i += 1;
+    }
+    u64::from_be_bytes(x)
+}
+
+#[inline(never)]
+fn read_u32_be(buf: &[u8], off: usize) -> u32 {
+    let mut x = [0u8; 4];
+    let mut i = 0;
+    while i < 4 {
+        x[i] = buf[off + i];
+        i += 1;
+    }
+    u32::from_be_bytes(x)
+}
+
+#[inline(never)]
+fn read_addr(buf: &[u8], off: usize) -> [u8; 20] {
+    let mut a = [0u8; 20];
+    let mut i = 0;
+    while i < 20 {
+        a[i] = buf[off + i];
+        i += 1;
+    }
+    a
+}
+
 fn addr_topic(addr: &[u8; 20]) -> [u8; 32] {
     let mut t = [0u8; 32];
-    t[12..32].copy_from_slice(addr);
+    put_bytes(&mut t, 12, addr);
     t
 }
 
 fn u64_topic(val: u64) -> [u8; 32] {
     let mut t = [0u8; 32];
-    t[24..32].copy_from_slice(&val.to_be_bytes());
+    put_u64(&mut t, 24, val);
     t
 }
 
 fn encode_inv_sku_wire(sku: &[u8; 32], st: &InvSkuState) -> [u8; 56] {
     let mut out = [0u8; 56];
-    out[0..32].copy_from_slice(sku);
-    out[32..40].copy_from_slice(&st.units_on_hand.to_be_bytes());
-    out[40..48].copy_from_slice(&st.carrying_cost.to_be_bytes());
-    out[48..56].copy_from_slice(&st.total_units_sold.to_be_bytes());
+    put_bytes(&mut out, 0, sku);
+    put_u64(&mut out, 32, st.units_on_hand);
+    put_u64(&mut out, 40, st.carrying_cost);
+    put_u64(&mut out, 48, st.total_units_sold);
     out
 }
 
@@ -327,32 +406,32 @@ fn encode_asset_wire(id: u64, row: &CapitalAssetRow, now: u64) -> [u8; 64] {
         )
     };
     let mut out = [0u8; 64];
-    out[0..8].copy_from_slice(&id.to_be_bytes());
+    put_u64(&mut out, 0, id);
     out[8] = row.asset_class;
     out[9] = u8::from(row.disposed);
-    out[16..24].copy_from_slice(&row.cost.to_be_bytes());
-    out[24..32].copy_from_slice(&row.residual.to_be_bytes());
-    out[32..40].copy_from_slice(&row.useful_life_blocks.to_be_bytes());
-    out[40..48].copy_from_slice(&row.acquired_block.to_be_bytes());
-    out[48..56].copy_from_slice(&row.posted_depr.to_be_bytes());
-    out[56..64].copy_from_slice(&live_cum.to_be_bytes());
+    put_u64(&mut out, 16, row.cost);
+    put_u64(&mut out, 24, row.residual);
+    put_u64(&mut out, 32, row.useful_life_blocks);
+    put_u64(&mut out, 40, row.acquired_block);
+    put_u64(&mut out, 48, row.posted_depr);
+    put_u64(&mut out, 56, live_cum);
     out
 }
 
 fn encode_lease_wire(id: u64, ls: &LeaseRow) -> [u8; 96] {
     let mut out = [0u8; 96];
-    out[0..8].copy_from_slice(&id.to_be_bytes());
-    out[8..28].copy_from_slice(&ls.lessor);
+    put_u64(&mut out, 0, id);
+    put_bytes(&mut out, 8, &ls.lessor);
     out[28] = ls.status;
-    out[32..40].copy_from_slice(&ls.initial_pv.to_be_bytes());
-    out[40..48].copy_from_slice(&ls.rem_liability.to_be_bytes());
-    out[48..56].copy_from_slice(&ls.periodic_payment.to_be_bytes());
-    out[56..64].copy_from_slice(&ls.rate_bps.to_be_bytes());
-    out[64..68].copy_from_slice(&ls.total_periods.to_be_bytes());
-    out[68..72].copy_from_slice(&ls.paid_periods.to_be_bytes());
-    out[72..80].copy_from_slice(&ls.period_blocks.to_be_bytes());
-    out[80..88].copy_from_slice(&ls.start_block.to_be_bytes());
-    out[88..96].copy_from_slice(&ls.posted_amort.to_be_bytes());
+    put_u64(&mut out, 32, ls.initial_pv);
+    put_u64(&mut out, 40, ls.rem_liability);
+    put_u64(&mut out, 48, ls.periodic_payment);
+    put_u64(&mut out, 56, ls.rate_bps);
+    put_u32(&mut out, 64, ls.total_periods);
+    put_u32(&mut out, 68, ls.paid_periods);
+    put_u64(&mut out, 72, ls.period_blocks);
+    put_u64(&mut out, 80, ls.start_block);
+    put_u64(&mut out, 88, ls.posted_amort);
     out
 }
 
@@ -364,15 +443,15 @@ fn encode_def_wire(id: u64, dc: &DeferredContractRow, now: u64) -> [u8; 80] {
         now,
     );
     let mut out = [0u8; 80];
-    out[0..8].copy_from_slice(&id.to_be_bytes());
-    out[8..28].copy_from_slice(&dc.customer);
+    put_u64(&mut out, 0, id);
+    put_bytes(&mut out, 8, &dc.customer);
     out[28] = u8::from(dc.is_related);
-    out[32..40].copy_from_slice(&dc.total_amount.to_be_bytes());
-    out[40..48].copy_from_slice(&dc.posted_earned.to_be_bytes());
-    out[48..56].copy_from_slice(&live_earned.to_be_bytes());
-    out[56..64].copy_from_slice(&dc.start_block.to_be_bytes());
-    out[64..72].copy_from_slice(&dc.duration_blocks.to_be_bytes());
-    out[72..80].copy_from_slice(&dc.plan_tag);
+    put_u64(&mut out, 32, dc.total_amount);
+    put_u64(&mut out, 40, dc.posted_earned);
+    put_u64(&mut out, 48, live_earned);
+    put_u64(&mut out, 56, dc.start_block);
+    put_u64(&mut out, 64, dc.duration_blocks);
+    put_bytes(&mut out, 72, &dc.plan_tag);
     out
 }
 
@@ -383,38 +462,53 @@ fn encode_invoice_wire(id: u64, inv: &CreditInvoiceRow, now: u64) -> [u8; 72] {
         0
     };
     let mut out = [0u8; 72];
-    out[0..8].copy_from_slice(&id.to_be_bytes());
-    out[8..28].copy_from_slice(&inv.buyer);
+    put_u64(&mut out, 0, id);
+    put_bytes(&mut out, 8, &inv.buyer);
     out[28] = inv.status;
-    out[32..40].copy_from_slice(&inv.original_amount.to_be_bytes());
-    out[40..48].copy_from_slice(&inv.open_amount.to_be_bytes());
-    out[48..56].copy_from_slice(&live_ecl.to_be_bytes());
-    out[56..64].copy_from_slice(&inv.issued_block.to_be_bytes());
-    out[64..72].copy_from_slice(&inv.due_block.to_be_bytes());
+    put_u64(&mut out, 32, inv.original_amount);
+    put_u64(&mut out, 40, inv.open_amount);
+    put_u64(&mut out, 48, live_ecl);
+    put_u64(&mut out, 56, inv.issued_block);
+    put_u64(&mut out, 64, inv.due_block);
     out
 }
 
 fn encode_loan_wire(id: u64, row: &TermLoanRow) -> [u8; 64] {
     let mut out = [0u8; 64];
-    out[0..8].copy_from_slice(&id.to_be_bytes());
-    out[8..28].copy_from_slice(&row.lender);
+    put_u64(&mut out, 0, id);
+    put_bytes(&mut out, 8, &row.lender);
     out[28] = row.status;
-    out[32..40].copy_from_slice(&row.initial_principal.to_be_bytes());
-    out[40..48].copy_from_slice(&row.rem_principal.to_be_bytes());
-    out[48..56].copy_from_slice(&row.rate_bps.to_be_bytes());
-    out[56..64].copy_from_slice(&row.start_block.to_be_bytes());
+    put_u64(&mut out, 32, row.initial_principal);
+    put_u64(&mut out, 40, row.rem_principal);
+    put_u64(&mut out, 48, row.rate_bps);
+    put_u64(&mut out, 56, row.start_block);
+    out
+}
+
+fn encode_svc_wire(id: u64, row: &ServiceContractRow) -> [u8; 96] {
+    let mut out = [0u8; 96];
+    put_u64(&mut out, 0, id);
+    put_bytes(&mut out, 8, &row.client);
+    out[28] = row.status;
+    put_u64(&mut out, 32, row.monthly_amount);
+    put_u32(&mut out, 40, row.total_months);
+    put_u32(&mut out, 44, row.billed_months);
+    put_u64(&mut out, 48, row.month_blocks);
+    put_u64(&mut out, 56, row.start_block);
+    put_u64(&mut out, 64, row.last_invoice_id);
+    put_bytes(&mut out, 72, &row.contract_tag);
     out
 }
 
 fn encode_aux_counters_wire() -> [u8; 56] {
     let mut out = [0u8; 56];
-    out[0..8].copy_from_slice(&storage::get_u64(KEY_RP_TX_CNT).to_be_bytes());
-    out[8..16].copy_from_slice(&storage::get_u64(KEY_RP_INFLOW).to_be_bytes());
-    out[16..24].copy_from_slice(&storage::get_u64(KEY_RP_OUTFLOW).to_be_bytes());
-    out[24..32].copy_from_slice(&storage::get_u64(KEY_OPEX_RND).to_be_bytes());
-    out[32..40].copy_from_slice(&storage::get_u64(KEY_OPEX_SM).to_be_bytes());
-    out[40..48].copy_from_slice(&storage::get_u64(KEY_OPEX_GA).to_be_bytes());
-    out[48..56].copy_from_slice(&storage::get_u64(KEY_SALE_COUNT).to_be_bytes());
+    put_u64(&mut out, 0, storage::get_u64(KEY_RP_TX_CNT));
+    put_u64(&mut out, 8, storage::get_u64(KEY_RP_INFLOW));
+    put_u64(&mut out, 16, storage::get_u64(KEY_RP_OUTFLOW));
+    put_u64(&mut out, 24, storage::get_u64(KEY_OPEX_RND));
+    put_u64(&mut out, 32, storage::get_u64(KEY_OPEX_SM));
+    put_u64(&mut out, 40, storage::get_u64(KEY_OPEX_GA));
+    put_u64(&mut out, 48, storage::get_u64(KEY_SALE_COUNT));
     out
 }
 
@@ -443,6 +537,7 @@ fn set_i64(key: &[u8], val: i64) {
     storage::set(key, &val.to_be_bytes());
 }
 
+#[inline(never)]
 fn load_coa_totals() -> [(u64, u64); COA_COUNT] {
     let mut out = [(0u64, 0u64); COA_COUNT];
     let mut raw = [0u8; COA_COUNT * 16];
@@ -460,6 +555,7 @@ fn load_coa_totals() -> [(u64, u64); COA_COUNT] {
     out
 }
 
+#[inline(never)]
 fn save_coa_totals(totals: &[(u64, u64); COA_COUNT]) {
     let mut raw = [0u8; COA_COUNT * 16];
     let mut i = 0;
@@ -611,6 +707,7 @@ fn journal_key(idx: u64) -> KeyBuilder<24> {
 /// Commit a verified `BalancedBatch` to the 32-account General Ledger, `IAS 7` Cash Flow totals,
 /// and append-only General Journal tape, emitting a self-contained `IfrsJournalPosted` event log
 /// carrying all double-entry lines and cash-flow deltas for realtime event-sourced statement UIs.
+#[inline(never)]
 fn commit_batch(
     totals: &mut [(u64, u64); COA_COUNT],
     batch: &BalancedBatch,
@@ -742,16 +839,10 @@ fn load_inv_sku(sku: &[u8; 32]) -> Option<InvSkuState> {
     if storage::get_into(inv_sku_key(sku).as_slice(), &mut b) != Some(24) {
         return None;
     }
-    let mut u = [0u8; 8];
-    let mut c = [0u8; 8];
-    let mut s = [0u8; 8];
-    u.copy_from_slice(&b[0..8]);
-    c.copy_from_slice(&b[8..16]);
-    s.copy_from_slice(&b[16..24]);
     Some(InvSkuState {
-        units_on_hand: u64::from_be_bytes(u),
-        carrying_cost: u64::from_be_bytes(c),
-        total_units_sold: u64::from_be_bytes(s),
+        units_on_hand: read_u64_be(&b, 0),
+        carrying_cost: read_u64_be(&b, 8),
+        total_units_sold: read_u64_be(&b, 16),
     })
 }
 
@@ -766,9 +857,9 @@ fn save_inv_sku(sku: &[u8; 32], st: &InvSkuState) -> Result<(), i32> {
         storage::set_u64(KEY_INV_SKU_COUNT, cnt + 1);
     }
     let mut b = [0u8; 24];
-    b[0..8].copy_from_slice(&st.units_on_hand.to_be_bytes());
-    b[8..16].copy_from_slice(&st.carrying_cost.to_be_bytes());
-    b[16..24].copy_from_slice(&st.total_units_sold.to_be_bytes());
+    put_u64(&mut b, 0, st.units_on_hand);
+    put_u64(&mut b, 8, st.carrying_cost);
+    put_u64(&mut b, 16, st.total_units_sold);
     storage::set(k.as_slice(), &b);
     let wire = encode_inv_sku_wire(sku, st);
     events::emit(
@@ -785,11 +876,11 @@ fn save_asset(id: u64, row: &CapitalAssetRow) {
     let mut b = [0u8; 42];
     b[0] = row.asset_class;
     b[1] = u8::from(row.disposed);
-    b[2..10].copy_from_slice(&row.cost.to_be_bytes());
-    b[10..18].copy_from_slice(&row.residual.to_be_bytes());
-    b[18..26].copy_from_slice(&row.useful_life_blocks.to_be_bytes());
-    b[26..34].copy_from_slice(&row.acquired_block.to_be_bytes());
-    b[34..42].copy_from_slice(&row.posted_depr.to_be_bytes());
+    put_u64(&mut b, 2, row.cost);
+    put_u64(&mut b, 10, row.residual);
+    put_u64(&mut b, 18, row.useful_life_blocks);
+    put_u64(&mut b, 26, row.acquired_block);
+    put_u64(&mut b, 34, row.posted_depr);
     storage::set(asset_key(id).as_slice(), &b);
     let wire = encode_asset_wire(id, row, context::block_number());
     events::emit(
@@ -806,19 +897,14 @@ fn load_asset(id: u64) -> Option<CapitalAssetRow> {
     if storage::get_into(asset_key(id).as_slice(), &mut b) != Some(42) {
         return None;
     }
-    let u64_at = |off: usize| {
-        let mut x = [0u8; 8];
-        x.copy_from_slice(&b[off..off + 8]);
-        u64::from_be_bytes(x)
-    };
     Some(CapitalAssetRow {
         asset_class: b[0],
         disposed: b[1] == 1,
-        cost: u64_at(2),
-        residual: u64_at(10),
-        useful_life_blocks: u64_at(18),
-        acquired_block: u64_at(26),
-        posted_depr: u64_at(34),
+        cost: read_u64_be(&b, 2),
+        residual: read_u64_be(&b, 10),
+        useful_life_blocks: read_u64_be(&b, 18),
+        acquired_block: read_u64_be(&b, 26),
+        posted_depr: read_u64_be(&b, 34),
     })
 }
 
@@ -827,17 +913,17 @@ fn lease_key(id: u64) -> KeyBuilder<24> {
 }
 fn save_lease(id: u64, row: &LeaseRow) {
     let mut b = [0u8; 85];
-    b[0..20].copy_from_slice(&row.lessor);
+    put_bytes(&mut b, 0, &row.lessor);
     b[20] = row.status;
-    b[21..29].copy_from_slice(&row.initial_pv.to_be_bytes());
-    b[29..37].copy_from_slice(&row.rem_liability.to_be_bytes());
-    b[37..45].copy_from_slice(&row.periodic_payment.to_be_bytes());
-    b[45..53].copy_from_slice(&row.rate_bps.to_be_bytes());
-    b[53..57].copy_from_slice(&row.total_periods.to_be_bytes());
-    b[57..61].copy_from_slice(&row.paid_periods.to_be_bytes());
-    b[61..69].copy_from_slice(&row.period_blocks.to_be_bytes());
-    b[69..77].copy_from_slice(&row.start_block.to_be_bytes());
-    b[77..85].copy_from_slice(&row.posted_amort.to_be_bytes());
+    put_u64(&mut b, 21, row.initial_pv);
+    put_u64(&mut b, 29, row.rem_liability);
+    put_u64(&mut b, 37, row.periodic_payment);
+    put_u64(&mut b, 45, row.rate_bps);
+    put_u32(&mut b, 53, row.total_periods);
+    put_u32(&mut b, 57, row.paid_periods);
+    put_u64(&mut b, 61, row.period_blocks);
+    put_u64(&mut b, 69, row.start_block);
+    put_u64(&mut b, 77, row.posted_amort);
     storage::set(lease_key(id).as_slice(), &b);
     let wire = encode_lease_wire(id, row);
     events::emit(
@@ -854,29 +940,18 @@ fn load_lease(id: u64) -> Option<LeaseRow> {
     if storage::get_into(lease_key(id).as_slice(), &mut b) != Some(85) {
         return None;
     }
-    let mut lessor = [0u8; 20];
-    lessor.copy_from_slice(&b[0..20]);
-    let u64_at = |off: usize| {
-        let mut x = [0u8; 8];
-        x.copy_from_slice(&b[off..off + 8]);
-        u64::from_be_bytes(x)
-    };
-    let mut tp = [0u8; 4];
-    let mut pp = [0u8; 4];
-    tp.copy_from_slice(&b[53..57]);
-    pp.copy_from_slice(&b[57..61]);
     Some(LeaseRow {
-        lessor,
+        lessor: read_addr(&b, 0),
         status: b[20],
-        initial_pv: u64_at(21),
-        rem_liability: u64_at(29),
-        periodic_payment: u64_at(37),
-        rate_bps: u64_at(45),
-        total_periods: u32::from_be_bytes(tp),
-        paid_periods: u32::from_be_bytes(pp),
-        period_blocks: u64_at(61),
-        start_block: u64_at(69),
-        posted_amort: u64_at(77),
+        initial_pv: read_u64_be(&b, 21),
+        rem_liability: read_u64_be(&b, 29),
+        periodic_payment: read_u64_be(&b, 37),
+        rate_bps: read_u64_be(&b, 45),
+        total_periods: read_u32_be(&b, 53),
+        paid_periods: read_u32_be(&b, 57),
+        period_blocks: read_u64_be(&b, 61),
+        start_block: read_u64_be(&b, 69),
+        posted_amort: read_u64_be(&b, 77),
     })
 }
 
@@ -885,13 +960,13 @@ fn def_key(id: u64) -> KeyBuilder<24> {
 }
 fn save_def(id: u64, row: &DeferredContractRow) {
     let mut b = [0u8; 61];
-    b[0..20].copy_from_slice(&row.customer);
+    put_bytes(&mut b, 0, &row.customer);
     b[20] = u8::from(row.is_related);
-    b[21..29].copy_from_slice(&row.plan_tag);
-    b[29..37].copy_from_slice(&row.total_amount.to_be_bytes());
-    b[37..45].copy_from_slice(&row.posted_earned.to_be_bytes());
-    b[45..53].copy_from_slice(&row.start_block.to_be_bytes());
-    b[53..61].copy_from_slice(&row.duration_blocks.to_be_bytes());
+    put_bytes(&mut b, 21, &row.plan_tag);
+    put_u64(&mut b, 29, row.total_amount);
+    put_u64(&mut b, 37, row.posted_earned);
+    put_u64(&mut b, 45, row.start_block);
+    put_u64(&mut b, 53, row.duration_blocks);
     storage::set(def_key(id).as_slice(), &b);
     let wire = encode_def_wire(id, row, context::block_number());
     events::emit(
@@ -908,23 +983,16 @@ fn load_def(id: u64) -> Option<DeferredContractRow> {
     if storage::get_into(def_key(id).as_slice(), &mut b) != Some(61) {
         return None;
     }
-    let mut customer = [0u8; 20];
-    customer.copy_from_slice(&b[0..20]);
     let mut plan_tag = [0u8; 8];
-    plan_tag.copy_from_slice(&b[21..29]);
-    let u64_at = |off: usize| {
-        let mut x = [0u8; 8];
-        x.copy_from_slice(&b[off..off + 8]);
-        u64::from_be_bytes(x)
-    };
+    put_bytes(&mut plan_tag, 0, &b[21..29]);
     Some(DeferredContractRow {
-        customer,
+        customer: read_addr(&b, 0),
         is_related: b[20] == 1,
         plan_tag,
-        total_amount: u64_at(29),
-        posted_earned: u64_at(37),
-        start_block: u64_at(45),
-        duration_blocks: u64_at(53),
+        total_amount: read_u64_be(&b, 29),
+        posted_earned: read_u64_be(&b, 37),
+        start_block: read_u64_be(&b, 45),
+        duration_blocks: read_u64_be(&b, 53),
     })
 }
 
@@ -933,14 +1001,14 @@ fn invoice_key(id: u64) -> KeyBuilder<24> {
 }
 fn save_invoice(id: u64, row: &CreditInvoiceRow) {
     let mut b = [0u8; 93];
-    b[0..20].copy_from_slice(&row.buyer);
-    b[20..52].copy_from_slice(&row.product_id);
-    b[52..60].copy_from_slice(&row.quantity.to_be_bytes());
+    put_bytes(&mut b, 0, &row.buyer);
+    put_bytes(&mut b, 20, &row.product_id);
+    put_u64(&mut b, 52, row.quantity);
     b[60] = row.status;
-    b[61..69].copy_from_slice(&row.original_amount.to_be_bytes());
-    b[69..77].copy_from_slice(&row.open_amount.to_be_bytes());
-    b[77..85].copy_from_slice(&row.issued_block.to_be_bytes());
-    b[85..93].copy_from_slice(&row.due_block.to_be_bytes());
+    put_u64(&mut b, 61, row.original_amount);
+    put_u64(&mut b, 69, row.open_amount);
+    put_u64(&mut b, 77, row.issued_block);
+    put_u64(&mut b, 85, row.due_block);
     storage::set(invoice_key(id).as_slice(), &b);
     let wire = encode_invoice_wire(id, row, context::block_number());
     events::emit(
@@ -957,24 +1025,17 @@ fn load_invoice(id: u64) -> Option<CreditInvoiceRow> {
     if storage::get_into(invoice_key(id).as_slice(), &mut b) != Some(93) {
         return None;
     }
-    let mut buyer = [0u8; 20];
-    buyer.copy_from_slice(&b[0..20]);
     let mut product_id = [0u8; 32];
-    product_id.copy_from_slice(&b[20..52]);
-    let u64_at = |off: usize| {
-        let mut x = [0u8; 8];
-        x.copy_from_slice(&b[off..off + 8]);
-        u64::from_be_bytes(x)
-    };
+    put_bytes(&mut product_id, 0, &b[20..52]);
     Some(CreditInvoiceRow {
-        buyer,
+        buyer: read_addr(&b, 0),
         product_id,
-        quantity: u64_at(52),
+        quantity: read_u64_be(&b, 52),
         status: b[60],
-        original_amount: u64_at(61),
-        open_amount: u64_at(69),
-        issued_block: u64_at(77),
-        due_block: u64_at(85),
+        original_amount: read_u64_be(&b, 61),
+        open_amount: read_u64_be(&b, 69),
+        issued_block: read_u64_be(&b, 77),
+        due_block: read_u64_be(&b, 85),
     })
 }
 
@@ -983,12 +1044,12 @@ fn loan_key(id: u64) -> KeyBuilder<24> {
 }
 fn save_loan(id: u64, row: &TermLoanRow) {
     let mut b = [0u8; 53];
-    b[0..20].copy_from_slice(&row.lender);
+    put_bytes(&mut b, 0, &row.lender);
     b[20] = row.status;
-    b[21..29].copy_from_slice(&row.initial_principal.to_be_bytes());
-    b[29..37].copy_from_slice(&row.rem_principal.to_be_bytes());
-    b[37..45].copy_from_slice(&row.rate_bps.to_be_bytes());
-    b[45..53].copy_from_slice(&row.start_block.to_be_bytes());
+    put_u64(&mut b, 21, row.initial_principal);
+    put_u64(&mut b, 29, row.rem_principal);
+    put_u64(&mut b, 37, row.rate_bps);
+    put_u64(&mut b, 45, row.start_block);
     storage::set(loan_key(id).as_slice(), &b);
     let wire = encode_loan_wire(id, row);
     events::emit(
@@ -1005,21 +1066,95 @@ fn load_loan(id: u64) -> Option<TermLoanRow> {
     if storage::get_into(loan_key(id).as_slice(), &mut b) != Some(53) {
         return None;
     }
-    let mut lender = [0u8; 20];
-    lender.copy_from_slice(&b[0..20]);
-    let u64_at = |off: usize| {
-        let mut x = [0u8; 8];
-        x.copy_from_slice(&b[off..off + 8]);
-        u64::from_be_bytes(x)
-    };
     Some(TermLoanRow {
-        lender,
+        lender: read_addr(&b, 0),
         status: b[20],
-        initial_principal: u64_at(21),
-        rem_principal: u64_at(29),
-        rate_bps: u64_at(37),
-        start_block: u64_at(45),
+        initial_principal: read_u64_be(&b, 21),
+        rem_principal: read_u64_be(&b, 29),
+        rate_bps: read_u64_be(&b, 37),
+        start_block: read_u64_be(&b, 45),
     })
+}
+
+fn svc_key(id: u64) -> KeyBuilder<24> {
+    KeyBuilder::<24>::new().push(b"svc:").push_u64_be(id)
+}
+fn save_svc(id: u64, row: &ServiceContractRow) {
+    let mut b = [0u8; 85];
+    put_bytes(&mut b, 0, &row.client);
+    b[20] = row.status;
+    put_u64(&mut b, 21, row.monthly_amount);
+    put_u32(&mut b, 29, row.total_months);
+    put_u32(&mut b, 33, row.billed_months);
+    put_u64(&mut b, 37, row.month_blocks);
+    put_u64(&mut b, 45, row.start_block);
+    put_u64(&mut b, 53, row.last_invoice_id);
+    put_bytes(&mut b, 61, &row.contract_tag);
+    storage::set(svc_key(id).as_slice(), &b);
+    let wire = encode_svc_wire(id, row);
+    events::emit(
+        &[
+            EV_SUBLEDGER_UPDATED,
+            u64_topic(SUBLEDGER_KIND_SERVICE_CONTRACT),
+            u64_topic(id),
+        ],
+        &wire,
+    );
+}
+fn load_svc(id: u64) -> Option<ServiceContractRow> {
+    let mut b = [0u8; 85];
+    if storage::get_into(svc_key(id).as_slice(), &mut b) != Some(85) {
+        return None;
+    }
+    let mut contract_tag = [0u8; 24];
+    put_bytes(&mut contract_tag, 0, &b[61..85]);
+    Some(ServiceContractRow {
+        client: read_addr(&b, 0),
+        status: b[20],
+        monthly_amount: read_u64_be(&b, 21),
+        total_months: read_u32_be(&b, 29),
+        billed_months: read_u32_be(&b, 33),
+        month_blocks: read_u64_be(&b, 37),
+        start_block: read_u64_be(&b, 45),
+        last_invoice_id: read_u64_be(&b, 53),
+        contract_tag,
+    })
+}
+
+fn advance_first_open_invoice() {
+    let total = storage::get_u64(KEY_INVOICE_COUNT);
+    let mut cur = storage::get_u64(KEY_FIRST_OPEN_INVOICE);
+    let start = cur;
+    while cur < total {
+        if let Some(inv) = load_invoice(cur) {
+            if inv.status == 3 {
+                cur += 1;
+                continue;
+            }
+        }
+        break;
+    }
+    if cur > start {
+        storage::set_u64(KEY_FIRST_OPEN_INVOICE, cur);
+    }
+}
+
+fn advance_first_active_svc() {
+    let total = storage::get_u64(KEY_SVC_COUNT);
+    let mut cur = storage::get_u64(KEY_FIRST_ACTIVE_SVC);
+    let start = cur;
+    while cur < total {
+        if let Some(row) = load_svc(cur) {
+            if row.status == 3 {
+                cur += 1;
+                continue;
+            }
+        }
+        break;
+    }
+    if cur > start {
+        storage::set_u64(KEY_FIRST_ACTIVE_SVC, cur);
+    }
 }
 
 fn sale_key(sale_idx: u64) -> KeyBuilder<24> {
@@ -1139,6 +1274,7 @@ fn require_verified_sibling_module(expected_hfs_type: &[u8; 32], extra_cap: &[u8
 ///   custom multi-stage policy).
 /// - When `auth_obj == 0x0` and no custom multi-stage policy override is set, permits direct
 ///   execution by an active `ROLE_CHIEF_ACCOUNTANT`, `ROLE_TREASURY_MANAGER`, or sole director (`directorCount() == 1`).
+#[inline(never)]
 fn require_accounting_ops_auth(
     fn_selector: &[u8; 4],
     action_hash: &[u8; 32],
@@ -1204,6 +1340,7 @@ fn require_accounting_ops_auth(
 }
 
 /// Governance check for Board-level capital & period-close actions (`payDividend`, `closeFiscalPeriod`).
+#[inline(never)]
 fn require_board_level_auth(
     fn_selector: &[u8; 4],
     action_hash: &[u8; 32],
@@ -1321,7 +1458,7 @@ fn compute_live_accrual_projection(totals: &[(u64, u64); COA_COUNT], now_block: 
     // 4. IFRS 9 Deterministic Aging ECL across open Trade Receivable invoices
     let inv_cnt = storage::get_u64(KEY_INVOICE_COUNT);
     let mut target_ecl = 0u64;
-    let mut ar = 0u64;
+    let mut ar = storage::get_u64(KEY_FIRST_OPEN_INVOICE);
     while ar < inv_cnt {
         if let Some(inv) = load_invoice(ar) {
             if inv.status == 2 && inv.open_amount > 0 {
@@ -1349,8 +1486,64 @@ fn compute_live_accrual_projection(totals: &[(u64, u64); COA_COUNT], now_block: 
     proj
 }
 
+/// Bill one due monthly installment for active `ServiceContractRow` `svc_id`, creating an open `IFRS 9`
+/// `CreditInvoiceRow` (`1100 Current Trade Receivables`) and reclassifying from `1800 Future Contract Receivables`.
+fn bill_single_svc_installment(
+    totals: &mut [(u64, u64); COA_COUNT],
+    svc_id: u64,
+    row: &mut ServiceContractRow,
+    now_block: u64,
+) -> Result<u64, i32> {
+    if row.status != 2 || row.billed_months >= row.total_months {
+        return Err(ERR_IFRS_NOTHING_TO_POST);
+    }
+    let next_month_num = (row.billed_months as u64) + 1;
+    let due_at = row
+        .start_block
+        .saturating_add(next_month_num.saturating_mul(row.month_blocks));
+    if now_block < due_at {
+        return Err(ERR_IFRS_NOTHING_TO_POST);
+    }
+    let inv_id = storage::get_u64(KEY_INVOICE_COUNT);
+    if inv_id >= MAX_INVOICES {
+        return Err(ERR_IFRS_SUBLEDGER_FULL);
+    }
+
+    let batch = ifrs::derive_service_contract_billing(row.monthly_amount)?;
+    let mut prod_tag = [0u8; 32];
+    prod_tag[0..24].copy_from_slice(&row.contract_tag);
+    save_invoice(
+        inv_id,
+        &CreditInvoiceRow {
+            buyer: row.client,
+            product_id: prod_tag,
+            quantity: next_month_num,
+            status: 2, // Open Current Receivable (`1100`) — contract already bilaterally co-signed!
+            original_amount: row.monthly_amount,
+            open_amount: row.monthly_amount,
+            issued_block: now_block,
+            due_block: now_block.saturating_add(row.month_blocks),
+        },
+    );
+    storage::set_u64(KEY_INVOICE_COUNT, inv_id + 1);
+
+    row.billed_months += 1;
+    row.last_invoice_id = inv_id;
+    if row.billed_months >= row.total_months {
+        row.status = 3;
+    }
+    save_svc(svc_id, row);
+    if row.status == 3 {
+        advance_first_active_svc();
+    }
+
+    let _ = commit_batch(totals, &batch, &row.client, b"SVCB")?;
+    Ok(inv_id)
+}
+
 /// Post all currently due periodic accruals (`IAS 16/38`, `IFRS 16`, `IFRS 15`, `IFRS 9`, and
 /// `2900 Unattributed Cash Suspense` quarantine) into permanent storage. Returns number of batches posted.
+#[inline(never)]
 fn sweep_periodic_accruals_internal(totals: &mut [(u64, u64); COA_COUNT]) -> Result<u64, i32> {
     let now_block = context::block_number();
     let mut posted_batches = 0u64;
@@ -1454,10 +1647,30 @@ fn sweep_periodic_accruals_internal(totals: &mut [(u64, u64); COA_COUNT]) -> Res
         posted_batches += 1;
     }
 
+    // 2b. Multi-Month B2B / Defense Service Contract Milestone Invoices (`1800 Future AR -> 1100 Current AR`)
+    let svc_cnt = storage::get_u64(KEY_SVC_COUNT);
+    let mut svc_billed_this_sweep = 0u32;
+    let mut sc = storage::get_u64(KEY_FIRST_ACTIVE_SVC);
+    while sc < svc_cnt && svc_billed_this_sweep < 4 {
+        if let Some(mut row) = load_svc(sc) {
+            while row.status == 2 && row.billed_months < row.total_months && svc_billed_this_sweep < 4 {
+                let next_m = (row.billed_months as u64) + 1;
+                let due_at = row.start_block.saturating_add(next_m.saturating_mul(row.month_blocks));
+                if now_block < due_at || storage::get_u64(KEY_INVOICE_COUNT) >= MAX_INVOICES {
+                    break;
+                }
+                let _ = bill_single_svc_installment(totals, sc, &mut row, now_block)?;
+                posted_batches += 1;
+                svc_billed_this_sweep += 1;
+            }
+        }
+        sc += 1;
+    }
+
     // 3. Deterministic Aging ECL (`IFRS 9`)
     let inv_cnt = storage::get_u64(KEY_INVOICE_COUNT);
     let mut target_ecl = 0u64;
-    let mut ar = 0u64;
+    let mut ar = storage::get_u64(KEY_FIRST_OPEN_INVOICE);
     while ar < inv_cnt {
         if let Some(inv) = load_invoice(ar) {
             if inv.status == 2 && inv.open_amount > 0 {
@@ -2271,9 +2484,142 @@ fn handle_settle_credit_invoice(args: &CalldataReader) -> Result<(), i32> {
         inv_row.status = 3;
     }
     save_invoice(invoice_id, &inv_row);
+    if inv_row.status == 3 {
+        advance_first_open_invoice();
+    }
 
     let j_id = commit_batch(&mut totals, &batch, &inv_row.buyer, b"ARCL")?;
     ret::write_u64_word(j_id);
+    Ok(())
+}
+
+fn compute_propose_service_contract_hash(
+    client: &[u8; 20],
+    contract_tag_word: &[u8; 32],
+    monthly_amount: u64,
+    total_months: u64,
+    month_blocks: u64,
+) -> [u8; 32] {
+    ActionHasher::<192>::new(&context::self_address(), &ACTION_SIGN_SERVICE_CONTRACT)
+        .push_address(client)
+        .push_bytes32(contract_tag_word)
+        .push_u64(monthly_amount)
+        .push_u64(total_months)
+        .push_u64(month_blocks)
+        .finish()
+}
+
+fn handle_hash_propose_service_contract(args: &CalldataReader) -> Result<(), i32> {
+    let client = args.address(0).ok_or(-3)?;
+    let tag_word = args.bytes32(1).ok_or(-3)?;
+    let monthly_amount = args.u64(2).ok_or(-3)?;
+    let total_months = args.u64(3).ok_or(-3)?;
+    let month_blocks = args.u64(4).ok_or(-3)?;
+    ret::write_word(&compute_propose_service_contract_hash(
+        &client,
+        &tag_word,
+        monthly_amount,
+        total_months,
+        month_blocks,
+    ));
+    Ok(())
+}
+
+/// Stage 1A of Multi-Month B2B / Defense Service Contract (`CorporateCharter` `BOARD_RESOLUTION`):
+/// Ratifies contract terms via Board `Authorization` (`ACTION_SIGN_SERVICE_CONTRACT`), enforces `IAS 24`
+/// arm's-length counterparty verification, and registers the contract awaiting Client `Identity` co-signature.
+fn handle_propose_service_contract(args: &CalldataReader) -> Result<(), i32> {
+    let client = args.address(0).ok_or(-3)?;
+    let tag_word = args.bytes32(1).ok_or(-3)?;
+    let monthly_amount = args.u64(2).ok_or(-3)?;
+    let total_months = args.u64(3).ok_or(-3)?;
+    let month_blocks = args.u64(4).ok_or(-3)?;
+    let auth_obj = args.address(5).ok_or(-3)?;
+
+    let ah = compute_propose_service_contract_hash(
+        &client,
+        &tag_word,
+        monthly_amount,
+        total_months,
+        month_blocks,
+    );
+    let (registry, charter, _caller) =
+        require_board_level_auth(&SEL_PROPOSE_SVC, &ah, &auth_obj)?;
+    require_valid_identity(&registry, &client)?;
+
+    let is_rp = detect_related_party(&charter, &client);
+    let _ = ifrs::derive_service_contract_backlog(
+        monthly_amount,
+        total_months,
+        month_blocks,
+        is_rp,
+    )?;
+
+    let svc_id = storage::get_u64(KEY_SVC_COUNT);
+    if svc_id >= MAX_SERVICE_CONTRACTS {
+        return Err(ERR_IFRS_SUBLEDGER_FULL);
+    }
+    let mut contract_tag = [0u8; 24];
+    contract_tag.copy_from_slice(&tag_word[0..24]);
+    save_svc(
+        svc_id,
+        &ServiceContractRow {
+            client,
+            status: 1, // Board-Ratified — awaiting bilateral Client Identity co-signature!
+            monthly_amount,
+            total_months: total_months as u32,
+            billed_months: 0,
+            month_blocks,
+            start_block: 0,
+            last_invoice_id: u64::MAX,
+            contract_tag,
+        },
+    );
+    storage::set_u64(KEY_SVC_COUNT, svc_id + 1);
+    ret::write_u64_word(svc_id);
+    Ok(())
+}
+
+/// Stage 1B of Multi-Month B2B / Defense Service Contract (`msg.sender == client`):
+/// Client `Identity` co-signs the Board-ratified contract, booking `Dr 1800 Future Contract Receivables`
+/// and `Cr 2300 Contract Liabilities` across the full contract value (`monthly_amount * total_months`).
+fn handle_cosign_service_contract(args: &CalldataReader) -> Result<(), i32> {
+    let (registry, charter) = ensure_active()?;
+    let caller = context::msg_sender();
+    require_valid_identity(&registry, &caller)?;
+
+    let svc_id = args.u64(0).ok_or(-3)?;
+    let mut row = load_svc(svc_id).ok_or(ERR_IFRS_SUBLEDGER_NOT_FOUND)?;
+    if row.status != 1 || caller != row.client {
+        return Err(ERR_IFRS_COUNTERPARTY_CONSENT_REQUIRED);
+    }
+    let is_rp = detect_related_party(&charter, &caller);
+    let (batch, _total_val) = ifrs::derive_service_contract_backlog(
+        row.monthly_amount,
+        row.total_months as u64,
+        row.month_blocks,
+        is_rp,
+    )?;
+
+    row.status = 2;
+    row.start_block = context::block_number();
+    save_svc(svc_id, &row);
+
+    let mut totals = load_coa_totals();
+    let j_id = commit_batch(&mut totals, &batch, &caller, b"SVCS")?;
+    ret::write_u64_word(j_id);
+    Ok(())
+}
+
+/// Stage 2 of Multi-Month B2B / Defense Service Contract:
+/// Generates the next due monthly `IFRS 9` Receivable Invoice (`1800 Future AR -> 1100 Current AR + 4000 Revenue`).
+fn handle_bill_service_contract_month(args: &CalldataReader) -> Result<(), i32> {
+    let (_registry, _charter) = ensure_active()?;
+    let svc_id = args.u64(0).ok_or(-3)?;
+    let mut row = load_svc(svc_id).ok_or(ERR_IFRS_SUBLEDGER_NOT_FOUND)?;
+    let mut totals = load_coa_totals();
+    let inv_id = bill_single_svc_installment(&mut totals, svc_id, &mut row, context::block_number())?;
+    ret::write_u64_word(inv_id);
     Ok(())
 }
 
@@ -2664,40 +3010,39 @@ fn handle_get_financial_statements(_args: &CalldataReader) -> Result<(), i32> {
         flags |= 8;
     }
 
-    out[0..8].copy_from_slice(&period.to_be_bytes());
-    out[8..16].copy_from_slice(&p_start.to_be_bytes());
-    out[16..24].copy_from_slice(&p_closed.to_be_bytes());
-    out[24..32].copy_from_slice(&now.to_be_bytes());
-    out[32..40].copy_from_slice(&j_cnt.to_be_bytes());
-    out[40..48].copy_from_slice(&actual_bank.to_be_bytes());
-    out[48..56].copy_from_slice(&booked_cash.to_be_bytes());
-    out[56..64].copy_from_slice(&proj.unattributed_bank_inflow.to_be_bytes());
-    out[64..72].copy_from_slice(&proj.bank_custody_shortfall.to_be_bytes());
-    out[72..80].copy_from_slice(&flags.to_be_bytes());
-
-    out[80..88].copy_from_slice(&get_i64(KEY_CFO_NET).to_be_bytes());
-    out[88..96].copy_from_slice(&get_i64(KEY_CFI_NET).to_be_bytes());
-    out[96..104].copy_from_slice(&get_i64(KEY_CFF_NET).to_be_bytes());
-
-    out[104..112].copy_from_slice(&storage::get_u64(KEY_RP_TX_CNT).to_be_bytes());
-    out[112..120].copy_from_slice(&storage::get_u64(KEY_RP_INFLOW).to_be_bytes());
-    out[120..128].copy_from_slice(&storage::get_u64(KEY_RP_OUTFLOW).to_be_bytes());
-
-    out[128..136].copy_from_slice(&storage::get_u64(KEY_OPEX_RND).to_be_bytes());
-    out[136..144].copy_from_slice(&storage::get_u64(KEY_OPEX_SM).to_be_bytes());
-    out[144..152].copy_from_slice(&storage::get_u64(KEY_OPEX_GA).to_be_bytes());
-
-    let unposted_da = proj
-        .unposted_ppe_depr
-        .saturating_add(proj.unposted_rou_amort)
-        .saturating_add(proj.unposted_intang_amort);
-    let unposted_def = proj
-        .unposted_deferred_rev_arms
-        .saturating_add(proj.unposted_deferred_rev_related);
-    out[152..160].copy_from_slice(&unposted_da.to_be_bytes());
-    out[160..168].copy_from_slice(&unposted_def.to_be_bytes());
-    out[168..176].copy_from_slice(&proj.target_ecl_allowance.to_be_bytes());
-    out[176..184].copy_from_slice(&storage::get_u64(KEY_SALE_COUNT).to_be_bytes());
+    let hdr_u64s = [
+        period,
+        p_start,
+        p_closed,
+        now,
+        j_cnt,
+        actual_bank,
+        booked_cash,
+        proj.unattributed_bank_inflow,
+        proj.bank_custody_shortfall,
+        flags,
+        get_i64(KEY_CFO_NET) as u64,
+        get_i64(KEY_CFI_NET) as u64,
+        get_i64(KEY_CFF_NET) as u64,
+        storage::get_u64(KEY_RP_TX_CNT),
+        storage::get_u64(KEY_RP_INFLOW),
+        storage::get_u64(KEY_RP_OUTFLOW),
+        storage::get_u64(KEY_OPEX_RND),
+        storage::get_u64(KEY_OPEX_SM),
+        storage::get_u64(KEY_OPEX_GA),
+        proj.unposted_ppe_depr
+            .saturating_add(proj.unposted_rou_amort)
+            .saturating_add(proj.unposted_intang_amort),
+        proj.unposted_deferred_rev_arms
+            .saturating_add(proj.unposted_deferred_rev_related),
+        proj.target_ecl_allowance,
+        storage::get_u64(KEY_SALE_COUNT),
+    ];
+    let mut h = 0;
+    while h < hdr_u64s.len() {
+        put_u64(&mut out, h * 8, hdr_u64s[h]);
+        h += 1;
+    }
 
     let aggs = [
         st.total_current_assets,
@@ -2717,19 +3062,19 @@ fn handle_get_financial_statements(_args: &CalldataReader) -> Result<(), i32> {
     ];
     let mut a = 0;
     while a < aggs.len() {
-        out[184 + a * 8..192 + a * 8].copy_from_slice(&clamp_i64_be(aggs[a]));
+        put_bytes(&mut out, 184 + a * 8, &clamp_i64_be(aggs[a]));
         a += 1;
     }
 
     let mut c = 0;
     while c < COA_COUNT {
-        out[296 + c * 8..304 + c * 8].copy_from_slice(&clamp_i64_be(st.normal_balances[c]));
+        put_bytes(&mut out, 296 + c * 8, &clamp_i64_be(st.normal_balances[c]));
         c += 1;
     }
 
-    out[552..572].copy_from_slice(&storage::get_address(KEY_CHARTER).unwrap_or([0u8; 20]));
-    out[572..592].copy_from_slice(&storage::get_address(KEY_BANK_LEDGER).unwrap_or([0u8; 20]));
-    out[592..612].copy_from_slice(&storage::get_address(KEY_TREASURY_ID).unwrap_or([0u8; 20]));
+    put_bytes(&mut out, 552, &storage::get_address(KEY_CHARTER).unwrap_or([0u8; 20]));
+    put_bytes(&mut out, 572, &storage::get_address(KEY_BANK_LEDGER).unwrap_or([0u8; 20]));
+    put_bytes(&mut out, 592, &storage::get_address(KEY_TREASURY_ID).unwrap_or([0u8; 20]));
 
     let counts = [
         storage::get_u64(KEY_INV_SKU_COUNT) as u32,
@@ -2738,11 +3083,11 @@ fn handle_get_financial_statements(_args: &CalldataReader) -> Result<(), i32> {
         storage::get_u64(KEY_DEF_COUNT) as u32,
         storage::get_u64(KEY_INVOICE_COUNT) as u32,
         storage::get_u64(KEY_LOAN_COUNT) as u32,
-        0u32,
+        storage::get_u64(KEY_SVC_COUNT) as u32,
     ];
     let mut k = 0;
     while k < counts.len() {
-        out[612 + k * 4..616 + k * 4].copy_from_slice(&counts[k].to_be_bytes());
+        put_u32(&mut out, 612 + k * 4, counts[k]);
         k += 1;
     }
 
@@ -2750,7 +3095,8 @@ fn handle_get_financial_statements(_args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
-fn pack_schedules_into_buf(out: &mut [u8], mut pos: usize, now: u64) -> (usize, [u32; 6]) {
+#[inline(never)]
+fn pack_schedules_into_buf(out: &mut [u8], mut pos: usize, now: u64) -> (usize, [u32; 7]) {
     let inv_cnt = storage::get_u64(KEY_INV_SKU_COUNT).min(MAX_INV_SKUS);
     let mut written_inv = 0u32;
     let mut i = 0u64;
@@ -2807,9 +3153,28 @@ fn pack_schedules_into_buf(out: &mut [u8], mut pos: usize, now: u64) -> (usize, 
     }
 
     let inv_ar_cnt = storage::get_u64(KEY_INVOICE_COUNT).min(MAX_INVOICES);
+    let ar_tail = inv_ar_cnt.saturating_sub(MAX_PACKED_INVOICES as u64);
     let mut written_ar = 0u32;
-    let mut ar = 0u64;
-    while ar < inv_ar_cnt && pos + 72 <= out.len() {
+    let mut ar_open = storage::get_u64(KEY_FIRST_OPEN_INVOICE);
+    while ar_open < ar_tail
+        && (written_ar as usize) < MAX_PACKED_INVOICES
+        && pos + 72 <= out.len()
+    {
+        if let Some(inv) = load_invoice(ar_open) {
+            if inv.status != 3 {
+                let w = encode_invoice_wire(ar_open, &inv, now);
+                out[pos..pos + 72].copy_from_slice(&w);
+                pos += 72;
+                written_ar += 1;
+            }
+        }
+        ar_open += 1;
+    }
+    let mut ar = ar_tail;
+    while ar < inv_ar_cnt
+        && (written_ar as usize) < MAX_PACKED_INVOICES
+        && pos + 72 <= out.len()
+    {
         if let Some(inv) = load_invoice(ar) {
             let w = encode_invoice_wire(ar, &inv, now);
             out[pos..pos + 72].copy_from_slice(&w);
@@ -2832,6 +3197,38 @@ fn pack_schedules_into_buf(out: &mut [u8], mut pos: usize, now: u64) -> (usize, 
         ln += 1;
     }
 
+    let svc_cnt = storage::get_u64(KEY_SVC_COUNT).min(MAX_SERVICE_CONTRACTS);
+    let svc_tail = svc_cnt.saturating_sub(MAX_PACKED_SERVICE_CONTRACTS as u64);
+    let mut written_svc = 0u32;
+    let mut sc_act = storage::get_u64(KEY_FIRST_ACTIVE_SVC);
+    while sc_act < svc_tail
+        && (written_svc as usize) < MAX_PACKED_SERVICE_CONTRACTS
+        && pos + 96 <= out.len()
+    {
+        if let Some(row) = load_svc(sc_act) {
+            if row.status != 3 {
+                let w = encode_svc_wire(sc_act, &row);
+                out[pos..pos + 96].copy_from_slice(&w);
+                pos += 96;
+                written_svc += 1;
+            }
+        }
+        sc_act += 1;
+    }
+    let mut sc = svc_tail;
+    while sc < svc_cnt
+        && (written_svc as usize) < MAX_PACKED_SERVICE_CONTRACTS
+        && pos + 96 <= out.len()
+    {
+        if let Some(row) = load_svc(sc) {
+            let w = encode_svc_wire(sc, &row);
+            out[pos..pos + 96].copy_from_slice(&w);
+            pos += 96;
+            written_svc += 1;
+        }
+        sc += 1;
+    }
+
     (
         pos,
         [
@@ -2841,6 +3238,7 @@ fn pack_schedules_into_buf(out: &mut [u8], mut pos: usize, now: u64) -> (usize, 
             written_def,
             written_ar,
             written_ln,
+            written_svc,
         ],
     )
 }
@@ -2882,41 +3280,48 @@ fn handle_get_realtime_anchor_state(_args: &CalldataReader) -> Result<(), i32> {
     unsafe {
         let out = &mut *core::ptr::addr_of_mut!(SNAP_BUF);
         out[0..ANCHOR_HEADER_BYTES].fill(0);
-        out[0..8].copy_from_slice(&period.to_be_bytes());
-        out[8..16].copy_from_slice(&p_start.to_be_bytes());
-        out[16..24].copy_from_slice(&p_closed.to_be_bytes());
-        out[24..32].copy_from_slice(&now.to_be_bytes());
-        out[32..40].copy_from_slice(&j_cnt.to_be_bytes());
-        out[40..48].copy_from_slice(&actual_bank.to_be_bytes());
-        out[48..56].copy_from_slice(&flags.to_be_bytes());
-        out[56..64].copy_from_slice(&get_i64(KEY_CFO_NET).to_be_bytes());
-        out[64..72].copy_from_slice(&get_i64(KEY_CFI_NET).to_be_bytes());
-        out[72..80].copy_from_slice(&get_i64(KEY_CFF_NET).to_be_bytes());
-        out[80..88].copy_from_slice(&storage::get_u64(KEY_CFO_IN).to_be_bytes());
-        out[88..96].copy_from_slice(&storage::get_u64(KEY_CFO_OUT).to_be_bytes());
-        out[96..104].copy_from_slice(&storage::get_u64(KEY_CFI_IN).to_be_bytes());
-        out[104..112].copy_from_slice(&storage::get_u64(KEY_CFI_OUT).to_be_bytes());
-        out[112..120].copy_from_slice(&storage::get_u64(KEY_CFF_IN).to_be_bytes());
-        out[120..128].copy_from_slice(&storage::get_u64(KEY_CFF_OUT).to_be_bytes());
+        let anch_u64s = [
+            period,
+            p_start,
+            p_closed,
+            now,
+            j_cnt,
+            actual_bank,
+            flags,
+            get_i64(KEY_CFO_NET) as u64,
+            get_i64(KEY_CFI_NET) as u64,
+            get_i64(KEY_CFF_NET) as u64,
+            storage::get_u64(KEY_CFO_IN),
+            storage::get_u64(KEY_CFO_OUT),
+            storage::get_u64(KEY_CFI_IN),
+            storage::get_u64(KEY_CFI_OUT),
+            storage::get_u64(KEY_CFF_IN),
+            storage::get_u64(KEY_CFF_OUT),
+        ];
+        let mut h = 0;
+        while h < anch_u64s.len() {
+            put_u64(out, h * 8, anch_u64s[h]);
+            h += 1;
+        }
         let aux = encode_aux_counters_wire();
-        out[128..184].copy_from_slice(&aux);
-        out[184..204].copy_from_slice(&storage::get_address(KEY_CHARTER).unwrap_or([0u8; 20]));
-        out[204..224].copy_from_slice(&storage::get_address(KEY_BANK_LEDGER).unwrap_or([0u8; 20]));
-        out[224..244].copy_from_slice(&storage::get_address(KEY_TREASURY_ID).unwrap_or([0u8; 20]));
+        put_bytes(out, 128, &aux);
+        put_bytes(out, 184, &storage::get_address(KEY_CHARTER).unwrap_or([0u8; 20]));
+        put_bytes(out, 204, &storage::get_address(KEY_BANK_LEDGER).unwrap_or([0u8; 20]));
+        put_bytes(out, 224, &storage::get_address(KEY_TREASURY_ID).unwrap_or([0u8; 20]));
 
         let mut c = 0usize;
         while c < COA_COUNT {
             let base = ANCHOR_HEADER_BYTES + c * 16;
-            out[base..base + 8].copy_from_slice(&totals[c].0.to_be_bytes());
-            out[base + 8..base + 16].copy_from_slice(&totals[c].1.to_be_bytes());
+            put_u64(out, base, totals[c].0);
+            put_u64(out, base + 8, totals[c].1);
             c += 1;
         }
 
         let sched_start = ANCHOR_HEADER_BYTES + COA_COUNT * 16; // 272 + 512 = 784
         let (end_pos, counts) = pack_schedules_into_buf(out, sched_start, now);
         let mut s = 0usize;
-        while s < 6 {
-            out[244 + s * 4..248 + s * 4].copy_from_slice(&counts[s].to_be_bytes());
+        while s < 7 {
+            put_u32(out, 244 + s * 4, counts[s]);
             s += 1;
         }
         ret::write(&out[..end_pos]);
@@ -3771,5 +4176,88 @@ mod tests {
         assert_eq!(rc_close, 0);
         assert_eq!(u64::from_be_bytes(close_ret[24..32].try_into().unwrap()), 2);
         ingest_events_and_assert_parity(&mut client, &mut ev_cursor, 180);
+
+        // 7. 3-Stage Defense Service Contract (`DEF-TAC-MESH-MOD`: 180k/mo * 12m = 2,160,000, month_blocks = 32):
+        let mut def_tag = [0u8; 32];
+        def_tag[..16].copy_from_slice(b"DEF-TAC-MESH-MOD");
+        // Insider / related-party backlog rejected (`IAS 24`)!
+        let bad_svc_cd = CallEncoder::<224>::new(const {
+            selector("proposeServiceContract(address,bytes32,uint64,uint64,uint64,address)")
+        })
+        .push_address(&FOUNDER_DIR)
+        .push_bytes32(&def_tag)
+        .push_u64(180_000)
+        .push_u64(12)
+        .push_u64(32)
+        .push_address(&[0u8; 20]);
+        let (rc_bad_svc, _) = call_at(ACC, FOUNDER_DIR, 185, bad_svc_cd.as_slice());
+        assert_eq!(rc_bad_svc, ERR_IFRS_RELATED_PARTY_CREDIT_BANNED);
+
+        // Stage 1A: Board proposes Defense contract to arm's-length CUSTOMER
+        let prop_svc_cd = CallEncoder::<224>::new(const {
+            selector("proposeServiceContract(address,bytes32,uint64,uint64,uint64,address)")
+        })
+        .push_address(&CUSTOMER)
+        .push_bytes32(&def_tag)
+        .push_u64(180_000)
+        .push_u64(12)
+        .push_u64(32)
+        .push_address(&[0u8; 20]);
+        let (rc_prop_svc, prop_svc_ret) = call_at(ACC, FOUNDER_DIR, 185, prop_svc_cd.as_slice());
+        assert_eq!(rc_prop_svc, 0);
+        let svc_id = u64::from_be_bytes(prop_svc_ret[24..32].try_into().unwrap());
+        assert_eq!(svc_id, 0);
+
+        // Stage 1B: Non-client co-sign rejected; Client co-sign books +2,160,000 into 1800 Future AR!
+        let cosign_cd =
+            CallEncoder::<64>::new(const { selector("coSignServiceContract(uint64)") })
+                .push_u64(svc_id);
+        let (rc_fake_cosign, _) = call_at(ACC, FOUNDER_DIR, 185, cosign_cd.as_slice());
+        assert_eq!(rc_fake_cosign, ERR_IFRS_COUNTERPARTY_CONSENT_REQUIRED);
+        let (rc_cosign, _) = call_at(ACC, CUSTOMER, 185, cosign_cd.as_slice());
+        assert_eq!(rc_cosign, 0);
+        ingest_events_and_assert_parity(&mut client, &mut ev_cursor, 185);
+        assert_eq!(
+            client.totals[ifrs::ACC_FUTURE_CONTRACT_RECEIVABLES as usize].0
+                - client.totals[ifrs::ACC_FUTURE_CONTRACT_RECEIVABLES as usize].1,
+            2_160_000
+        );
+
+        // Stage 2: Premature billing at block 200 (< 185 + 32 = 217) rejected; billing at block 218 creates Current AR invoice!
+        let bill_cd =
+            CallEncoder::<64>::new(const { selector("billServiceContractMonth(uint64)") })
+                .push_u64(svc_id);
+        let (rc_early_bill, _) = call_at(ACC, FOUNDER_DIR, 200, bill_cd.as_slice());
+        assert_eq!(rc_early_bill, ERR_IFRS_NOTHING_TO_POST);
+        let (rc_bill, bill_ret) = call_at(ACC, FOUNDER_DIR, 218, bill_cd.as_slice());
+        assert_eq!(rc_bill, 0);
+        let inv_id = u64::from_be_bytes(bill_ret[24..32].try_into().unwrap());
+        ingest_events_and_assert_parity(&mut client, &mut ev_cursor, 218);
+        assert_eq!(
+            client.totals[ifrs::ACC_FUTURE_CONTRACT_RECEIVABLES as usize].0
+                - client.totals[ifrs::ACC_FUTURE_CONTRACT_RECEIVABLES as usize].1,
+            1_980_000
+        );
+        assert_eq!(
+            client.totals[ifrs::ACC_TRADE_RECEIVABLES as usize].0
+                - client.totals[ifrs::ACC_TRADE_RECEIVABLES as usize].1,
+            180_000
+        );
+
+        // Stage 3: Bank oracle settles 180,000 SGD into Virgin Treasury -> Current AR becomes Current Cash + CFO!
+        BANK_BALS.with(|b| *b.borrow_mut().get_mut(&TREAS).unwrap() += 180_000);
+        let settle_cd = CallEncoder::<96>::new(const {
+            selector("settleCreditInvoice(uint64,uint64)")
+        })
+        .push_u64(inv_id)
+        .push_u64(180_000);
+        let (rc_settle, _) = call_at(ACC, CUSTOMER, 222, settle_cd.as_slice());
+        assert_eq!(rc_settle, 0);
+        ingest_events_and_assert_parity(&mut client, &mut ev_cursor, 222);
+        assert_eq!(
+            client.totals[ifrs::ACC_TRADE_RECEIVABLES as usize].0
+                - client.totals[ifrs::ACC_TRADE_RECEIVABLES as usize].1,
+            0
+        );
     }
 }
