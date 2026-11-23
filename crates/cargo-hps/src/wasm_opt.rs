@@ -23,6 +23,20 @@ const ALLOWED_ENV_IMPORTS: &[&str] = &[
     "get_block_number",
     "host_emit_event",
     "host_call_contract",
+    "host_active_validators",
+    "host_vrf_verify_deal",
+    "host_vrf_verify_dispute",
+    "host_vrf_derive_epoch_keys",
+    "host_vrf_verify_share",
+    "host_vrf_lagrange_combine",
+    "host_ec_elgamal_lincomb",
+    "host_ec_dleq_verify",
+    "host_he_add_ciphertexts",
+    "host_he_scale_ciphertext",
+    "host_he_verify_zero_or_one",
+    "host_he_verify_pok",
+    "host_he_verify_decryption_share",
+    "host_he_lagrange_decrypt",
 ];
 
 #[derive(Debug, Clone)]

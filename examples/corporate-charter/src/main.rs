@@ -42,11 +42,13 @@ use hps_sdk::governance::{
     MAX_DEFINED_ROLES, MAX_ENCODED_POLICY_BYTES, MAX_MEMBERS_PER_STAGE, MAX_SHARE_CLASSES,
     POLICY_BANK_ORACLE, POLICY_BOARD_RESOLUTION, POLICY_FIRST_SHAREHOLDER_RESOLUTION,
     POLICY_PRODUCT_MANAGEMENT, POLICY_SHAREHOLDER_SUPERMAJORITY, POLICY_SHARE_ISSUANCE_AUCTION,
-    POLICY_SHARE_TRANSFER_AUCTION, POLICY_SUPER_GOVERNANCE, ROLE_BANK_ORACLE, ROLE_DIRECTOR,
-    ROLE_PRODUCT_MANAGER, ROLE_SHAREHOLDER, ROLE_TREASURY_MANAGER,
+    POLICY_SHARE_TRANSFER_AUCTION, POLICY_SUPER_GOVERNANCE, ROLE_BANK_ORACLE,
+    ROLE_CHIEF_ACCOUNTANT, ROLE_DIRECTOR, ROLE_PRODUCT_MANAGER, ROLE_SHAREHOLDER,
+    ROLE_TREASURY_MANAGER, ACTION_GRANT_AUDITOR_KEY, ACTION_ROTATE_AUDIT_KEY,
 };
 use hps_sdk::keccak::keccak256;
 use hps_sdk::storage::KeyBuilder;
+use hps_sdk::vrf::IDENTITY_POINT_BYTES;
 use hps_sdk::{context, event_topic, events, hps_entry, ret, selector, storage};
 
 const CHARTER_INITIALIZED: [u8; 32] = event_topic("CharterInitialized(address,uint64)");
@@ -69,6 +71,16 @@ const SHARE_CLASS_REGISTERED: [u8; 32] =
 const TREASURY_UPDATED: [u8; 32] = event_topic("TreasuryAccountUpdated(address,address)");
 const ACCOUNTING_LEDGER_SET: [u8; 32] =
     event_topic("AccountingLedgerPinned(address,address,address)");
+const AUDIT_EPOCH_ROTATED: [u8; 32] =
+    event_topic("AuditEpochRotated(uint64,bytes32,address)");
+const AUDIT_OFFICER_WRAPPED: [u8; 32] =
+    event_topic("AuditKeyWrappedForOfficer(uint64,address,address)");
+const AUDITOR_KEY_GRANTED: [u8; 32] =
+    event_topic("AuditorCategoryKeyGranted(uint64,bytes32,address,bytes32)");
+
+const ROLE_CEO: [u8; 32] = keccak256(b"ROLE_CEO");
+const ROLE_COO: [u8; 32] = keccak256(b"ROLE_COO");
+const ROLE_CTO: [u8; 32] = keccak256(b"ROLE_CTO");
 
 const TAG_SET_POLICY: [u8; 32] = keccak256(b"CHARTER_SET_POLICY");
 const TAG_DEACTIVATE_POLICY: [u8; 32] = keccak256(b"CHARTER_DEACTIVATE_POLICY");
@@ -90,6 +102,10 @@ const SEL_REGISTER_SHARE_CLASS: [u8; 4] =
 const SEL_SET_TREASURY: [u8; 4] = selector("setTreasuryAccount(address,address)");
 const SEL_SET_ACCOUNTING_LEDGER: [u8; 4] =
     selector("setAccountingLedger(address,address,address)");
+const SEL_ROTATE_AUDIT_EPOCH: [u8; 4] =
+    selector("initOrRotateAuditEpoch(bytes32,bytes,address)");
+const SEL_GRANT_AUDITOR_KEY: [u8; 4] =
+    selector("grantAuditorCategoryKey(uint64,bytes32,bytes32,address,bytes,address)");
 
 const KEY_INIT: &[u8] = b"chr:init";
 const KEY_STATE: &[u8] = b"chr:state";
@@ -106,6 +122,10 @@ const KEY_DIRECTORS_BLOB: &[u8] = b"chr:directors";
 const KEY_PENDING_DIRECTORS_BLOB: &[u8] = b"chr:dpend_list";
 const KEY_BOARD_EXPIRY: &[u8] = b"chr:board_exp";
 const KEY_SHARE_CLASSES_BLOB: &[u8] = b"chr:sh_classes";
+const KEY_AUDIT_EPOCH: &[u8] = b"chr:aud:ep";
+const KEY_AUD_GRANT_CNT: &[u8] = b"chr:aud:gcnt";
+const MAX_AUDIT_ENVELOPE_BYTES: usize = 256;
+const MAX_IAS24_INSIDERS: usize = 64;
 
 hps_entry! {
     "initialize(address,bytes)"                                                 => handle_initialize,
@@ -179,6 +199,17 @@ hps_entry! {
     "hashGrantRole(bytes32,address)"                                            => handle_hash_grant_role,
     "hashRevokeRole(bytes32,address)"                                           => handle_hash_revoke_role,
     "hashRegisterShareClass(address,uint64,uint64,uint64)"                      => handle_hash_register_share_class,
+    "initOrRotateAuditEpoch(bytes32,bytes,address)"                             => handle_init_or_rotate_audit_epoch,
+    "wrapAuditKeyForOfficer(uint64,address,bytes)"                              => handle_wrap_audit_key_for_officer,
+    "grantAuditorCategoryKey(uint64,bytes32,bytes32,address,bytes,address)"     => handle_grant_auditor_category_key,
+    "revokeAuditorCategoryKey(uint64,address)"                                  => handle_revoke_auditor_category_key,
+    "getAuditEpochState()"                                                      => handle_get_audit_epoch_state,
+    "getAuditPubKey(uint64)"                                                    => handle_get_audit_pubkey,
+    "getOfficerAuditEnvelope(uint64,address)"                                   => handle_get_officer_audit_envelope,
+    "getAuditorGrantsSlice(uint64,uint64)"                                      => handle_get_auditor_grants_slice,
+    "getIas24InsiderEdPubKeys()"                                                => handle_get_ias24_insider_ed_pubkeys,
+    "hashRotateAuditEpoch(bytes32,bytes)"                                       => handle_hash_rotate_audit_epoch,
+    "hashGrantAuditorCategoryKey(uint64,bytes32,bytes32,address,bytes)"         => handle_hash_grant_auditor_category_key,
 }
 
 fn addr_topic(addr: &[u8; 20]) -> [u8; 32] {
@@ -2799,6 +2830,454 @@ fn handle_hash_register_share_class(args: &CalldataReader) -> Result<(), i32> {
         conversion_numer,
         conversion_denom,
     ));
+    Ok(())
+}
+
+// ============================================================================
+// Epoch-Versioned `CompanyAuditKey`, Scoped Auditor Grants & `IAS 24` Insiders
+// ============================================================================
+
+fn audit_pk_key(epoch: u64) -> KeyBuilder<32> {
+    KeyBuilder::<32>::new().push(b"chr:aud:pk:").push_u64_be(epoch)
+}
+
+fn audit_wrap_key(epoch: u64, officer: &[u8; 20]) -> KeyBuilder<48> {
+    KeyBuilder::<48>::new()
+        .push(b"chr:aud:wr:")
+        .push_u64_be(epoch)
+        .push(officer)
+}
+
+fn audit_grant_key(idx: u64) -> KeyBuilder<32> {
+    KeyBuilder::<32>::new().push(b"chr:aud:gr:").push_u64_be(idx)
+}
+
+fn is_audit_authorized_officer(registry: &[u8; 20], candidate: &[u8; 20]) -> bool {
+    if *candidate == [0u8; 20] {
+        return false;
+    }
+    has_active_role(registry, &ROLE_DIRECTOR, candidate)
+        || has_active_role(registry, &ROLE_TREASURY_MANAGER, candidate)
+        || has_active_role(registry, &ROLE_CHIEF_ACCOUNTANT, candidate)
+}
+
+fn resolve_charter_board_or_fn_policy(sel: &[u8; 4]) -> Result<[u8; 32], i32> {
+    if let Ok(pol) = require_charter_function_auth(sel) {
+        return Ok(pol);
+    }
+    let mut buf = [0u8; MAX_ENCODED_POLICY_BYTES];
+    if resolve_policy_into(&context::self_address(), &POLICY_BOARD_RESOLUTION, &mut buf).is_some()
+        || resolve_policy_into(&[0u8; 20], &POLICY_BOARD_RESOLUTION, &mut buf).is_some()
+    {
+        return Ok(POLICY_BOARD_RESOLUTION);
+    }
+    Err(ERR_FUNCTION_AUTH_NOT_SET)
+}
+
+fn compute_rotate_audit_epoch_hash(new_audit_pk: &[u8; 32], wraps_blob: &[u8]) -> [u8; 32] {
+    ActionHasher::<160>::new(&context::self_address(), &ACTION_ROTATE_AUDIT_KEY)
+        .push_bytes32(new_audit_pk)
+        .push_bytes32(&keccak256(wraps_blob))
+        .finish()
+}
+
+fn compute_grant_auditor_key_hash(
+    epoch: u64,
+    category_id: &[u8; 32],
+    period_tag: &[u8; 32],
+    auditor_id: &[u8; 20],
+    envelope: &[u8],
+) -> [u8; 32] {
+    ActionHasher::<224>::new(&context::self_address(), &ACTION_GRANT_AUDITOR_KEY)
+        .push_u64(epoch)
+        .push_bytes32(category_id)
+        .push_bytes32(period_tag)
+        .push_address(auditor_id)
+        .push_bytes32(&keccak256(envelope))
+        .finish()
+}
+
+/// `wraps_blob` layout: `[count: u16 BE]([officerIdentity: 20][envLen: u16 BE][wrappedBytes])*`
+fn handle_init_or_rotate_audit_epoch(args: &CalldataReader) -> Result<(), i32> {
+    if storage::get_u64(KEY_INIT) != 1 {
+        return Err(-57);
+    }
+    let registry = storage::get_address(KEY_REGISTRY).ok_or(-57)?;
+    let caller = context::msg_sender();
+    require_valid_identity(&registry, &caller)?;
+
+    let new_audit_pk = args.bytes32(0).ok_or(-3)?;
+    let wraps_blob = args.dynamic_bytes(1).ok_or(-3)?;
+    let auth_obj = args.address(2).ok_or(-3)?;
+
+    if new_audit_pk == [0u8; 32] || new_audit_pk == IDENTITY_POINT_BYTES || wraps_blob.len() < 2 {
+        return Err(-59);
+    }
+
+    let cur_epoch = storage::get_u64(KEY_AUDIT_EPOCH);
+    if cur_epoch == 0 && auth_obj == [0u8; 20] {
+        // Initial Epoch 1 bootstrap allowed by Charter initializer or any active Director/CFO/Chief Accountant!
+        let init_by = storage::get_address(KEY_INITIALIZER).unwrap_or([0u8; 20]);
+        if caller != init_by && !is_audit_authorized_officer(&registry, &caller) {
+            return Err(-65);
+        }
+    } else {
+        if storage::get_u64(KEY_STATE) != CHARTER_STATE_ACTIVE {
+            return Err(ERR_CHARTER_NOT_ACTIVE);
+        }
+        let req_pol = resolve_charter_board_or_fn_policy(&SEL_ROTATE_AUDIT_EPOCH)?;
+        let ah = compute_rotate_audit_epoch_hash(&new_audit_pk, wraps_blob);
+        let me = context::self_address();
+        verify_and_consume_auth(&registry, &auth_obj, &me, &req_pol, &ah, &caller)?;
+    }
+
+    let count = u16::from_be_bytes([wraps_blob[0], wraps_blob[1]]) as usize;
+    if count == 0 || count > MAX_MEMBERS_PER_STAGE {
+        return Err(-59);
+    }
+
+    let next_epoch = cur_epoch + 1;
+    let mut pos = 2usize;
+    let mut i = 0usize;
+    while i < count {
+        if pos + 22 > wraps_blob.len() {
+            return Err(-3);
+        }
+        let mut officer = [0u8; 20];
+        officer.copy_from_slice(&wraps_blob[pos..pos + 20]);
+        let elen = u16::from_be_bytes([wraps_blob[pos + 20], wraps_blob[pos + 21]]) as usize;
+        pos += 22;
+        if elen == 0 || elen > MAX_AUDIT_ENVELOPE_BYTES || pos + elen > wraps_blob.len() {
+            return Err(-59);
+        }
+        if !is_audit_authorized_officer(&registry, &officer) {
+            let init_by = storage::get_address(KEY_INITIALIZER).unwrap_or([0u8; 20]);
+            if !(cur_epoch == 0 && officer == init_by) {
+                return Err(-65);
+            }
+        }
+        let wk = audit_wrap_key(next_epoch, &officer);
+        storage::set(wk.as_slice(), &wraps_blob[pos..pos + elen]);
+        pos += elen;
+        i += 1;
+    }
+
+    let pk_k = audit_pk_key(next_epoch);
+    storage::set(pk_k.as_slice(), &new_audit_pk);
+    storage::set_u64(KEY_AUDIT_EPOCH, next_epoch);
+
+    events::emit(
+        &[
+            AUDIT_EPOCH_ROTATED,
+            new_audit_pk,
+            addr_topic(&caller),
+        ],
+        &next_epoch.to_be_bytes(),
+    );
+    ret::write_u64_word(next_epoch);
+    Ok(())
+}
+
+fn handle_wrap_audit_key_for_officer(args: &CalldataReader) -> Result<(), i32> {
+    let (registry, caller) = ensure_initialized_and_valid_caller()?;
+    if !is_audit_authorized_officer(&registry, &caller) {
+        return Err(-65);
+    }
+    let epoch = args.u64(0).ok_or(-3)?;
+    let target_officer = args.address(1).ok_or(-3)?;
+    let env = args.dynamic_bytes(2).ok_or(-3)?;
+
+    let cur_epoch = storage::get_u64(KEY_AUDIT_EPOCH);
+    if epoch == 0
+        || epoch > cur_epoch
+        || env.is_empty()
+        || env.len() > MAX_AUDIT_ENVELOPE_BYTES
+        || !is_audit_authorized_officer(&registry, &target_officer)
+    {
+        return Err(-59);
+    }
+    let wk = audit_wrap_key(epoch, &target_officer);
+    storage::set(wk.as_slice(), env);
+    events::emit(
+        &[
+            AUDIT_OFFICER_WRAPPED,
+            addr_topic(&target_officer),
+            addr_topic(&caller),
+        ],
+        &epoch.to_be_bytes(),
+    );
+    ret::write_bool(true);
+    Ok(())
+}
+
+const FIXED_AUD_GRANT_HDR: usize = 101; // [epoch:8][cat:32][period:32][auditor:20][blk:8][revoked:1]
+
+fn handle_grant_auditor_category_key(args: &CalldataReader) -> Result<(), i32> {
+    let (registry, caller) = ensure_initialized_and_valid_caller()?;
+    let epoch = args.u64(0).ok_or(-3)?;
+    let category_id = args.bytes32(1).ok_or(-3)?;
+    let period_tag = args.bytes32(2).ok_or(-3)?;
+    let auditor_id = args.address(3).ok_or(-3)?;
+    let env = args.dynamic_bytes(4).ok_or(-3)?;
+    let auth_obj = args.address(5).ok_or(-3)?;
+
+    let cur_epoch = storage::get_u64(KEY_AUDIT_EPOCH);
+    if epoch == 0
+        || epoch > cur_epoch
+        || category_id == [0u8; 32]
+        || env.is_empty()
+        || env.len() > MAX_AUDIT_ENVELOPE_BYTES
+    {
+        return Err(-59);
+    }
+    require_valid_identity(&registry, &auditor_id)?;
+
+    let req_pol = resolve_charter_board_or_fn_policy(&SEL_GRANT_AUDITOR_KEY)?;
+    let ah = compute_grant_auditor_key_hash(epoch, &category_id, &period_tag, &auditor_id, env);
+    let me = context::self_address();
+    verify_and_consume_auth(&registry, &auth_obj, &me, &req_pol, &ah, &caller)?;
+
+    let idx = storage::get_u64(KEY_AUD_GRANT_CNT);
+    let mut rec = [0u8; FIXED_AUD_GRANT_HDR + 2 + MAX_AUDIT_ENVELOPE_BYTES];
+    rec[0..8].copy_from_slice(&epoch.to_be_bytes());
+    rec[8..40].copy_from_slice(&category_id);
+    rec[40..72].copy_from_slice(&period_tag);
+    rec[72..92].copy_from_slice(&auditor_id);
+    rec[92..100].copy_from_slice(&context::block_number().to_be_bytes());
+    rec[100] = 0; // active
+    rec[101..103].copy_from_slice(&(env.len() as u16).to_be_bytes());
+    rec[103..103 + env.len()].copy_from_slice(env);
+
+    let gk = audit_grant_key(idx);
+    storage::set(gk.as_slice(), &rec[..103 + env.len()]);
+    storage::set_u64(KEY_AUD_GRANT_CNT, idx + 1);
+
+    events::emit(
+        &[
+            AUDITOR_KEY_GRANTED,
+            category_id,
+            addr_topic(&auditor_id),
+            period_tag,
+        ],
+        &epoch.to_be_bytes(),
+    );
+    ret::write_u64_word(idx);
+    Ok(())
+}
+
+fn handle_revoke_auditor_category_key(args: &CalldataReader) -> Result<(), i32> {
+    let (registry, caller) = ensure_initialized_and_valid_caller()?;
+    let idx = args.u64(0).ok_or(-3)?;
+    let auth_obj = args.address(1).ok_or(-3)?;
+    if idx >= storage::get_u64(KEY_AUD_GRANT_CNT) {
+        return Err(-62);
+    }
+    let gk = audit_grant_key(idx);
+    let mut rec = [0u8; FIXED_AUD_GRANT_HDR + 2 + MAX_AUDIT_ENVELOPE_BYTES];
+    let n = storage::get_into(gk.as_slice(), &mut rec).ok_or(-62)?;
+    if n < FIXED_AUD_GRANT_HDR + 2 {
+        return Err(-62);
+    }
+    let req_pol = resolve_charter_board_or_fn_policy(&SEL_GRANT_AUDITOR_KEY)?;
+    let ah = ActionHasher::<96>::new(&context::self_address(), &ACTION_GRANT_AUDITOR_KEY)
+        .push_u64(idx)
+        .push_u64(1)
+        .finish();
+    let me = context::self_address();
+    verify_and_consume_auth(&registry, &auth_obj, &me, &req_pol, &ah, &caller)?;
+
+    rec[100] = 1; // revoked
+    rec[101..103].copy_from_slice(&0u16.to_be_bytes());
+    storage::set(gk.as_slice(), &rec[..103]);
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_get_audit_epoch_state(_args: &CalldataReader) -> Result<(), i32> {
+    let ep = storage::get_u64(KEY_AUDIT_EPOCH);
+    let gcnt = storage::get_u64(KEY_AUD_GRANT_CNT);
+    let mut out = [0u8; 48];
+    out[0..8].copy_from_slice(&ep.to_be_bytes());
+    if ep > 0 {
+        let pk_k = audit_pk_key(ep);
+        if let Some(pk) = storage::get_bytes32(pk_k.as_slice()) {
+            out[8..40].copy_from_slice(&pk);
+        }
+    }
+    out[40..48].copy_from_slice(&gcnt.to_be_bytes());
+    ret::write(&out);
+    Ok(())
+}
+
+fn handle_get_audit_pubkey(args: &CalldataReader) -> Result<(), i32> {
+    let ep = args.u64(0).ok_or(-3)?;
+    let pk = if ep > 0 {
+        let pk_k = audit_pk_key(ep);
+        storage::get_bytes32(pk_k.as_slice()).unwrap_or([0u8; 32])
+    } else {
+        [0u8; 32]
+    };
+    ret::write(&pk);
+    Ok(())
+}
+
+fn handle_get_officer_audit_envelope(args: &CalldataReader) -> Result<(), i32> {
+    let ep = args.u64(0).ok_or(-3)?;
+    let officer = args.address(1).ok_or(-3)?;
+    let wk = audit_wrap_key(ep, &officer);
+    let mut buf = [0u8; MAX_AUDIT_ENVELOPE_BYTES];
+    let n = storage::get_into(wk.as_slice(), &mut buf).unwrap_or(0);
+    ret::write(&buf[..n]);
+    Ok(())
+}
+
+fn handle_get_auditor_grants_slice(args: &CalldataReader) -> Result<(), i32> {
+    let offset = args.u64(0).ok_or(-3)?;
+    let limit = args.u64(1).ok_or(-3)?.min(20);
+    let total = storage::get_u64(KEY_AUD_GRANT_CNT);
+    let end = offset.saturating_add(limit).min(total);
+
+    const CAP: usize = 16 + 20 * (10 + FIXED_AUD_GRANT_HDR + 2 + MAX_AUDIT_ENVELOPE_BYTES);
+    let mut out = [0u8; CAP];
+    out[0..8].copy_from_slice(&total.to_be_bytes());
+    let mut pos = 16usize;
+    let mut returned = 0u64;
+    let mut cur = offset;
+    while cur < end {
+        let gk = audit_grant_key(cur);
+        let mut rec = [0u8; FIXED_AUD_GRANT_HDR + 2 + MAX_AUDIT_ENVELOPE_BYTES];
+        if let Some(n) = storage::get_into(gk.as_slice(), &mut rec) {
+            if n >= FIXED_AUD_GRANT_HDR + 2 && pos + 10 + n <= CAP {
+                out[pos..pos + 8].copy_from_slice(&cur.to_be_bytes());
+                out[pos + 8..pos + 10].copy_from_slice(&(n as u16).to_be_bytes());
+                out[pos + 10..pos + 10 + n].copy_from_slice(&rec[..n]);
+                pos += 10 + n;
+                returned += 1;
+            }
+        }
+        cur += 1;
+    }
+    out[8..16].copy_from_slice(&returned.to_be_bytes());
+    ret::write(&out[..pos]);
+    Ok(())
+}
+
+fn push_unique_insider(
+    list: &mut [[u8; 20]; MAX_IAS24_INSIDERS],
+    count: &mut usize,
+    addr: &[u8; 20],
+) {
+    if *addr == [0u8; 20] || *count >= MAX_IAS24_INSIDERS {
+        return;
+    }
+    let mut i = 0usize;
+    while i < *count {
+        if list[i] == *addr {
+            return;
+        }
+        i += 1;
+    }
+    list[*count] = *addr;
+    *count += 1;
+}
+
+/// Enumerates all unique `IAS 24` Related-Party Insiders of this `CorporateCharter`
+/// (`treasuryAccount`, active `Directors`, `CEO`/`COO`/`CTO`/`TREASURY_MANAGER`/`CHIEF_ACCOUNTANT`/`PRODUCT_MANAGER`,
+/// and significant shareholders holding `>= 5%` of total converted common shares) together with their
+/// registered `Identity.ed25519PubKey()` (`[count: u16 BE]([addr: 20][edPub32: 32])*`).
+fn handle_get_ias24_insider_ed_pubkeys(_args: &CalldataReader) -> Result<(), i32> {
+    let mut insiders = [[0u8; 20]; MAX_IAS24_INSIDERS];
+    let mut count = 0usize;
+
+    if let Some(treas) = storage::get_address(KEY_TREASURY) {
+        push_unique_insider(&mut insiders, &mut count, &treas);
+    }
+    let mut dirs = [[0u8; 20]; MAX_MEMBERS_PER_STAGE];
+    let d_cnt = load_directors(&mut dirs);
+    let mut d = 0usize;
+    while d < d_cnt {
+        push_unique_insider(&mut insiders, &mut count, &dirs[d]);
+        d += 1;
+    }
+
+    let kmp_roles = [
+        ROLE_CEO,
+        ROLE_COO,
+        ROLE_CTO,
+        ROLE_TREASURY_MANAGER,
+        ROLE_CHIEF_ACCOUNTANT,
+        ROLE_PRODUCT_MANAGER,
+    ];
+    let mut r = 0usize;
+    while r < kmp_roles.len() {
+        let mut mems = [[0u8; 20]; MAX_MEMBERS_PER_STAGE];
+        let m_cnt = load_role_members(&kmp_roles[r], &mut mems);
+        let mut m = 0usize;
+        while m < m_cnt {
+            push_unique_insider(&mut insiders, &mut count, &mems[m]);
+            m += 1;
+        }
+        r += 1;
+    }
+
+    let mut classes = [ShareClassSpec::empty(); MAX_SHARE_CLASSES];
+    let sc_cnt = load_share_classes(&mut classes);
+    let mut c = 0usize;
+    while c < sc_cnt {
+        let led = &classes[c].ledger;
+        let hc_cd = CallEncoder::<16>::new(const { selector("registeredHolderCount()") });
+        let h_cnt = call::call_u64(led, hc_cd.as_slice()).unwrap_or(0).min(64);
+        let mut h = 0u64;
+        while h < h_cnt {
+            let ha_cd =
+                CallEncoder::<64>::new(const { selector("registeredHolderAt(uint64)") }).push_u64(h);
+            if let Ok(raw) = call::call_raw(led, ha_cd.as_slice()) {
+                if raw.len() >= 32 {
+                    let mut holder = [0u8; 20];
+                    holder.copy_from_slice(&raw[12..32]);
+                    let (h_com, tot_com) = compute_converted_common_totals(&holder);
+                    if tot_com > 0 && (h_com as u128) * 20 >= (tot_com as u128) {
+                        push_unique_insider(&mut insiders, &mut count, &holder);
+                    }
+                }
+            }
+            h += 1;
+        }
+        c += 1;
+    }
+
+    let mut out = [0u8; 2 + MAX_IAS24_INSIDERS * 52];
+    out[0..2].copy_from_slice(&(count as u16).to_be_bytes());
+    let ed_cd = CallEncoder::<16>::new(const { selector("ed25519PubKey()") });
+    let mut idx = 0usize;
+    while idx < count {
+        let off = 2 + idx * 52;
+        out[off..off + 20].copy_from_slice(&insiders[idx]);
+        if let Ok(raw) = call::call_raw(&insiders[idx], ed_cd.as_slice()) {
+            if raw.len() == 32 {
+                out[off + 20..off + 52].copy_from_slice(raw);
+            }
+        }
+        idx += 1;
+    }
+    ret::write(&out[..2 + count * 52]);
+    Ok(())
+}
+
+fn handle_hash_rotate_audit_epoch(args: &CalldataReader) -> Result<(), i32> {
+    let pk = args.bytes32(0).ok_or(-3)?;
+    let wraps = args.dynamic_bytes(1).ok_or(-3)?;
+    ret::write_word(&compute_rotate_audit_epoch_hash(&pk, wraps));
+    Ok(())
+}
+
+fn handle_hash_grant_auditor_category_key(args: &CalldataReader) -> Result<(), i32> {
+    let ep = args.u64(0).ok_or(-3)?;
+    let cat = args.bytes32(1).ok_or(-3)?;
+    let per = args.bytes32(2).ok_or(-3)?;
+    let aud = args.address(3).ok_or(-3)?;
+    let env = args.dynamic_bytes(4).ok_or(-3)?;
+    ret::write_word(&compute_grant_auditor_key_hash(ep, &cat, &per, &aud, env));
     Ok(())
 }
 

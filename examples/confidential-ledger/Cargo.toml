@@ -1,0 +1,13 @@
+[package]
+name = "confidential-ledger"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Confidential Category Roll-Up & Shielded Settlement Haltproof Subroutine (HPS) paired with AccountingLedger"
+
+[[bin]]
+name = "confidential_ledger"
+path = "src/main.rs"
+
+[dependencies]
+hps-sdk = { path = "../../crates/hps-sdk" }

@@ -137,6 +137,20 @@ pub const ERR_IFRS_COUNTERPARTY_CONSENT_REQUIRED: i32 = -136;
 pub const ERR_IFRS_NOTHING_TO_POST: i32 = -137;
 pub const ERR_IFRS_SUBLEDGER_NOT_FOUND: i32 = -138;
 pub const ERR_IFRS_SUBLEDGER_FULL: i32 = -139;
+pub const ERR_IFRS_CONF_PROOF_INVALID: i32 = -140;
+pub const ERR_IFRS_CONF_PADDING_TOO_SMALL: i32 = -141;
+pub const ERR_IFRS_CONF_AUDIT_KEY_UNSET: i32 = -142;
+pub const ERR_IFRS_CONF_CATEGORY_INVALID: i32 = -143;
+
+/// Canonical Confidential Category families (`AccountingLedger`).
+pub const CONF_CAT_PAYROLL: u8 = 1;
+pub const CONF_CAT_DEFENSE_B2B: u8 = 2;
+pub const CONF_CAT_TRADE_AR: u8 = 3;
+pub const CONF_CAT_VENDOR_OPEX: u8 = 4;
+
+/// Confidential Category Roll-Up timing modes.
+pub const CONF_MODE_BATCH_OR_EPOCH: u8 = 1;
+pub const CONF_MODE_LIVE_COUNTERPARTY_SHIELDED: u8 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -539,6 +553,43 @@ pub fn derive_service_contract_billing(monthly_amount: u64) -> Result<BalancedBa
         JournalLine::cr(ACC_REVENUE_ARMS_LENGTH, monthly_amount),
     ];
     BalancedBatch::build(&raw, STD_IFRS15_REVENUE, CashFlowClass::None)
+}
+
+/// Confidential Category Roll-Up of one or more `IAS 24`-non-insider verified B2B / Defense contracts
+/// (`Dr 1800 Future Contract Receivables / Cr 2300 Contract Liabilities` for `rollup_backlog_total`).
+pub fn derive_confidential_backlog_rollup(rollup_backlog_total: u64) -> Result<BalancedBatch, i32> {
+    if rollup_backlog_total == 0 {
+        return Err(ERR_IFRS_ZERO_OR_OVERFLOW);
+    }
+    let raw = [
+        JournalLine::dr(ACC_FUTURE_CONTRACT_RECEIVABLES, rollup_backlog_total),
+        JournalLine::cr(ACC_CONTRACT_LIABILITIES, rollup_backlog_total),
+    ];
+    BalancedBatch::build(&raw, STD_IFRS15_REVENUE, CashFlowClass::None)
+}
+
+/// Confidential Category Roll-Up of arm's-length Trade AR invoices (`Dr 1100 Trade Receivables / Cr 4000 Revenue`).
+pub fn derive_confidential_trade_ar_rollup(rollup_ar_total: u64) -> Result<BalancedBatch, i32> {
+    if rollup_ar_total == 0 {
+        return Err(ERR_IFRS_ZERO_OR_OVERFLOW);
+    }
+    let raw = [
+        JournalLine::dr(ACC_TRADE_RECEIVABLES, rollup_ar_total),
+        JournalLine::cr(ACC_REVENUE_ARMS_LENGTH, rollup_ar_total),
+    ];
+    BalancedBatch::build(&raw, STD_IFRS15_REVENUE, CashFlowClass::None)
+}
+
+/// Lump-sum cash sweep from `AssetLedger` Shielded Pool into `1010 Cash` settling confidential `1100 Trade Receivables`.
+pub fn derive_confidential_ar_cash_sweep(sweep_amount: u64) -> Result<BalancedBatch, i32> {
+    if sweep_amount == 0 {
+        return Err(ERR_IFRS_ZERO_OR_OVERFLOW);
+    }
+    let raw = [
+        JournalLine::dr(ACC_CASH, sweep_amount),
+        JournalLine::cr(ACC_TRADE_RECEIVABLES, sweep_amount),
+    ];
+    BalancedBatch::build(&raw, STD_IFRS9_INSTRUMENTS, CashFlowClass::Operating)
 }
 
 /// Inventory procurement (`IAS 2` Moving WAC — `Dr 1200 Inventory / Cr 1010 Cash | 2010 AP`).

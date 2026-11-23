@@ -14,6 +14,7 @@ members = [
     "examples/asset-pair-otc",
     "examples/product-ledger",
     "examples/accounting-ledger",
+    "examples/confidential-ledger",
     "examples/dex-clob",
     "examples/battleship",
     "examples/social-charter",

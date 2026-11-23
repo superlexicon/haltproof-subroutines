@@ -35,12 +35,12 @@ use hps_sdk::governance::{
     CAP_MERCHANT_PAYMENT, ERR_AUTH_CONSUME_FAILED, ERR_CHARTER_MISMATCH, ERR_INVALID_PRODUCT_PARAMS,
     ERR_MISSING_ROLE, ERR_UNAUTHORIZED_MODULE, HFS_TYPE_PRODUCT_LEDGER, HFS_TYPE_SHARE_CAPITAL,
     POLICY_ACCOUNTING_OPS, POLICY_BOARD_RESOLUTION, ROLE_CHIEF_ACCOUNTANT, ROLE_PRODUCT_MANAGER,
-    ROLE_TREASURY_MANAGER,
+    ROLE_TREASURY_MANAGER, ACTION_CONFIDENTIAL_BATCH, CAP_CONFIDENTIAL_LEDGER, HFS_TYPE_CONF_LEDGER,
 };
 use hps_sdk::ifrs::{
     self, AccrualProjection, BalancedBatch, CashFlowClass, Side, ACC_ALLOWANCE_ECL, ACC_CASH,
     ACC_CASH_SUSPENSE, ACC_TAX_PAYABLE, ACC_TRADE_PAYABLES, ACC_ACCRUED_PAYROLL, COA_COUNT,
-    ERR_IFRS_BANK_CASH_SHORTFALL, ERR_IFRS_COUNTERPARTY_CONSENT_REQUIRED,
+    ERR_IFRS_BANK_CASH_SHORTFALL, ERR_IFRS_CONF_PROOF_INVALID, ERR_IFRS_COUNTERPARTY_CONSENT_REQUIRED,
     ERR_IFRS_CUSTODY_OWNER_MISMATCH, ERR_IFRS_NOTHING_TO_POST, ERR_IFRS_SUBLEDGER_FULL,
     ERR_IFRS_SUBLEDGER_NOT_FOUND, ERR_IFRS_ZERO_OR_OVERFLOW, OPEX_GENERAL_ADMIN, OPEX_RND,
     OPEX_SALES_MARKETING,
@@ -73,6 +73,7 @@ const KEY_HFS_REGISTRY: &[u8] = b"ifrs:hfsreg";
 const KEY_CHARTER: &[u8] = b"ifrs:chr";
 const KEY_BANK_LEDGER: &[u8] = b"ifrs:bank";
 const KEY_TREASURY_ID: &[u8] = b"ifrs:treas";
+const KEY_CONF_LEDGER: &[u8] = b"ifrs:conf_led";
 const KEY_INITIALIZER: &[u8] = b"ifrs:init_by";
 const KEY_VIRGIN_CUSTODY: &[u8] = b"ifrs:virgin";
 
@@ -235,6 +236,12 @@ hps_entry! {
     "getSale(uint64)"                                                                   => handle_get_sale,
     "productSalesOf(bytes32)"                                                           => handle_product_sales_of,
     "buyerPurchasesOf(address)"                                                         => handle_buyer_purchases_of,
+    // Composable ConfidentialLedger (`HFS_TYPE_CONF_LEDGER`) Sibling Hooks
+    "setConfidentialLedger(address,address)"                                            => handle_set_confidential_ledger,
+    "confidentialLedger()"                                                              => handle_confidential_ledger,
+    "bookConfidentialRollupFromModule(uint64,uint64,bool)"                              => handle_book_conf_rollup_from_module,
+    "fundShieldedBatchFromModule(bytes32,uint64,bytes32,bytes,bytes)"                   => handle_fund_shielded_batch_from_module,
+    "isVerifiedShieldedBatch(bytes32,address,uint64,bytes32)"                           => handle_is_verified_shielded_batch,
 }
 
 // ============================================================================
@@ -3464,6 +3471,187 @@ fn handle_buyer_purchases_of(args: &CalldataReader) -> Result<(), i32> {
     out[24..32].copy_from_slice(&u.to_be_bytes());
     out[56..64].copy_from_slice(&s.to_be_bytes());
     ret::write(&out);
+    Ok(())
+}
+
+// ============================================================================
+// Composable `ConfidentialLedger` (`HFS_TYPE_CONF_LEDGER`) Sibling Bridge
+// ============================================================================
+
+const SEL_SET_CONF_LED: [u8; 4] = selector("setConfidentialLedger(address,address)");
+
+fn vshd_stamp_key(batch_tag: &[u8; 32]) -> KeyBuilder<48> {
+    KeyBuilder::<48>::new().push(b"ifrs:vshd:").push(batch_tag)
+}
+
+fn handle_set_confidential_ledger(args: &CalldataReader) -> Result<(), i32> {
+    let conf_led = args.address(0).ok_or(-3)?;
+    let auth_obj = args.address(1).ok_or(-3)?;
+    if conf_led == [0u8; 20] {
+        return Err(-3);
+    }
+    let ah = ActionHasher::<128>::new(&context::self_address(), &ACTION_CONFIDENTIAL_BATCH)
+        .push_address(&conf_led)
+        .finish();
+    let _ = require_accounting_ops_auth(&SEL_SET_CONF_LED, &ah, &auth_obj)?;
+    let hfs_reg = storage::get_address(KEY_HFS_REGISTRY).unwrap_or([0u8; 20]);
+    if hfs_reg != [0u8; 20] {
+        require_approved_hfs_code_hash(&hfs_reg, &HFS_TYPE_CONF_LEDGER, &conf_led)?;
+    }
+    storage::set_address(KEY_CONF_LEDGER, &conf_led);
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_confidential_ledger(_args: &CalldataReader) -> Result<(), i32> {
+    ret::write_address(&storage::get_address(KEY_CONF_LEDGER).unwrap_or([0u8; 20]));
+    Ok(())
+}
+
+fn handle_book_conf_rollup_from_module(args: &CalldataReader) -> Result<(), i32> {
+    let _ = require_verified_sibling_module(&HFS_TYPE_CONF_LEDGER, &CAP_CONFIDENTIAL_LEDGER)?;
+    let rollup_kind = args.u64(0).ok_or(-3)?;
+    let total_amount = args.u64(1).ok_or(-3)?;
+    let is_paid_or_cash = args.bool(2).ok_or(-3)?;
+
+    let mut totals = load_coa_totals();
+    let (batch, memo): (BalancedBatch, [u8; 4]) = match rollup_kind {
+        1 => (ifrs::derive_payroll_run(total_amount, is_paid_or_cash)?, *b"CPAY"),
+        2 => {
+            if totals[ACC_ACCRUED_PAYROLL as usize]
+                .1
+                .saturating_sub(totals[ACC_ACCRUED_PAYROLL as usize].0)
+                < total_amount
+            {
+                return Err(ERR_IFRS_ZERO_OR_OVERFLOW);
+            }
+            (ifrs::derive_accrued_payroll_settlement(total_amount)?, *b"CSET")
+        }
+        3 => (
+            ifrs::derive_operating_expense(OPEX_RND, total_amount, is_paid_or_cash)?,
+            *b"COPX",
+        ),
+        4 => {
+            if totals[ACC_TRADE_PAYABLES as usize]
+                .1
+                .saturating_sub(totals[ACC_TRADE_PAYABLES as usize].0)
+                < total_amount
+            {
+                return Err(ERR_IFRS_ZERO_OR_OVERFLOW);
+            }
+            (ifrs::derive_payable_settlement(total_amount)?, *b"CSET")
+        }
+        5 => (ifrs::derive_confidential_backlog_rollup(total_amount)?, *b"CEPK"),
+        6 => (ifrs::derive_confidential_backlog_rollup(total_amount)?, *b"CSVC"),
+        7 => (ifrs::derive_service_contract_billing(total_amount)?, *b"CBIL"),
+        8 => (ifrs::derive_confidential_trade_ar_rollup(total_amount)?, *b"CAR "),
+        9 => {
+            let open_ar = totals[ifrs::ACC_TRADE_RECEIVABLES as usize]
+                .0
+                .saturating_sub(totals[ifrs::ACC_TRADE_RECEIVABLES as usize].1);
+            if open_ar < total_amount {
+                return Err(ERR_IFRS_ZERO_OR_OVERFLOW);
+            }
+            require_inbound_bank_cash(&totals, total_amount)?;
+            (ifrs::derive_confidential_ar_cash_sweep(total_amount)?, *b"CSWP")
+        }
+        _ => return Err(-3),
+    };
+
+    let j_id = commit_batch(&mut totals, &batch, &[0u8; 20], &memo)?;
+    ret::write_u64_word(j_id);
+    Ok(())
+}
+
+fn handle_fund_shielded_batch_from_module(args: &CalldataReader) -> Result<(), i32> {
+    let _ = require_verified_sibling_module(&HFS_TYPE_CONF_LEDGER, &CAP_CONFIDENTIAL_LEDGER)?;
+    let batch_tag32 = args.bytes32(0).ok_or(-3)?;
+    let total_amount = args.u64(1).ok_or(-3)?;
+    let audit_pk = args.bytes32(2).ok_or(-3)?;
+    let sum_dleq_slice = args.dynamic_bytes(3).ok_or(-3)?;
+    let packed_notes = args.dynamic_bytes(4).ok_or(-3)?;
+
+    if total_amount == 0 || sum_dleq_slice.len() != 64 || packed_notes.len() > 3600 {
+        return Err(ERR_IFRS_CONF_PROOF_INVALID);
+    }
+    let totals = load_coa_totals();
+    if booked_cash_u64(&totals) < total_amount {
+        return Err(ERR_IFRS_BANK_CASH_SHORTFALL);
+    }
+    let treas = storage::get_address(KEY_TREASURY_ID).ok_or(-10)?;
+    let bank = storage::get_address(KEY_BANK_LEDGER).ok_or(-10)?;
+    let me = context::self_address();
+
+    let notes_hash = keccak256(packed_notes);
+    let mut stamp = [0u8; 60];
+    stamp[0..20].copy_from_slice(&treas);
+    stamp[20..28].copy_from_slice(&total_amount.to_be_bytes());
+    stamp[28..60].copy_from_slice(&notes_hash);
+    let sk = vshd_stamp_key(&batch_tag32);
+    storage::set(sk.as_slice(), &stamp);
+
+    let pn_pad = (32 - (packed_notes.len() % 32)) % 32;
+    let inner_len = 4 + 192 + 96 + 32 + packed_notes.len() + pn_pad;
+    let in_pad = (32 - (inner_len % 32)) % 32;
+    let outer_len = 4 + 64 + 32 + inner_len + in_pad;
+
+    let res = unsafe {
+        let buf = &mut *core::ptr::addr_of_mut!(SNAP_BUF);
+        // Build inner at `buf[8192 .. 8192 + inner_len]` and outer at `buf[0 .. outer_len]`
+        for b in &mut buf[0..outer_len] {
+            *b = 0;
+        }
+        for b in &mut buf[8192..8192 + inner_len] {
+            *b = 0;
+        }
+        let inner = &mut buf[8192..8192 + inner_len];
+        inner[0..4].copy_from_slice(&selector(
+            "fundVerifiedShieldedBatch(bytes32,uint64,bytes32,bytes,bytes,address)",
+        ));
+        inner[4..36].copy_from_slice(&batch_tag32);
+        inner[60..68].copy_from_slice(&total_amount.to_be_bytes());
+        inner[68..100].copy_from_slice(&audit_pk);
+        inner[124..132].copy_from_slice(&192u64.to_be_bytes());
+        inner[156..164].copy_from_slice(&288u64.to_be_bytes());
+        inner[176..196].copy_from_slice(&me);
+        inner[220..228].copy_from_slice(&64u64.to_be_bytes());
+        inner[228..292].copy_from_slice(sum_dleq_slice);
+        inner[316..324].copy_from_slice(&(packed_notes.len() as u64).to_be_bytes());
+        inner[324..324 + packed_notes.len()].copy_from_slice(packed_notes);
+
+        buf[0..4].copy_from_slice(&selector("execute(address,bytes)"));
+        buf[16..36].copy_from_slice(&bank);
+        buf[60..68].copy_from_slice(&64u64.to_be_bytes());
+        buf[92..100].copy_from_slice(&(inner_len as u64).to_be_bytes());
+        let (left, right) = buf.split_at_mut(8192);
+        left[100..100 + inner_len].copy_from_slice(&right[..inner_len]);
+        call::call_raw(&treas, &buf[..outer_len])
+    };
+    storage::set(sk.as_slice(), &[]);
+    let raw = res?;
+    if raw.len() < 32 {
+        return Err(ERR_IFRS_BANK_CASH_SHORTFALL);
+    }
+    ret::write_u64_word(read_u64_be(raw, 24));
+    Ok(())
+}
+
+fn handle_is_verified_shielded_batch(args: &CalldataReader) -> Result<(), i32> {
+    let batch_tag = args.bytes32(0).ok_or(-3)?;
+    let payer = args.address(1).ok_or(-3)?;
+    let total_amount = args.u64(2).ok_or(-3)?;
+    let notes_hash = args.bytes32(3).ok_or(-3)?;
+
+    let sk = vshd_stamp_key(&batch_tag);
+    let mut stamp = [0u8; 60];
+    let ok = if storage::get_into(sk.as_slice(), &mut stamp) == Some(60) {
+        stamp[0..20] == payer
+            && read_u64_be(&stamp, 20) == total_amount
+            && stamp[28..60] == notes_hash
+    } else {
+        false
+    };
+    ret::write_bool(ok);
     Ok(())
 }
 

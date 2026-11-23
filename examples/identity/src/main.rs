@@ -27,6 +27,8 @@ const HFS_ASSOC_NOTIFIED: [u8; 32] =
     event_topic("HfsAssociationNotified(address,bytes32,address)");
 const DELEGATED_HFS_ASSOC_UPDATED: [u8; 32] =
     event_topic("DelegatedHfsAssociationUpdated(address,address,bytes32,uint64)");
+const ENCRYPTION_KEYS_UPDATED: [u8; 32] =
+    event_topic("EncryptionKeysUpdated(address,bytes32)");
 
 /// Validity states for subroutines in this Identity's Associated HFS Register:
 /// - `0` (`UNLISTED`): Not recorded in this Identity's register.
@@ -38,7 +40,7 @@ pub const HFS_STATUS_PENDING: u8 = 1;
 pub const HFS_STATUS_WHITELISTED: u8 = 2;
 pub const HFS_STATUS_SPAM: u8 = 3;
 
-pub const IDENTITY_ABI_VERSION: u64 = 2;
+pub const IDENTITY_ABI_VERSION: u64 = 3;
 const MAX_HFS_LABEL_LEN: usize = 64;
 const FIXED_HFS_REC_HDR: usize = 83; // [status:1][addr:20][type_id:32][blk:8][actor:20][lbl_len:2]
 const MAX_HFS_REC_BYTES: usize = FIXED_HFS_REC_HDR + MAX_HFS_LABEL_LEN;
@@ -52,13 +54,18 @@ const KEY_OWNER: &[u8] = b"id:owner";
 const KEY_HANDLE: &[u8] = b"id:handle";
 const KEY_NICKNAME: &[u8] = b"id:nick";
 const KEY_HFS_COUNT: &[u8] = b"id:hfs:cnt";
+const KEY_SECP_PUB64: &[u8] = b"id:enc:secp64";
+const KEY_ED_PUB32: &[u8] = b"id:enc:ed32";
 
 hps_entry! {
     "initialize(address,string)"                                                      => handle_initialize,
     "initializeWithNickname(address,string,string)"                                   => handle_initialize_with_nickname,
+    "initializeWithKeys(address,string,string,bytes,bytes32)"                         => handle_initialize_with_keys,
+    "setEncryptionKeys(bytes,bytes32)"                                                => handle_set_encryption_keys,
     "setNickname(string)"                                                             => handle_set_nickname,
     "setDelegate(address,bool)"                                                       => handle_set_delegate,
     "transferOwnership(address)"                                                      => handle_transfer_ownership,
+    "transferOwnershipWithKeys(address,bytes,bytes32)"                                => handle_transfer_ownership_with_keys,
     "execute(address,bytes)"                                                          => handle_execute,
     "initCharterAuth(address,address,address,address,bytes32,bytes32)"                => handle_init_constitution_auth,
     "initConstitutionAuth(address,address,address,address,bytes32,bytes32)"           => handle_init_constitution_auth,
@@ -125,6 +132,9 @@ hps_entry! {
     "handle()"                                                                        => handle_handle,
     "nickname()"                                                                      => handle_nickname,
     "balanceIn(address)"                                                              => handle_balance_in,
+    "encryptionKeys()"                                                                => handle_encryption_keys,
+    "secp256k1PubKey()"                                                               => handle_secp256k1_pubkey,
+    "ed25519PubKey()"                                                                 => handle_ed25519_pubkey,
 }
 
 fn addr_topic(addr: &[u8; 20]) -> [u8; 32] {
@@ -415,6 +425,67 @@ fn handle_initialize_with_nickname(args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
+fn store_validated_encryption_keys(
+    owner: &[u8; 20],
+    secp_pub64: &[u8],
+    ed_pub32: &[u8; 32],
+) -> Result<(), i32> {
+    if secp_pub64.len() != 64
+        || secp_pub64.iter().all(|&b| b == 0)
+        || *ed_pub32 == [0u8; 32]
+        || *ed_pub32 == hps_sdk::vrf::IDENTITY_POINT_BYTES
+    {
+        return Err(-23);
+    }
+    storage::set(KEY_SECP_PUB64, secp_pub64);
+    storage::set(KEY_ED_PUB32, ed_pub32);
+    events::emit(
+        &[ENCRYPTION_KEYS_UPDATED, addr_topic(owner), *ed_pub32],
+        secp_pub64,
+    );
+    Ok(())
+}
+
+fn handle_initialize_with_keys(args: &CalldataReader) -> Result<(), i32> {
+    if storage::get_u64(KEY_INIT) == 1 {
+        return Err(-21);
+    }
+    let owner = args.address(0).ok_or(-3)?;
+    let handle_str = args.dynamic_bytes(1).ok_or(-3)?;
+    let nick_str = args.dynamic_bytes(2).ok_or(-3)?;
+    let secp_pub64 = args.dynamic_bytes(3).ok_or(-3)?;
+    let ed_pub32 = args.bytes32(4).ok_or(-3)?;
+    if owner == [0u8; 20]
+        || handle_str.is_empty()
+        || handle_str.len() > 64
+        || nick_str.is_empty()
+        || nick_str.len() > 32
+    {
+        return Err(-23);
+    }
+    store_validated_encryption_keys(&owner, secp_pub64, &ed_pub32)?;
+
+    storage::set_address(KEY_OWNER, &owner);
+    storage::set(KEY_HANDLE, handle_str);
+    storage::set(KEY_NICKNAME, nick_str);
+    storage::set_u64(KEY_INIT, 1);
+
+    events::emit(&[IDENTITY_INITIALIZED, addr_topic(&owner)], handle_str);
+    events::emit(&[NICKNAME_UPDATED, addr_topic(&owner)], nick_str);
+    Ok(())
+}
+
+fn handle_set_encryption_keys(args: &CalldataReader) -> Result<(), i32> {
+    let caller = context::msg_sender();
+    check_owner(&caller)?;
+    let secp_pub64 = args.dynamic_bytes(0).ok_or(-3)?;
+    let ed_pub32 = args.bytes32(1).ok_or(-3)?;
+    let owner = storage::get_address(KEY_OWNER).unwrap_or([0u8; 20]);
+    store_validated_encryption_keys(&owner, secp_pub64, &ed_pub32)?;
+    ret::write_bool(true);
+    Ok(())
+}
+
 fn handle_set_nickname(args: &CalldataReader) -> Result<(), i32> {
     require_authorized()?;
     let nick_str = args.dynamic_bytes(0).ok_or(-3)?;
@@ -456,6 +527,25 @@ fn handle_transfer_ownership(args: &CalldataReader) -> Result<(), i32> {
     if new_owner == [0u8; 20] {
         return Err(-23);
     }
+    storage::set_address(KEY_OWNER, &new_owner);
+    // Clear previous owner's encryption keys unless explicitly rotated via `transferOwnershipWithKeys`.
+    storage::set(KEY_SECP_PUB64, &[0u8; 64]);
+    storage::set(KEY_ED_PUB32, &[0u8; 32]);
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_transfer_ownership_with_keys(args: &CalldataReader) -> Result<(), i32> {
+    let caller = context::msg_sender();
+    check_owner(&caller)?;
+
+    let new_owner = args.address(0).ok_or(-3)?;
+    let secp_pub64 = args.dynamic_bytes(1).ok_or(-3)?;
+    let ed_pub32 = args.bytes32(2).ok_or(-3)?;
+    if new_owner == [0u8; 20] {
+        return Err(-23);
+    }
+    store_validated_encryption_keys(&new_owner, secp_pub64, &ed_pub32)?;
     storage::set_address(KEY_OWNER, &new_owner);
     ret::write_bool(true);
     Ok(())
@@ -1598,6 +1688,32 @@ fn handle_balance_in(args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
+fn handle_encryption_keys(_args: &CalldataReader) -> Result<(), i32> {
+    let mut out = [0u8; 96];
+    let mut secp = [0u8; 64];
+    if storage::get_into(KEY_SECP_PUB64, &mut secp) == Some(64) {
+        out[0..64].copy_from_slice(&secp);
+    }
+    if let Some(ed) = storage::get_bytes32(KEY_ED_PUB32) {
+        out[64..96].copy_from_slice(&ed);
+    }
+    ret::write(&out);
+    Ok(())
+}
+
+fn handle_secp256k1_pubkey(_args: &CalldataReader) -> Result<(), i32> {
+    let mut secp = [0u8; 64];
+    let _ = storage::get_into(KEY_SECP_PUB64, &mut secp);
+    ret::write(&secp);
+    Ok(())
+}
+
+fn handle_ed25519_pubkey(_args: &CalldataReader) -> Result<(), i32> {
+    let ed = storage::get_bytes32(KEY_ED_PUB32).unwrap_or([0u8; 32]);
+    ret::write(&ed);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1828,5 +1944,78 @@ mod tests {
         assert_eq!(total, 3);
         assert_eq!(returned, 3);
         assert_eq!(raw[16 + 8], HFS_STATUS_WHITELISTED); // invited_charter promoted to 2!
+    }
+
+    #[test]
+    fn v3_encryption_keys_registration_and_ownership_rotation_clear() {
+        mock::reset();
+        let owner_a = [0x61u8; 20];
+        let owner_b = [0x62u8; 20];
+        let stranger = [0x99u8; 20];
+        let id_hps = [0x71u8; 20];
+        mock::register_hps_with_code_hash(id_hps, [0xd1; 32], dispatch_calldata);
+
+        let secp_a = [0x44u8; 64];
+        let (_sk_a, ed_a) = hps_sdk::vrf::mock_crypto::derive_ed25519_keypair(&[0x12; 32], &id_hps);
+
+        // Initialize directly with encryption keys
+        let mut init_cd = Vec::new();
+        init_cd.extend_from_slice(&selector(
+            "initializeWithKeys(address,string,string,bytes,bytes32)",
+        ));
+        let mut w_owner = [0u8; 32];
+        w_owner[12..32].copy_from_slice(&owner_a);
+        init_cd.extend_from_slice(&w_owner);
+        // 5 head words = 160 bytes -> handle @ 160 (64B), nick @ 224 (64B), secp @ 288 (96B)
+        let mut w_off = [0u8; 32];
+        w_off[24..32].copy_from_slice(&160u64.to_be_bytes());
+        init_cd.extend_from_slice(&w_off);
+        w_off[24..32].copy_from_slice(&224u64.to_be_bytes());
+        init_cd.extend_from_slice(&w_off);
+        w_off[24..32].copy_from_slice(&288u64.to_be_bytes());
+        init_cd.extend_from_slice(&w_off);
+        init_cd.extend_from_slice(&ed_a);
+        // tail 1: "alice.id" (8B)
+        let mut t_len = [0u8; 32];
+        t_len[24..32].copy_from_slice(&8u64.to_be_bytes());
+        init_cd.extend_from_slice(&t_len);
+        let mut t_val = [0u8; 32];
+        t_val[0..8].copy_from_slice(b"alice.id");
+        init_cd.extend_from_slice(&t_val);
+        // tail 2: "Alice" (5B)
+        t_len[24..32].copy_from_slice(&5u64.to_be_bytes());
+        init_cd.extend_from_slice(&t_len);
+        t_val = [0u8; 32];
+        t_val[0..5].copy_from_slice(b"Alice");
+        init_cd.extend_from_slice(&t_val);
+        // tail 3: secp_a (64B)
+        t_len[24..32].copy_from_slice(&64u64.to_be_bytes());
+        init_cd.extend_from_slice(&t_len);
+        init_cd.extend_from_slice(&secp_a);
+
+        mock::transact_as(owner_a, id_hps, &init_cd).unwrap();
+
+        let keys_raw =
+            mock::transact_as(stranger, id_hps, &selector("encryptionKeys()")).unwrap();
+        assert_eq!(keys_raw.len(), 96);
+        assert_eq!(&keys_raw[0..64], &secp_a);
+        assert_eq!(&keys_raw[64..96], &ed_a);
+
+        // Stranger cannot overwrite keys
+        let mut bad_set = Vec::new();
+        bad_set.extend_from_slice(&selector("setEncryptionKeys(bytes,bytes32)"));
+        w_off[24..32].copy_from_slice(&64u64.to_be_bytes());
+        bad_set.extend_from_slice(&w_off);
+        bad_set.extend_from_slice(&ed_a);
+        bad_set.extend_from_slice(&t_len);
+        bad_set.extend_from_slice(&[0x55u8; 64]);
+        assert_eq!(mock::transact_as(stranger, id_hps, &bad_set), Err(-21));
+
+        // Plain `transferOwnership` clears stale encryption keys automatically
+        let xfer = CallEncoder::<64>::new(const { selector("transferOwnership(address)") })
+            .push_address(&owner_b);
+        mock::transact_as(owner_a, id_hps, xfer.as_slice()).unwrap();
+        let cleared = mock::transact_as(owner_b, id_hps, &selector("ed25519PubKey()")).unwrap();
+        assert_eq!(cleared.as_slice(), &[0u8; 32]);
     }
 }

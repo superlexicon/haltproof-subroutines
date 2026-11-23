@@ -24,17 +24,23 @@ use hps_sdk::abi::CalldataReader;
 use hps_sdk::call::{self, CallEncoder};
 use hps_sdk::governance::{
     compute_sha_doc_hash, is_authorized_charter_module, oracle_policy_id,
-    query_charter_equity_module, require_valid_identity, validate_charter_capital_auth,
-    verify_and_consume_auction_auth, verify_and_consume_auth,
+    query_charter_equity_module, require_approved_hfs_code_hash, require_valid_identity,
+    validate_charter_capital_auth, verify_and_consume_auction_auth, verify_and_consume_auth,
     verify_and_consume_issuance_auction_auth, ActionHasher, AuctionOrder, ACTION_APPROVE,
     ACTION_CANCEL, ACTION_ISSUE, ACTION_SET_ATTACHED_DEX, ACTION_SUPER, ACTION_TRANSFER,
     CAP_EQUITY_SETTLEMENT, CAP_MERCHANT_PAYMENT, ERR_CONSTITUTION_MISMATCH,
     ERR_DEX_FORBIDDEN_ON_SHARES, ERR_DEX_NOT_ATTACHED, ERR_FRACTIONAL_SHARE_WIPEOUT,
     ERR_NO_BIDS_IN_STAGE, ERR_NO_CROSSING_ORDERS, ERR_UNAUTHORIZED_MODULE, ERR_WRONG_AUCTION_STEP,
-    MAX_AUCTION_ORDERS, POLICY_HOLDER_SELF, POLICY_SHARE_ISSUANCE_AUCTION,
+    HFS_TYPE_IFRS_LEDGER, MAX_AUCTION_ORDERS, POLICY_HOLDER_SELF, POLICY_SHARE_ISSUANCE_AUCTION,
     POLICY_SHARE_TRANSFER_AUCTION,
 };
+use hps_sdk::keccak::keccak256;
 use hps_sdk::storage::KeyBuilder;
+use hps_sdk::vrf::{
+    he_add_ciphertexts, he_sub_ciphertexts, verify_ed25519_schnorr, verify_he_range_u24,
+    verify_he_sum_equals_u64, CONF_RANGE_PROOF_BYTES, ED25519_BASEPOINT_BYTES,
+    IDENTITY_CIPHERTEXT_64, IDENTITY_POINT_BYTES,
+};
 use hps_sdk::{context, event_topic, events, hps_entry, ret, selector, storage};
 
 const LEDGER_INITIALIZED: [u8; 32] = event_topic("LedgerInitialized(address,uint64,uint64)");
@@ -57,10 +63,19 @@ const AUCTION_SELLER_FILLED: [u8; 32] =
 const SHARE_SPLIT_TOPIC: [u8; 32] = event_topic("ShareSplitApplied(uint64,uint64,uint64)");
 const SHARE_REVERSE_SPLIT_TOPIC: [u8; 32] =
     event_topic("ShareReverseSplitApplied(uint64,uint64,uint64)");
+const SHIELDED_NOTE_MINTED: [u8; 32] =
+    event_topic("ShieldedNoteMinted(uint64,bytes32,bytes32)");
+const SHIELDED_BATCH_FUNDED: [u8; 32] =
+    event_topic("ShieldedBatchFunded(address,bytes32,uint64,uint64,uint64)");
+const SHIELDED_NOTE_SPENT: [u8; 32] =
+    event_topic("ShieldedNoteSpent(uint64,bytes32,uint64)");
+const SHIELDED_SWEEP_TOPIC: [u8; 32] =
+    event_topic("ShieldedNotesSwept(address,uint64,uint64)");
 
 const KEY_INIT: &[u8] = b"meta:init";
 const KEY_CREATOR: &[u8] = b"meta:creator";
 const KEY_REGISTRY: &[u8] = b"meta:registry";
+const KEY_HFS_REGISTRY: &[u8] = b"meta:hfs_reg";
 const KEY_CONSTITUTION: &[u8] = b"meta:constitution";
 const KEY_ATTACHED_DEX: &[u8] = b"meta:dex";
 const KEY_SYMBOL: &[u8] = b"meta:symbol";
@@ -72,9 +87,31 @@ const KEY_LAST_AUC_PRICE: &[u8] = b"meta:auc_price";
 const KEY_LAST_AUC_QTY: &[u8] = b"meta:auc_qty";
 const KEY_LAST_AUC_BUY_DEMAND: &[u8] = b"meta:auc_buy_q";
 const KEY_LAST_AUC_SELL_SUPPLY: &[u8] = b"meta:auc_sell_q";
+const KEY_SHIELDED_SUPPLY: &[u8] = b"shd:supply";
+const KEY_SHIELDED_NOTE_CNT: &[u8] = b"shd:ncnt";
+
+pub const ERR_SHIELDED_FORBIDDEN_ON_SHARES: i32 = -78;
+pub const ERR_SHIELDED_PROOF_INVALID: i32 = -79;
+pub const ERR_SHIELDED_NOTE_NOT_FOUND_OR_SPENT: i32 = -80;
+pub const ERR_SHIELDED_NULLIFIER_USED: i32 = -81;
+const MAX_SHIELDED_BATCH_SLOTS: usize = 12;
+const MAX_NOTE_ENVELOPE_BYTES: usize = 256;
+const FIXED_SHIELDED_NOTE_HDR: usize = 153; // [spent:1][audit_pk:32][claim_lock:32][ct64:64][batch_tag:16][blk:8]
 
 hps_entry! {
     "initialize(address,string,uint64,bytes,bytes)"         => handle_initialize,
+    "setHfsRegistry(address)"                               => handle_set_hfs_registry,
+    "hfsRegistry()"                                         => handle_hfs_registry,
+    "mintShieldedNote(address,uint64,bytes32,bytes32,bytes,bytes,bytes,address)" => handle_mint_shielded_note,
+    "mintShieldedBatchDirect(bytes32,uint64,bytes32,bytes,bytes,bytes)"          => handle_mint_shielded_batch_direct,
+    "fundVerifiedShieldedBatch(bytes32,uint64,bytes32,bytes,bytes,address)"      => handle_fund_verified_shielded_batch,
+    "spendOrRedeemShieldedNote(uint64,bytes32,uint64,address,bytes32,bytes32,bytes,bytes,bytes)" => handle_spend_or_redeem_shielded_note,
+    "sweepShieldedNotes(bytes,uint64,address,bytes32,bytes)"                     => handle_sweep_shielded_notes,
+    "shieldedPoolSupply()"                                  => handle_shielded_pool_supply,
+    "shieldedNoteCount()"                                   => handle_shielded_note_count,
+    "isNullifierUsed(bytes32)"                              => handle_is_nullifier_used,
+    "getShieldedNote(uint64)"                               => handle_get_shielded_note,
+    "getShieldedNotesSlice(uint64,uint64)"                  => handle_get_shielded_notes_slice,
     "issue(address,uint64,address)"                         => handle_issue,
     "cancel(address,uint64,address)"                        => handle_cancel,
     "transfer(address,address,uint64,address)"              => handle_transfer,
@@ -2297,6 +2334,832 @@ fn handle_hash_set_permission(args: &CalldataReader) -> Result<(), i32> {
 fn handle_hash_set_attached_dex(args: &CalldataReader) -> Result<(), i32> {
     let dex = args.address(0).ok_or(-3)?;
     ret::write_word(&compute_set_attached_dex_hash(&dex));
+    Ok(())
+}
+
+// ============================================================================
+// Shielded Batch & Note Pool (`SGD-FIAT` / Non-Share Currency Ledgers Only)
+// ============================================================================
+
+#[derive(Clone, Copy)]
+struct ShieldedNoteHdr {
+    spent: u8,
+    audit_pk: [u8; 32],
+    claim_lock: [u8; 32],
+    ct_64: [u8; 64],
+    batch_tag: [u8; 16],
+    created_block: u64,
+}
+
+fn shielded_note_key(note_id: u64) -> KeyBuilder<32> {
+    KeyBuilder::<32>::new().push(b"shd:note:").push_u64_be(note_id)
+}
+
+fn shielded_env_key(note_id: u64) -> KeyBuilder<32> {
+    KeyBuilder::<32>::new().push(b"shd:env:").push_u64_be(note_id)
+}
+
+fn shielded_nullifier_key(nullifier: &[u8; 32]) -> KeyBuilder<48> {
+    KeyBuilder::<48>::new().push(b"shd:null:").push(nullifier)
+}
+
+fn require_non_share_shielded_ledger() -> Result<[u8; 20], i32> {
+    if storage::get_u64(KEY_INIT) != 1 {
+        return Err(-10);
+    }
+    if let Some(tr_rule) = load_permission(&ACTION_TRANSFER) {
+        if tr_rule.policy_id != POLICY_HOLDER_SELF {
+            return Err(ERR_SHIELDED_FORBIDDEN_ON_SHARES);
+        }
+    } else {
+        return Err(ERR_SHIELDED_FORBIDDEN_ON_SHARES);
+    }
+    let pinned_con = storage::get_address(KEY_CONSTITUTION).unwrap_or([0u8; 20]);
+    if pinned_con != [0u8; 20] {
+        let sc_cd = CallEncoder::<64>::new(const { selector("getShareClassByLedger(address)") })
+            .push_address(&context::self_address());
+        if let Ok(raw) = call::call_raw(&pinned_con, sc_cd.as_slice()) {
+            if raw.len() >= 32 && raw[31] == 1 {
+                return Err(ERR_SHIELDED_FORBIDDEN_ON_SHARES);
+            }
+        }
+    }
+    storage::get_address(KEY_REGISTRY).ok_or(-10)
+}
+
+fn save_shielded_note(hdr: &ShieldedNoteHdr, envelope: &[u8]) -> Result<u64, i32> {
+    if envelope.len() > MAX_NOTE_ENVELOPE_BYTES
+        || hdr.audit_pk == [0u8; 32]
+        || hdr.audit_pk == IDENTITY_POINT_BYTES
+        || hdr.claim_lock == [0u8; 32]
+        || hdr.claim_lock == IDENTITY_POINT_BYTES
+    {
+        return Err(ERR_SHIELDED_PROOF_INVALID);
+    }
+    let note_id = storage::get_u64(KEY_SHIELDED_NOTE_CNT);
+    let mut raw = [0u8; FIXED_SHIELDED_NOTE_HDR];
+    raw[0] = hdr.spent;
+    raw[1..33].copy_from_slice(&hdr.audit_pk);
+    raw[33..65].copy_from_slice(&hdr.claim_lock);
+    raw[65..129].copy_from_slice(&hdr.ct_64);
+    raw[129..145].copy_from_slice(&hdr.batch_tag);
+    raw[145..153].copy_from_slice(&hdr.created_block.to_be_bytes());
+
+    let nk = shielded_note_key(note_id);
+    storage::set(nk.as_slice(), &raw);
+    if !envelope.is_empty() {
+        let ek = shielded_env_key(note_id);
+        storage::set(ek.as_slice(), envelope);
+    }
+    storage::set_u64(KEY_SHIELDED_NOTE_CNT, note_id + 1);
+    events::emit(
+        &[
+            SHIELDED_NOTE_MINTED,
+            hdr.audit_pk,
+            hdr.claim_lock,
+        ],
+        &note_id.to_be_bytes(),
+    );
+    Ok(note_id)
+}
+
+fn load_shielded_note(note_id: u64) -> Option<ShieldedNoteHdr> {
+    if note_id >= storage::get_u64(KEY_SHIELDED_NOTE_CNT) {
+        return None;
+    }
+    let nk = shielded_note_key(note_id);
+    let mut raw = [0u8; FIXED_SHIELDED_NOTE_HDR];
+    if storage::get_into(nk.as_slice(), &mut raw) != Some(FIXED_SHIELDED_NOTE_HDR) {
+        return None;
+    }
+    let mut audit_pk = [0u8; 32];
+    let mut claim_lock = [0u8; 32];
+    let mut ct_64 = [0u8; 64];
+    let mut batch_tag = [0u8; 16];
+    let mut blk_b = [0u8; 8];
+    audit_pk.copy_from_slice(&raw[1..33]);
+    claim_lock.copy_from_slice(&raw[33..65]);
+    ct_64.copy_from_slice(&raw[65..129]);
+    batch_tag.copy_from_slice(&raw[129..145]);
+    blk_b.copy_from_slice(&raw[145..153]);
+    Some(ShieldedNoteHdr {
+        spent: raw[0],
+        audit_pk,
+        claim_lock,
+        ct_64,
+        batch_tag,
+        created_block: u64::from_be_bytes(blk_b),
+    })
+}
+
+fn mark_shielded_note_spent(note_id: u64, hdr: &ShieldedNoteHdr) {
+    let mut raw = [0u8; FIXED_SHIELDED_NOTE_HDR];
+    raw[0] = 1;
+    raw[1..33].copy_from_slice(&hdr.audit_pk);
+    raw[33..65].copy_from_slice(&hdr.claim_lock);
+    raw[65..129].copy_from_slice(&hdr.ct_64);
+    raw[129..145].copy_from_slice(&hdr.batch_tag);
+    raw[145..153].copy_from_slice(&hdr.created_block.to_be_bytes());
+    let nk = shielded_note_key(note_id);
+    storage::set(nk.as_slice(), &raw);
+}
+
+fn handle_set_hfs_registry(args: &CalldataReader) -> Result<(), i32> {
+    if storage::get_u64(KEY_INIT) != 1 {
+        return Err(-10);
+    }
+    let creator = storage::get_address(KEY_CREATOR).ok_or(-10)?;
+    if context::msg_sender() != creator {
+        return Err(-65);
+    }
+    let reg = args.address(0).ok_or(-3)?;
+    if reg == [0u8; 20] {
+        return Err(-3);
+    }
+    storage::set_address(KEY_HFS_REGISTRY, &reg);
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_hfs_registry(_args: &CalldataReader) -> Result<(), i32> {
+    let reg = storage::get_address(KEY_HFS_REGISTRY).unwrap_or([0u8; 20]);
+    ret::write_address(&reg);
+    Ok(())
+}
+
+fn handle_mint_shielded_note(args: &CalldataReader) -> Result<(), i32> {
+    let registry = require_non_share_shielded_ledger()?;
+    let caller = context::msg_sender();
+    require_valid_identity(&registry, &caller)?;
+
+    let from_id = args.address(0).ok_or(-3)?;
+    let public_amount = args.u64(1).ok_or(-3)?;
+    let audit_pk = args.bytes32(2).ok_or(-3)?;
+    let claim_lock = args.bytes32(3).ok_or(-3)?;
+    let ct_slice = args.dynamic_bytes(4).ok_or(-3)?;
+    let dleq_slice = args.dynamic_bytes(5).ok_or(-3)?;
+    let envelope = args.dynamic_bytes(6).ok_or(-3)?;
+    let auth_obj = args.address(7).ok_or(-3)?;
+
+    if public_amount == 0
+        || ct_slice.len() != 64
+        || dleq_slice.len() != 64
+        || envelope.len() > MAX_NOTE_ENVELOPE_BYTES
+    {
+        return Err(ERR_SHIELDED_PROOF_INVALID);
+    }
+    let ah = compute_transfer_hash(&from_id, &context::self_address(), public_amount);
+    require_and_consume_permission(
+        &registry,
+        &ACTION_TRANSFER,
+        Some(&from_id),
+        &ah,
+        &auth_obj,
+        &caller,
+    )?;
+
+    let mut ct_64 = [0u8; 64];
+    let mut dleq_64 = [0u8; 64];
+    ct_64.copy_from_slice(ct_slice);
+    dleq_64.copy_from_slice(dleq_slice);
+
+    let me = context::self_address();
+    let mut mint_ctx = [0u8; 97];
+    mint_ctx[0..17].copy_from_slice(b"SLX_SHD_MINT1_V1:");
+    mint_ctx[17..37].copy_from_slice(&me);
+    mint_ctx[37..57].copy_from_slice(&from_id);
+    mint_ctx[57..65].copy_from_slice(&public_amount.to_be_bytes());
+    mint_ctx[65..97].copy_from_slice(&claim_lock);
+
+    if !verify_he_sum_equals_u64(&audit_pk, &ct_64, public_amount, &mint_ctx, &dleq_64) {
+        return Err(ERR_SHIELDED_PROOF_INVALID);
+    }
+
+    internal_debit(&from_id, public_amount)?;
+    let next_shd = storage::get_u64(KEY_SHIELDED_SUPPLY)
+        .checked_add(public_amount)
+        .ok_or(-15)?;
+    storage::set_u64(KEY_SHIELDED_SUPPLY, next_shd);
+
+    let mut batch_tag = [0u8; 16];
+    batch_tag.copy_from_slice(&from_id[0..16]);
+    let note_id = save_shielded_note(
+        &ShieldedNoteHdr {
+            spent: 0,
+            audit_pk,
+            claim_lock,
+            ct_64,
+            batch_tag,
+            created_block: context::block_number(),
+        },
+        envelope,
+    )?;
+    ret::write_u64_word(note_id);
+    Ok(())
+}
+
+fn handle_mint_shielded_batch_direct(args: &CalldataReader) -> Result<(), i32> {
+    let registry = require_non_share_shielded_ledger()?;
+    let caller = context::msg_sender();
+    require_valid_identity(&registry, &caller)?;
+
+    let batch_tag32 = args.bytes32(0).ok_or(-3)?;
+    let total_amount = args.u64(1).ok_or(-3)?;
+    let audit_pk = args.bytes32(2).ok_or(-3)?;
+    let range_proofs = args.dynamic_bytes(3).ok_or(-3)?;
+    let sum_dleq_slice = args.dynamic_bytes(4).ok_or(-3)?;
+    let locks_and_envs = args.dynamic_bytes(5).ok_or(-3)?;
+
+    if total_amount == 0 || sum_dleq_slice.len() != 64 || locks_and_envs.len() < 2 {
+        return Err(ERR_SHIELDED_PROOF_INVALID);
+    }
+    require_and_consume_permission(
+        &registry,
+        &ACTION_TRANSFER,
+        Some(&caller),
+        &batch_tag32,
+        &[0u8; 20],
+        &caller,
+    )?;
+
+    let slot_count = u16::from_be_bytes([locks_and_envs[0], locks_and_envs[1]]) as usize;
+    if slot_count == 0
+        || slot_count > MAX_SHIELDED_BATCH_SLOTS
+        || range_proofs.len() != slot_count * CONF_RANGE_PROOF_BYTES
+    {
+        return Err(ERR_SHIELDED_PROOF_INVALID);
+    }
+
+    let me = context::self_address();
+    let mut ctx_prefix = [0u8; 89];
+    ctx_prefix[0..17].copy_from_slice(b"SLX_SHD_BATCH_V1:");
+    ctx_prefix[17..37].copy_from_slice(&me);
+    ctx_prefix[37..57].copy_from_slice(&caller);
+    ctx_prefix[57..89].copy_from_slice(&batch_tag32);
+
+    let mut slot_cts = [[0u8; 64]; MAX_SHIELDED_BATCH_SLOTS];
+    let mut c_sum = IDENTITY_CIPHERTEXT_64;
+    let mut s = 0usize;
+    while s < slot_count {
+        let p_off = s * CONF_RANGE_PROOF_BYTES;
+        let ct_i = verify_he_range_u24(
+            &audit_pk,
+            &ctx_prefix,
+            s as u32,
+            &range_proofs[p_off..p_off + CONF_RANGE_PROOF_BYTES],
+        )
+        .ok_or(ERR_SHIELDED_PROOF_INVALID)?;
+        c_sum = he_add_ciphertexts(&c_sum, &ct_i).ok_or(ERR_SHIELDED_PROOF_INVALID)?;
+        slot_cts[s] = ct_i;
+        s += 1;
+    }
+
+    let mut sum_ctx = [0u8; 96];
+    sum_ctx[0..16].copy_from_slice(b"SLX_SHD_BSUM_V1:");
+    sum_ctx[16..36].copy_from_slice(&me);
+    sum_ctx[36..56].copy_from_slice(&caller);
+    sum_ctx[56..88].copy_from_slice(&batch_tag32);
+    sum_ctx[88..96].copy_from_slice(&total_amount.to_be_bytes());
+
+    let mut sum_dleq = [0u8; 64];
+    sum_dleq.copy_from_slice(sum_dleq_slice);
+    if !verify_he_sum_equals_u64(&audit_pk, &c_sum, total_amount, &sum_ctx, &sum_dleq) {
+        return Err(ERR_SHIELDED_PROOF_INVALID);
+    }
+
+    internal_debit(&caller, total_amount)?;
+    let next_shd = storage::get_u64(KEY_SHIELDED_SUPPLY)
+        .checked_add(total_amount)
+        .ok_or(-15)?;
+    storage::set_u64(KEY_SHIELDED_SUPPLY, next_shd);
+
+    let mut short_tag = [0u8; 16];
+    short_tag.copy_from_slice(&batch_tag32[0..16]);
+    let now = context::block_number();
+    let first_note_id = storage::get_u64(KEY_SHIELDED_NOTE_CNT);
+
+    let mut pos = 2usize;
+    let mut idx = 0usize;
+    while idx < slot_count {
+        if pos + 34 > locks_and_envs.len() {
+            return Err(ERR_SHIELDED_PROOF_INVALID);
+        }
+        let mut claim_lock = [0u8; 32];
+        claim_lock.copy_from_slice(&locks_and_envs[pos..pos + 32]);
+        let env_len = u16::from_be_bytes([locks_and_envs[pos + 32], locks_and_envs[pos + 33]]) as usize;
+        pos += 34;
+        if pos + env_len > locks_and_envs.len() {
+            return Err(ERR_SHIELDED_PROOF_INVALID);
+        }
+        let env = &locks_and_envs[pos..pos + env_len];
+        pos += env_len;
+        save_shielded_note(
+            &ShieldedNoteHdr {
+                spent: 0,
+                audit_pk,
+                claim_lock,
+                ct_64: slot_cts[idx],
+                batch_tag: short_tag,
+                created_block: now,
+            },
+            env,
+        )?;
+        idx += 1;
+    }
+
+    let mut ev = [0u8; 24];
+    ev[0..8].copy_from_slice(&first_note_id.to_be_bytes());
+    ev[8..16].copy_from_slice(&(slot_count as u64).to_be_bytes());
+    ev[16..24].copy_from_slice(&total_amount.to_be_bytes());
+    events::emit(&[SHIELDED_BATCH_FUNDED, addr_topic(&caller), batch_tag32], &ev);
+
+    ret::write_u64_word(first_note_id);
+    Ok(())
+}
+
+fn handle_fund_verified_shielded_batch(args: &CalldataReader) -> Result<(), i32> {
+    let registry = require_non_share_shielded_ledger()?;
+    let caller = context::msg_sender();
+    require_valid_identity(&registry, &caller)?;
+
+    let batch_tag32 = args.bytes32(0).ok_or(-3)?;
+    let total_amount = args.u64(1).ok_or(-3)?;
+    let audit_pk = args.bytes32(2).ok_or(-3)?;
+    let sum_dleq_slice = args.dynamic_bytes(3).ok_or(-3)?;
+    let packed_notes = args.dynamic_bytes(4).ok_or(-3)?;
+    let verifier_hfs = args.address(5).ok_or(-3)?;
+
+    if total_amount == 0 || sum_dleq_slice.len() != 64 || packed_notes.len() < 2 {
+        return Err(ERR_SHIELDED_PROOF_INVALID);
+    }
+    require_and_consume_permission(
+        &registry,
+        &ACTION_TRANSFER,
+        Some(&caller),
+        &batch_tag32,
+        &[0u8; 20],
+        &caller,
+    )?;
+
+    // Verify `verifier_hfs` is an approved `IFRS_LEDGER` subroutine (when `HfsRegistry` is pinned)
+    // AND has pre-verified every slot's 24-bit non-negative range proof for this exact `notes_hash`.
+    let hfs_reg = storage::get_address(KEY_HFS_REGISTRY).unwrap_or([0u8; 20]);
+    if hfs_reg != [0u8; 20] {
+        require_approved_hfs_code_hash(&hfs_reg, &HFS_TYPE_IFRS_LEDGER, &verifier_hfs)?;
+    } else if context::code_hash_of(&verifier_hfs).unwrap_or([0u8; 32]) == [0u8; 32] {
+        return Err(ERR_UNAUTHORIZED_MODULE);
+    }
+    let notes_hash = keccak256(packed_notes);
+    let check_cd = CallEncoder::<160>::new(const {
+        selector("isVerifiedShieldedBatch(bytes32,address,uint64,bytes32)")
+    })
+    .push_bytes32(&batch_tag32)
+    .push_address(&caller)
+    .push_u64(total_amount)
+    .push_bytes32(&notes_hash);
+    if !call::call_bool(&verifier_hfs, check_cd.as_slice())? {
+        return Err(ERR_SHIELDED_PROOF_INVALID);
+    }
+
+    let slot_count = u16::from_be_bytes([packed_notes[0], packed_notes[1]]) as usize;
+    if slot_count == 0 || slot_count > MAX_SHIELDED_BATCH_SLOTS {
+        return Err(ERR_SHIELDED_PROOF_INVALID);
+    }
+
+    // Independently sum all slot ciphertexts & verify DLEQ conservation on `AssetLedger` too!
+    let mut pos = 2usize;
+    let mut c_sum = IDENTITY_CIPHERTEXT_64;
+    let mut parsed_locks = [[0u8; 32]; MAX_SHIELDED_BATCH_SLOTS];
+    let mut parsed_cts = [[0u8; 64]; MAX_SHIELDED_BATCH_SLOTS];
+    let mut env_ranges = [(0usize, 0usize); MAX_SHIELDED_BATCH_SLOTS];
+    let mut idx = 0usize;
+    while idx < slot_count {
+        if pos + 98 > packed_notes.len() {
+            return Err(ERR_SHIELDED_PROOF_INVALID);
+        }
+        parsed_locks[idx].copy_from_slice(&packed_notes[pos..pos + 32]);
+        parsed_cts[idx].copy_from_slice(&packed_notes[pos + 32..pos + 96]);
+        let env_len = u16::from_be_bytes([packed_notes[pos + 96], packed_notes[pos + 97]]) as usize;
+        pos += 98;
+        if pos + env_len > packed_notes.len() {
+            return Err(ERR_SHIELDED_PROOF_INVALID);
+        }
+        env_ranges[idx] = (pos, pos + env_len);
+        pos += env_len;
+        c_sum = he_add_ciphertexts(&c_sum, &parsed_cts[idx]).ok_or(ERR_SHIELDED_PROOF_INVALID)?;
+        idx += 1;
+    }
+
+    let mut sum_ctx = [0u8; 96];
+    sum_ctx[0..16].copy_from_slice(b"SLX_CONF_BSUM_1:");
+    sum_ctx[16..36].copy_from_slice(&verifier_hfs);
+    sum_ctx[36..56].copy_from_slice(&caller);
+    sum_ctx[56..88].copy_from_slice(&batch_tag32);
+    sum_ctx[88..96].copy_from_slice(&total_amount.to_be_bytes());
+
+    let mut sum_dleq = [0u8; 64];
+    sum_dleq.copy_from_slice(sum_dleq_slice);
+    if !verify_he_sum_equals_u64(&audit_pk, &c_sum, total_amount, &sum_ctx, &sum_dleq) {
+        return Err(ERR_SHIELDED_PROOF_INVALID);
+    }
+
+    internal_debit(&caller, total_amount)?;
+    let next_shd = storage::get_u64(KEY_SHIELDED_SUPPLY)
+        .checked_add(total_amount)
+        .ok_or(-15)?;
+    storage::set_u64(KEY_SHIELDED_SUPPLY, next_shd);
+
+    let mut short_tag = [0u8; 16];
+    short_tag.copy_from_slice(&batch_tag32[0..16]);
+    let now = context::block_number();
+    let first_note_id = storage::get_u64(KEY_SHIELDED_NOTE_CNT);
+
+    idx = 0;
+    while idx < slot_count {
+        let (es, ee) = env_ranges[idx];
+        save_shielded_note(
+            &ShieldedNoteHdr {
+                spent: 0,
+                audit_pk,
+                claim_lock: parsed_locks[idx],
+                ct_64: parsed_cts[idx],
+                batch_tag: short_tag,
+                created_block: now,
+            },
+            &packed_notes[es..ee],
+        )?;
+        idx += 1;
+    }
+
+    let mut ev = [0u8; 24];
+    ev[0..8].copy_from_slice(&first_note_id.to_be_bytes());
+    ev[8..16].copy_from_slice(&(slot_count as u64).to_be_bytes());
+    ev[16..24].copy_from_slice(&total_amount.to_be_bytes());
+    events::emit(&[SHIELDED_BATCH_FUNDED, addr_topic(&caller), batch_tag32], &ev);
+
+    ret::write_u64_word(first_note_id);
+    Ok(())
+}
+
+fn handle_spend_or_redeem_shielded_note(args: &CalldataReader) -> Result<(), i32> {
+    let registry = require_non_share_shielded_ledger()?;
+
+    let note_id = args.u64(0).ok_or(-3)?;
+    let nullifier = args.bytes32(1).ok_or(-3)?;
+    let public_redeem_amt = args.u64(2).ok_or(-3)?;
+    let public_recipient = args.address(3).ok_or(-3)?;
+    let change_lock = args.bytes32(4).ok_or(-3)?;
+    let pay_lock = args.bytes32(5).ok_or(-3)?;
+    let range_proofs = args.dynamic_bytes(6).ok_or(-3)?;
+    let sig_and_cons = args.dynamic_bytes(7).ok_or(-3)?;
+    let envelopes_blob = args.dynamic_bytes(8).ok_or(-3)?;
+
+    if nullifier == [0u8; 32] || sig_and_cons.len() != 128 {
+        return Err(ERR_SHIELDED_PROOF_INVALID);
+    }
+    let nul_k = shielded_nullifier_key(&nullifier);
+    if storage::get_u64(nul_k.as_slice()) != 0 {
+        return Err(ERR_SHIELDED_NULLIFIER_USED);
+    }
+    let hdr = load_shielded_note(note_id).ok_or(ERR_SHIELDED_NOTE_NOT_FOUND_OR_SPENT)?;
+    if hdr.spent != 0 {
+        return Err(ERR_SHIELDED_NOTE_NOT_FOUND_OR_SPENT);
+    }
+
+    if public_redeem_amt > 0 {
+        require_valid_identity(&registry, &public_recipient)?;
+    } else if public_recipient != [0u8; 20] {
+        return Err(ERR_SHIELDED_PROOF_INVALID);
+    }
+
+    let me = context::self_address();
+    let mut spend_ctx = [0u8; 169];
+    spend_ctx[0..17].copy_from_slice(b"SLX_SHD_SPEND_V1:");
+    spend_ctx[17..37].copy_from_slice(&me);
+    spend_ctx[37..45].copy_from_slice(&note_id.to_be_bytes());
+    spend_ctx[45..77].copy_from_slice(&nullifier);
+    spend_ctx[77..85].copy_from_slice(&public_redeem_amt.to_be_bytes());
+    spend_ctx[85..105].copy_from_slice(&public_recipient);
+    spend_ctx[105..137].copy_from_slice(&change_lock);
+    spend_ctx[137..169].copy_from_slice(&pay_lock);
+
+    let mut spend_sig = [0u8; 64];
+    let mut cons_dleq = [0u8; 64];
+    spend_sig.copy_from_slice(&sig_and_cons[0..64]);
+    cons_dleq.copy_from_slice(&sig_and_cons[64..128]);
+
+    if !verify_ed25519_schnorr(&ED25519_BASEPOINT_BYTES, &hdr.claim_lock, &spend_ctx, &spend_sig) {
+        return Err(ERR_SHIELDED_PROOF_INVALID);
+    }
+
+    let has_change = change_lock != [0u8; 32];
+    let has_pay = pay_lock != [0u8; 32];
+    if has_pay && (!has_change || public_redeem_amt != 0) {
+        return Err(ERR_SHIELDED_PROOF_INVALID);
+    }
+
+    let mut split_prefix = [0u8; 77];
+    split_prefix[0..17].copy_from_slice(b"SLX_SHD_SPLIT_V1:");
+    split_prefix[17..37].copy_from_slice(&me);
+    split_prefix[37..45].copy_from_slice(&note_id.to_be_bytes());
+    split_prefix[45..77].copy_from_slice(&nullifier);
+
+    let (opt_pay_ct, opt_change_ct, c_rem) = if !has_change && !has_pay {
+        if !range_proofs.is_empty() || public_redeem_amt == 0 {
+            return Err(ERR_SHIELDED_PROOF_INVALID);
+        }
+        (None, None, hdr.ct_64)
+    } else if has_change && !has_pay {
+        if range_proofs.len() != CONF_RANGE_PROOF_BYTES {
+            return Err(ERR_SHIELDED_PROOF_INVALID);
+        }
+        let ch_ct = verify_he_range_u24(&hdr.audit_pk, &split_prefix, 1, range_proofs)
+            .ok_or(ERR_SHIELDED_PROOF_INVALID)?;
+        let rem = he_sub_ciphertexts(&hdr.ct_64, &ch_ct).ok_or(ERR_SHIELDED_PROOF_INVALID)?;
+        (None, Some(ch_ct), rem)
+    } else {
+        if range_proofs.len() != 2 * CONF_RANGE_PROOF_BYTES {
+            return Err(ERR_SHIELDED_PROOF_INVALID);
+        }
+        let pay_ct = verify_he_range_u24(
+            &hdr.audit_pk,
+            &split_prefix,
+            0,
+            &range_proofs[0..CONF_RANGE_PROOF_BYTES],
+        )
+        .ok_or(ERR_SHIELDED_PROOF_INVALID)?;
+        let ch_ct = verify_he_range_u24(
+            &hdr.audit_pk,
+            &split_prefix,
+            1,
+            &range_proofs[CONF_RANGE_PROOF_BYTES..2 * CONF_RANGE_PROOF_BYTES],
+        )
+        .ok_or(ERR_SHIELDED_PROOF_INVALID)?;
+        let sum_out = he_add_ciphertexts(&pay_ct, &ch_ct).ok_or(ERR_SHIELDED_PROOF_INVALID)?;
+        let rem = he_sub_ciphertexts(&hdr.ct_64, &sum_out).ok_or(ERR_SHIELDED_PROOF_INVALID)?;
+        (Some(pay_ct), Some(ch_ct), rem)
+    };
+
+    let mut cons_ctx = [0u8; 85];
+    cons_ctx[0..16].copy_from_slice(b"SLX_SHD_CONS_V1:");
+    cons_ctx[16..36].copy_from_slice(&me);
+    cons_ctx[36..44].copy_from_slice(&note_id.to_be_bytes());
+    cons_ctx[44..76].copy_from_slice(&nullifier);
+    cons_ctx[76..84].copy_from_slice(&public_redeem_amt.to_be_bytes());
+    cons_ctx[84] = if has_pay { 2 } else if has_change { 1 } else { 0 };
+
+    if !verify_he_sum_equals_u64(&hdr.audit_pk, &c_rem, public_redeem_amt, &cons_ctx, &cons_dleq) {
+        return Err(ERR_SHIELDED_PROOF_INVALID);
+    }
+
+    // Parse optional `[changeEnvLen: u16 BE][changeEnv][payEnvLen: u16 BE][payEnv]`
+    let (change_env, pay_env): (&[u8], &[u8]) = if envelopes_blob.is_empty() {
+        (&[], &[])
+    } else {
+        if envelopes_blob.len() < 4 {
+            return Err(ERR_SHIELDED_PROOF_INVALID);
+        }
+        let clen = u16::from_be_bytes([envelopes_blob[0], envelopes_blob[1]]) as usize;
+        if 2 + clen + 2 > envelopes_blob.len() {
+            return Err(ERR_SHIELDED_PROOF_INVALID);
+        }
+        let ce = &envelopes_blob[2..2 + clen];
+        let p_off = 2 + clen;
+        let plen = u16::from_be_bytes([envelopes_blob[p_off], envelopes_blob[p_off + 1]]) as usize;
+        if p_off + 2 + plen > envelopes_blob.len() {
+            return Err(ERR_SHIELDED_PROOF_INVALID);
+        }
+        (ce, &envelopes_blob[p_off + 2..p_off + 2 + plen])
+    };
+
+    // State transition: mark old note spent + record nullifier + update shielded pool & mint outputs!
+    mark_shielded_note_spent(note_id, &hdr);
+    storage::set_u64(nul_k.as_slice(), 1);
+
+    if public_redeem_amt > 0 {
+        let cur_shd = storage::get_u64(KEY_SHIELDED_SUPPLY);
+        if cur_shd < public_redeem_amt {
+            return Err(-16);
+        }
+        storage::set_u64(KEY_SHIELDED_SUPPLY, cur_shd - public_redeem_amt);
+        internal_credit(&public_recipient, public_redeem_amt)?;
+    }
+
+    let now = context::block_number();
+    let mut first_new = u64::MAX;
+    if let Some(pay_ct) = opt_pay_ct {
+        let pid = save_shielded_note(
+            &ShieldedNoteHdr {
+                spent: 0,
+                audit_pk: hdr.audit_pk,
+                claim_lock: pay_lock,
+                ct_64: pay_ct,
+                batch_tag: hdr.batch_tag,
+                created_block: now,
+            },
+            pay_env,
+        )?;
+        first_new = pid;
+    }
+    if let Some(ch_ct) = opt_change_ct {
+        let cid = save_shielded_note(
+            &ShieldedNoteHdr {
+                spent: 0,
+                audit_pk: hdr.audit_pk,
+                claim_lock: change_lock,
+                ct_64: ch_ct,
+                batch_tag: hdr.batch_tag,
+                created_block: now,
+            },
+            change_env,
+        )?;
+        if first_new == u64::MAX {
+            first_new = cid;
+        }
+    }
+
+    events::emit(
+        &[SHIELDED_NOTE_SPENT, nullifier],
+        &public_redeem_amt.to_be_bytes(),
+    );
+    ret::write_u64_word(first_new);
+    Ok(())
+}
+
+fn handle_sweep_shielded_notes(args: &CalldataReader) -> Result<(), i32> {
+    let registry = require_non_share_shielded_ledger()?;
+    let note_ids_raw = args.dynamic_bytes(0).ok_or(-3)?;
+    let total_sweep_amt = args.u64(1).ok_or(-3)?;
+    let recipient_id = args.address(2).ok_or(-3)?;
+    let audit_pk = args.bytes32(3).ok_or(-3)?;
+    let sigs_and_sum = args.dynamic_bytes(4).ok_or(-3)?;
+
+    if total_sweep_amt == 0 || note_ids_raw.is_empty() || note_ids_raw.len() % 8 != 0 {
+        return Err(ERR_SHIELDED_PROOF_INVALID);
+    }
+    let count = note_ids_raw.len() / 8;
+    if count > MAX_SHIELDED_BATCH_SLOTS || sigs_and_sum.len() != count * 64 + 64 {
+        return Err(ERR_SHIELDED_PROOF_INVALID);
+    }
+    require_valid_identity(&registry, &recipient_id)?;
+
+    let me = context::self_address();
+    let mut note_ids = [0u64; MAX_SHIELDED_BATCH_SLOTS];
+    let mut hdrs = [ShieldedNoteHdr {
+        spent: 1,
+        audit_pk: [0u8; 32],
+        claim_lock: [0u8; 32],
+        ct_64: [0u8; 64],
+        batch_tag: [0u8; 16],
+        created_block: 0,
+    }; MAX_SHIELDED_BATCH_SLOTS];
+    let mut c_sum = IDENTITY_CIPHERTEXT_64;
+
+    let mut i = 0usize;
+    while i < count {
+        let mut id_b = [0u8; 8];
+        id_b.copy_from_slice(&note_ids_raw[i * 8..(i + 1) * 8]);
+        let nid = u64::from_be_bytes(id_b);
+        let mut prev = 0usize;
+        while prev < i {
+            if note_ids[prev] == nid {
+                return Err(ERR_SHIELDED_PROOF_INVALID); // Duplicate note ID!
+            }
+            prev += 1;
+        }
+        let h = load_shielded_note(nid).ok_or(ERR_SHIELDED_NOTE_NOT_FOUND_OR_SPENT)?;
+        if h.spent != 0 || h.audit_pk != audit_pk {
+            return Err(ERR_SHIELDED_NOTE_NOT_FOUND_OR_SPENT);
+        }
+
+        let mut sp_ctx = [0u8; 72];
+        sp_ctx[0..16].copy_from_slice(b"SLX_SHD_SWSP_V1:");
+        sp_ctx[16..36].copy_from_slice(&me);
+        sp_ctx[36..44].copy_from_slice(&nid.to_be_bytes());
+        sp_ctx[44..52].copy_from_slice(&total_sweep_amt.to_be_bytes());
+        sp_ctx[52..72].copy_from_slice(&recipient_id);
+
+        let mut sig = [0u8; 64];
+        sig.copy_from_slice(&sigs_and_sum[i * 64..(i + 1) * 64]);
+        if !verify_ed25519_schnorr(&ED25519_BASEPOINT_BYTES, &h.claim_lock, &sp_ctx, &sig) {
+            return Err(ERR_SHIELDED_PROOF_INVALID);
+        }
+        c_sum = he_add_ciphertexts(&c_sum, &h.ct_64).ok_or(ERR_SHIELDED_PROOF_INVALID)?;
+        note_ids[i] = nid;
+        hdrs[i] = h;
+        i += 1;
+    }
+
+    let notes_hash = keccak256(note_ids_raw);
+    let mut sum_ctx = [0u8; 97];
+    sum_ctx[0..17].copy_from_slice(b"SLX_SHD_SWSUM_V1:");
+    sum_ctx[17..37].copy_from_slice(&me);
+    sum_ctx[37..57].copy_from_slice(&recipient_id);
+    sum_ctx[57..65].copy_from_slice(&total_sweep_amt.to_be_bytes());
+    sum_ctx[65..97].copy_from_slice(&notes_hash);
+
+    let mut sum_dleq = [0u8; 64];
+    sum_dleq.copy_from_slice(&sigs_and_sum[count * 64..count * 64 + 64]);
+    if !verify_he_sum_equals_u64(&audit_pk, &c_sum, total_sweep_amt, &sum_ctx, &sum_dleq) {
+        return Err(ERR_SHIELDED_PROOF_INVALID);
+    }
+
+    let cur_shd = storage::get_u64(KEY_SHIELDED_SUPPLY);
+    if cur_shd < total_sweep_amt {
+        return Err(-16);
+    }
+    storage::set_u64(KEY_SHIELDED_SUPPLY, cur_shd - total_sweep_amt);
+
+    i = 0;
+    while i < count {
+        mark_shielded_note_spent(note_ids[i], &hdrs[i]);
+        i += 1;
+    }
+    internal_credit(&recipient_id, total_sweep_amt)?;
+
+    let mut ev = [0u8; 16];
+    ev[0..8].copy_from_slice(&(count as u64).to_be_bytes());
+    ev[8..16].copy_from_slice(&total_sweep_amt.to_be_bytes());
+    events::emit(&[SHIELDED_SWEEP_TOPIC, addr_topic(&recipient_id)], &ev);
+
+    ret::write_u64_word(total_sweep_amt);
+    Ok(())
+}
+
+fn handle_shielded_pool_supply(_args: &CalldataReader) -> Result<(), i32> {
+    ret::write_u64_word(storage::get_u64(KEY_SHIELDED_SUPPLY));
+    Ok(())
+}
+
+fn handle_shielded_note_count(_args: &CalldataReader) -> Result<(), i32> {
+    ret::write_u64_word(storage::get_u64(KEY_SHIELDED_NOTE_CNT));
+    Ok(())
+}
+
+fn handle_is_nullifier_used(args: &CalldataReader) -> Result<(), i32> {
+    let nul = args.bytes32(0).ok_or(-3)?;
+    let nk = shielded_nullifier_key(&nul);
+    ret::write_bool(storage::get_u64(nk.as_slice()) != 0);
+    Ok(())
+}
+
+fn pack_shielded_note_record(note_id: u64, out: &mut [u8]) -> Option<usize> {
+    let hdr = load_shielded_note(note_id)?;
+    let mut env_buf = [0u8; MAX_NOTE_ENVELOPE_BYTES];
+    let ek = shielded_env_key(note_id);
+    let env_len = storage::get_into(ek.as_slice(), &mut env_buf).unwrap_or(0);
+    let need = FIXED_SHIELDED_NOTE_HDR + 2 + env_len;
+    if out.len() < need {
+        return None;
+    }
+    out[0] = hdr.spent;
+    out[1..33].copy_from_slice(&hdr.audit_pk);
+    out[33..65].copy_from_slice(&hdr.claim_lock);
+    out[65..129].copy_from_slice(&hdr.ct_64);
+    out[129..145].copy_from_slice(&hdr.batch_tag);
+    out[145..153].copy_from_slice(&hdr.created_block.to_be_bytes());
+    out[153..155].copy_from_slice(&(env_len as u16).to_be_bytes());
+    if env_len > 0 {
+        out[155..155 + env_len].copy_from_slice(&env_buf[..env_len]);
+    }
+    Some(need)
+}
+
+fn handle_get_shielded_note(args: &CalldataReader) -> Result<(), i32> {
+    let note_id = args.u64(0).ok_or(-3)?;
+    let mut buf = [0u8; FIXED_SHIELDED_NOTE_HDR + 2 + MAX_NOTE_ENVELOPE_BYTES];
+    let n = pack_shielded_note_record(note_id, &mut buf).ok_or(ERR_SHIELDED_NOTE_NOT_FOUND_OR_SPENT)?;
+    ret::write(&buf[..n]);
+    Ok(())
+}
+
+fn handle_get_shielded_notes_slice(args: &CalldataReader) -> Result<(), i32> {
+    let offset = args.u64(0).ok_or(-3)?;
+    let limit = args.u64(1).ok_or(-3)?.min(24);
+    let total = storage::get_u64(KEY_SHIELDED_NOTE_CNT);
+    let end = offset.saturating_add(limit).min(total);
+
+    const SLICE_CAP: usize = 16 + 24 * (10 + FIXED_SHIELDED_NOTE_HDR + 2 + MAX_NOTE_ENVELOPE_BYTES);
+    let mut out = [0u8; SLICE_CAP];
+    out[0..8].copy_from_slice(&total.to_be_bytes());
+    let mut pos = 16usize;
+    let mut returned = 0u64;
+    let mut cur = offset;
+    while cur < end {
+        let mut item = [0u8; FIXED_SHIELDED_NOTE_HDR + 2 + MAX_NOTE_ENVELOPE_BYTES];
+        if let Some(n) = pack_shielded_note_record(cur, &mut item) {
+            if pos + 10 + n <= SLICE_CAP {
+                out[pos..pos + 8].copy_from_slice(&cur.to_be_bytes());
+                out[pos + 8..pos + 10].copy_from_slice(&(n as u16).to_be_bytes());
+                out[pos + 10..pos + 10 + n].copy_from_slice(&item[..n]);
+                pos += 10 + n;
+                returned += 1;
+            }
+        }
+        cur += 1;
+    }
+    out[8..16].copy_from_slice(&returned.to_be_bytes());
+    ret::write(&out[..pos]);
     Ok(())
 }
 

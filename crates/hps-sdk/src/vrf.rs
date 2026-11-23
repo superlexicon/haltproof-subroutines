@@ -690,6 +690,207 @@ pub fn he_lagrange_decrypt(
     Some((d_32, m_32, val))
 }
 
+// ============================================================================
+// Confidential Category Roll-Up, Range-Proof & Stealth Non-Insider Helpers
+// ============================================================================
+
+/// Bit-width of individual confidential line-item range proofs (`0 .. 16,777,215` units).
+pub const CONF_RANGE_BITS: usize = 24;
+/// Byte stride per proven binary bit (`[bit_ct_64 || cds_or01_proof_128]`).
+pub const CONF_BIT_PROOF_STRIDE: usize = 192;
+/// Total byte length of a 24-bit non-negative range proof (`24 * 192 = 4,608` bytes).
+pub const CONF_RANGE_PROOF_BYTES: usize = CONF_RANGE_BITS * CONF_BIT_PROOF_STRIDE;
+/// Default minimum slot count (with zero-value dummy commitment padding) per confidential roll-up.
+pub const CONF_MIN_PADDED_SLOTS: usize = 4;
+
+/// Subtracts two 64-byte ElGamal ciphertexts homomorphically: `Enc(a) - Enc(b) = Enc(a - b)`.
+pub fn he_sub_ciphertexts(ca: &[u8; 64], cb: &[u8; 64]) -> Option<[u8; 64]> {
+    let mut ca1 = [0u8; 32];
+    let mut ca2 = [0u8; 32];
+    let mut cb1 = [0u8; 32];
+    let mut cb2 = [0u8; 32];
+    ca1.copy_from_slice(&ca[0..32]);
+    ca2.copy_from_slice(&ca[32..64]);
+    cb1.copy_from_slice(&cb[0..32]);
+    cb2.copy_from_slice(&cb[32..64]);
+
+    let d1 = ec_elgamal_lincomb(&SCALAR_ONE_BYTES, &ca1, &SCALAR_MINUS_ONE_BYTES, &cb1)?;
+    let d2 = ec_elgamal_lincomb(&SCALAR_ONE_BYTES, &ca2, &SCALAR_MINUS_ONE_BYTES, &cb2)?;
+    let mut out = [0u8; 64];
+    out[0..32].copy_from_slice(&d1);
+    out[32..64].copy_from_slice(&d2);
+    Some(out)
+}
+
+/// Verifies a `4,608`-byte 24-bit binary-decomposition range proof under `pk_32` and
+/// deterministically reconstructs the 64-byte ElGamal ciphertext `C_slot = ∑ 2^b * C_b`,
+/// guaranteeing `0 <= value < 2^24` (`16,777,216`) without modulo-`ℓ` negative wrap-around.
+#[inline(never)]
+pub fn verify_he_range_u24(
+    pk_32: &[u8; 32],
+    ctx_prefix: &[u8],
+    slot_idx: u32,
+    packed_4608: &[u8],
+) -> Option<[u8; 64]> {
+    if packed_4608.len() != CONF_RANGE_PROOF_BYTES || ctx_prefix.len() > 192 {
+        return None;
+    }
+    const TAG: &[u8] = b"SLX_CONF_BIT01_V1:";
+    let mut ctx_buf = [0u8; 18 + 192 + 5];
+    ctx_buf[0..18].copy_from_slice(TAG);
+    let p_end = 18 + ctx_prefix.len();
+    ctx_buf[18..p_end].copy_from_slice(ctx_prefix);
+    ctx_buf[p_end..p_end + 4].copy_from_slice(&slot_idx.to_be_bytes());
+    let ctx_len = p_end + 5;
+
+    let mut bit_cts = [[0u8; 64]; CONF_RANGE_BITS];
+    let mut b = 0usize;
+    while b < CONF_RANGE_BITS {
+        let off = b * CONF_BIT_PROOF_STRIDE;
+        bit_cts[b].copy_from_slice(&packed_4608[off..off + 64]);
+        let mut proof_128 = [0u8; 128];
+        proof_128.copy_from_slice(&packed_4608[off + 64..off + 192]);
+        ctx_buf[p_end + 4] = b as u8;
+        if !he_verify_zero_or_one(pk_32, &bit_cts[b], &ctx_buf[..ctx_len], &proof_128) {
+            return None;
+        }
+        b += 1;
+    }
+
+    // Reconstruct `C_slot = ∑_{b=0}^{23} 2^b * bit_cts[b]` via Horner's method.
+    let mut acc = bit_cts[CONF_RANGE_BITS - 1];
+    let mut rev = CONF_RANGE_BITS - 1;
+    while rev > 0 {
+        rev -= 1;
+        acc = he_scale_ciphertext(&acc, 2)?;
+        acc = he_add_ciphertexts(&acc, &bit_cts[rev])?;
+    }
+    Some(acc)
+}
+
+/// Verifies a 64-byte Chaum-Pedersen DLEQ proof that `c_sum_64 = (R * B, public_amount * B + R * pk_32)`
+/// encrypts the exact integer `public_amount` under `pk_32` without revealing `R`.
+#[inline(never)]
+pub fn verify_he_sum_equals_u64(
+    pk_32: &[u8; 32],
+    c_sum_64: &[u8; 64],
+    public_amount: u64,
+    sum_ctx: &[u8],
+    dleq_proof_64: &[u8; 64],
+) -> bool {
+    let mut c1 = [0u8; 32];
+    let mut c2 = [0u8; 32];
+    c1.copy_from_slice(&c_sum_64[0..32]);
+    c2.copy_from_slice(&c_sum_64[32..64]);
+
+    let pub_pt = if public_amount == 0 {
+        IDENTITY_POINT_BYTES
+    } else {
+        let mut s_pub = [0u8; 32];
+        s_pub[0..8].copy_from_slice(&public_amount.to_le_bytes());
+        let s_zero = [0u8; 32];
+        let Some(p) =
+            ec_elgamal_lincomb(&s_pub, &ED25519_BASEPOINT_BYTES, &s_zero, &IDENTITY_POINT_BYTES)
+        else {
+            return false;
+        };
+        p
+    };
+
+    let Some(m_diff) =
+        ec_elgamal_lincomb(&SCALAR_ONE_BYTES, &c2, &SCALAR_MINUS_ONE_BYTES, &pub_pt)
+    else {
+        return false;
+    };
+
+    if c1 == IDENTITY_POINT_BYTES {
+        return m_diff == IDENTITY_POINT_BYTES && *dleq_proof_64 == [0u8; 64];
+    }
+    ec_dleq_verify(
+        &ED25519_BASEPOINT_BYTES,
+        &c1,
+        pk_32,
+        &m_diff,
+        sum_ctx,
+        dleq_proof_64,
+    )
+}
+
+/// Verifies a 64-byte prime-order `Edwards25519` Schnorr knowledge signature (`pubkey = secret * base`)
+/// over `msg_ctx` via diagonal Chaum-Pedersen DLEQ (`log_base(pubkey) == log_base(pubkey)`).
+pub fn verify_ed25519_schnorr(
+    base_32: &[u8; 32],
+    pubkey_32: &[u8; 32],
+    msg_ctx: &[u8],
+    sig_64: &[u8; 64],
+) -> bool {
+    if *base_32 == [0u8; 32]
+        || *base_32 == IDENTITY_POINT_BYTES
+        || *pubkey_32 == [0u8; 32]
+        || *pubkey_32 == IDENTITY_POINT_BYTES
+    {
+        return false;
+    }
+    ec_dleq_verify(base_32, pubkey_32, base_32, pubkey_32, msg_ctx, sig_64)
+}
+
+/// Verifies an `IAS 24` Stealth Counterparty Non-Insider Proof:
+/// Given `h_base_32 = ρ * B` and `p_blind_32 = ρ * PK_client` (`ρ != 0`), checks for every active
+/// Charter insider key `PK_j` that `Q_j = ρ * PK_j` (proven via DLEQ) satisfies `Q_j != p_blind_32`,
+/// mathematically proving `PK_client != PK_j` without revealing `PK_client`.
+#[inline(never)]
+pub fn verify_stealth_non_insider(
+    h_base_32: &[u8; 32],
+    p_blind_32: &[u8; 32],
+    insider_pks: &[[u8; 32]],
+    ctx_prefix: &[u8],
+    proof_blob: &[u8],
+) -> bool {
+    if *h_base_32 == [0u8; 32]
+        || *h_base_32 == IDENTITY_POINT_BYTES
+        || *p_blind_32 == [0u8; 32]
+        || *p_blind_32 == IDENTITY_POINT_BYTES
+        || ctx_prefix.len() > 192
+        || proof_blob.len() != insider_pks.len() * 96
+    {
+        return false;
+    }
+    const TAG: &[u8] = b"SLX_IAS24_NEQ_V1:";
+    let mut ctx_buf = [0u8; 17 + 192 + 4];
+    ctx_buf[0..17].copy_from_slice(TAG);
+    let p_end = 17 + ctx_prefix.len();
+    ctx_buf[17..p_end].copy_from_slice(ctx_prefix);
+    let ctx_len = p_end + 4;
+
+    let mut j = 0usize;
+    while j < insider_pks.len() {
+        let pk_j = &insider_pks[j];
+        if *pk_j != [0u8; 32] && *pk_j != IDENTITY_POINT_BYTES {
+            let off = j * 96;
+            let mut q_j = [0u8; 32];
+            let mut dleq_j = [0u8; 64];
+            q_j.copy_from_slice(&proof_blob[off..off + 32]);
+            dleq_j.copy_from_slice(&proof_blob[off + 32..off + 96]);
+            if q_j == *p_blind_32 || q_j == IDENTITY_POINT_BYTES {
+                return false;
+            }
+            ctx_buf[p_end..p_end + 4].copy_from_slice(&(j as u32).to_be_bytes());
+            if !ec_dleq_verify(
+                &ED25519_BASEPOINT_BYTES,
+                h_base_32,
+                pk_j,
+                &q_j,
+                &ctx_buf[..ctx_len],
+                &dleq_j,
+            ) {
+                return false;
+            }
+        }
+        j += 1;
+    }
+    true
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub mod mock_crypto {
     use super::{dkg_deal_byte_len, min_safe_validator_threshold, ActiveValidator, MAX_VRF_VALIDATORS};
@@ -1759,5 +1960,268 @@ pub mod mock_crypto {
             cur += giant_neg;
         }
         2
+    }
+
+    /// Deterministically derives a prime-order `Edwards25519` `(secret_scalar, pk_bytes_32)` pair
+    /// from `(seed_32, context_bytes)` (matching `@superlexicon/sdk/confidential`).
+    pub fn derive_ed25519_keypair(seed_32: &[u8; 32], ctx: &[u8]) -> (Scalar, [u8; 32]) {
+        let mut h = Sha512::new();
+        h.update(b"SLX_ID_ED25519_V1");
+        h.update(seed_32);
+        h.update((ctx.len() as u64).to_be_bytes());
+        h.update(ctx);
+        let mut s = Scalar::from_bytes_mod_order_wide(&h.finalize().into());
+        if s == Scalar::ZERO {
+            s = Scalar::ONE;
+        }
+        let pk = (&s * ED25519_BASEPOINT_TABLE).compress().to_bytes();
+        (s, pk)
+    }
+
+    /// Generates a `4,608`-byte 24-bit range proof under `pk_bytes` for `value < 2^24`,
+    /// returning `(slot_ct_64, slot_randomness_scalar, packed_4608)`.
+    pub fn prove_he_range_u24(
+        pk_bytes: &[u8; 32],
+        value: u64,
+        ctx_prefix: &[u8],
+        slot_idx: u32,
+        entropy_32: &[u8; 32],
+    ) -> Option<([u8; 64], Scalar, Vec<u8>)> {
+        if value >= (1u64 << super::CONF_RANGE_BITS) || ctx_prefix.len() > 192 {
+            return None;
+        }
+        let mut packed = vec![0u8; super::CONF_RANGE_PROOF_BYTES];
+        let mut r_bits = [Scalar::ZERO; super::CONF_RANGE_BITS];
+
+        for b in 0..super::CONF_RANGE_BITS {
+            let bit = ((value >> b) & 1) as u8;
+            let mut rh = Sha512::new();
+            rh.update(b"SLX_CONF_BIT_RAND_V1:");
+            rh.update(ctx_prefix);
+            rh.update(slot_idx.to_be_bytes());
+            rh.update(entropy_32);
+            rh.update([b as u8, bit]);
+            let mut rb = Scalar::from_bytes_mod_order_wide(&rh.finalize().into());
+            if rb == Scalar::ZERO {
+                rb = Scalar::ONE;
+            }
+            r_bits[b] = rb;
+
+            let mut bit_ctx = Vec::with_capacity(18 + ctx_prefix.len() + 5);
+            bit_ctx.extend_from_slice(b"SLX_CONF_BIT01_V1:");
+            bit_ctx.extend_from_slice(ctx_prefix);
+            bit_ctx.extend_from_slice(&slot_idx.to_be_bytes());
+            bit_ctx.push(b as u8);
+
+            let mut bit_ent = *entropy_32;
+            bit_ent[0] = bit_ent[0].wrapping_add((b as u8).wrapping_mul(41));
+            let (ct_64, proof_128) = prove_he_zero_or_one(pk_bytes, bit, &rb, &bit_ctx, &bit_ent)?;
+            let off = b * super::CONF_BIT_PROOF_STRIDE;
+            packed[off..off + 64].copy_from_slice(&ct_64);
+            packed[off + 64..off + 192].copy_from_slice(&proof_128);
+        }
+
+        let mut r_slot = r_bits[super::CONF_RANGE_BITS - 1];
+        for b in (0..super::CONF_RANGE_BITS - 1).rev() {
+            r_slot = r_slot + r_slot + r_bits[b];
+        }
+        let slot_ct = he_encrypt_u64(pk_bytes, value, &r_slot)?;
+        Some((slot_ct, r_slot, packed))
+    }
+
+    /// Generates a 64-byte Chaum-Pedersen DLEQ proof that `C_sum = (r_sum * B, public_amount * B + r_sum * Y)`
+    /// encrypts `public_amount` under `pk_bytes`.
+    pub fn prove_he_sum_equals_u64(
+        pk_bytes: &[u8; 32],
+        r_sum: &Scalar,
+        sum_ctx: &[u8],
+        entropy_32: &[u8; 32],
+    ) -> Option<[u8; 64]> {
+        if *r_sum == Scalar::ZERO {
+            return Some([0u8; 64]);
+        }
+        let y_pt = decode_prime_order_point(pk_bytes)?;
+        let c1_pt = r_sum * ED25519_BASEPOINT_TABLE;
+        let m_diff_pt = r_sum * y_pt;
+        Some(prove_dleq(
+            r_sum,
+            &ED25519_BASEPOINT_POINT,
+            &c1_pt,
+            &y_pt,
+            &m_diff_pt,
+            sum_ctx,
+            entropy_32,
+        ))
+    }
+
+    /// Signs `msg_ctx` with `secret` over `base_32` (`pubkey = secret * base_32`).
+    pub fn prove_ed25519_schnorr(
+        secret: &Scalar,
+        base_32: &[u8; 32],
+        msg_ctx: &[u8],
+        entropy_32: &[u8; 32],
+    ) -> Option<[u8; 64]> {
+        if *secret == Scalar::ZERO {
+            return None;
+        }
+        let base_pt = decode_prime_order_point(base_32)?;
+        let pub_pt = secret * base_pt;
+        Some(prove_dleq(
+            secret,
+            &base_pt,
+            &pub_pt,
+            &base_pt,
+            &pub_pt,
+            msg_ctx,
+            entropy_32,
+        ))
+    }
+
+    /// Builds stealth counterparty commitment `(h_base_32, p_blind_32)` and `IAS 24` non-insider proof blob
+    /// for `(rho, client_pk_32)` against `insider_pks`.
+    pub fn prove_stealth_non_insider(
+        rho: &Scalar,
+        client_pk_32: &[u8; 32],
+        insider_pks: &[[u8; 32]],
+        ctx_prefix: &[u8],
+        entropy_32: &[u8; 32],
+    ) -> Option<([u8; 32], [u8; 32], Vec<u8>)> {
+        if *rho == Scalar::ZERO {
+            return None;
+        }
+        let client_pt = decode_prime_order_point(client_pk_32)?;
+        let h_pt = rho * ED25519_BASEPOINT_TABLE;
+        let p_blind_pt = rho * client_pt;
+        let h_32 = h_pt.compress().to_bytes();
+        let p_blind_32 = p_blind_pt.compress().to_bytes();
+
+        let mut blob = vec![0u8; insider_pks.len() * 96];
+        for (j, pk_j) in insider_pks.iter().enumerate() {
+            if *pk_j == [0u8; 32] || *pk_j == super::IDENTITY_POINT_BYTES {
+                continue;
+            }
+            let ins_pt = decode_prime_order_point(pk_j)?;
+            let q_pt = rho * ins_pt;
+            let q_32 = q_pt.compress().to_bytes();
+            if q_32 == p_blind_32 {
+                return None; // Caller IS an insider!
+            }
+            let mut ctx = Vec::with_capacity(17 + ctx_prefix.len() + 4);
+            ctx.extend_from_slice(b"SLX_IAS24_NEQ_V1:");
+            ctx.extend_from_slice(ctx_prefix);
+            ctx.extend_from_slice(&(j as u32).to_be_bytes());
+            let mut ent_j = *entropy_32;
+            ent_j[1] = ent_j[1].wrapping_add(j as u8);
+            let dleq = prove_dleq(
+                rho,
+                &ED25519_BASEPOINT_POINT,
+                &h_pt,
+                &ins_pt,
+                &q_pt,
+                &ctx,
+                &ent_j,
+            );
+            let off = j * 96;
+            blob[off..off + 32].copy_from_slice(&q_32);
+            blob[off + 32..off + 96].copy_from_slice(&dleq);
+        }
+        Some((h_32, p_blind_32, blob))
+    }
+}
+
+#[cfg(test)]
+mod confidential_tests {
+    use super::*;
+
+    #[test]
+    fn u24_range_proofs_homomorphic_sum_schnorr_and_ias24_stealth_non_insider() {
+        let (_sk_audit, pk_audit) =
+            mock_crypto::derive_ed25519_keypair(&[0x11; 32], b"COMPANY_AUDIT_EP1");
+        let amounts = [12_500u64, 18_750u64, 0u64, 9_250u64]; // 4 slots including 0-value dummy!
+        let expected_total: u64 = amounts.iter().sum();
+        let ctx_prefix = b"PAYROLL_BATCH_TEST";
+
+        let mut c_sum = IDENTITY_CIPHERTEXT_64;
+        let mut r_sum = mock_crypto::Scalar::ZERO;
+        for (idx, &amt) in amounts.iter().enumerate() {
+            let mut ent = [0x22u8; 32];
+            ent[0] = idx as u8;
+            let (slot_ct, r_slot, packed_4608) =
+                mock_crypto::prove_he_range_u24(&pk_audit, amt, ctx_prefix, idx as u32, &ent)
+                    .expect("valid u24 range proof");
+            let verified_ct =
+                verify_he_range_u24(&pk_audit, ctx_prefix, idx as u32, &packed_4608)
+                    .expect("range proof must verify");
+            assert_eq!(slot_ct, verified_ct);
+
+            // Tampering any byte or slot_idx must fail verification
+            assert!(verify_he_range_u24(&pk_audit, ctx_prefix, (idx + 1) as u32, &packed_4608).is_none());
+
+            c_sum = he_add_ciphertexts(&c_sum, &verified_ct).unwrap();
+            r_sum += r_slot;
+        }
+
+        let sum_ctx = b"PAYROLL_SUM_CTX";
+        let sum_dleq =
+            mock_crypto::prove_he_sum_equals_u64(&pk_audit, &r_sum, sum_ctx, &[0x33; 32]).unwrap();
+        assert!(verify_he_sum_equals_u64(
+            &pk_audit,
+            &c_sum,
+            expected_total,
+            sum_ctx,
+            &sum_dleq
+        ));
+        // Wrong public sum must be rejected!
+        assert!(!verify_he_sum_equals_u64(
+            &pk_audit,
+            &c_sum,
+            expected_total + 1,
+            sum_ctx,
+            &sum_dleq
+        ));
+
+        // Stealth bilateral co-signing + IAS 24 insider non-membership check
+        let (_s_dir1, pk_dir1) = mock_crypto::derive_ed25519_keypair(&[0x41; 32], b"DIR1");
+        let (_s_cfo, pk_cfo) = mock_crypto::derive_ed25519_keypair(&[0x42; 32], b"CFO");
+        let (s_client, pk_client) =
+            mock_crypto::derive_ed25519_keypair(&[0x99; 32], b"EXTERNAL_DEFENSE_BUYER");
+        let insiders = [pk_dir1, pk_cfo];
+        let (rho, _) = mock_crypto::derive_ed25519_keypair(&[0x77; 32], b"STEALTH_RHO");
+
+        let (h_32, p_blind_32, neq_blob) = mock_crypto::prove_stealth_non_insider(
+            &rho,
+            &pk_client,
+            &insiders,
+            b"SVC_CONTRACT_0",
+            &[0x55; 32],
+        )
+        .expect("arm's-length client succeeds");
+        assert!(verify_stealth_non_insider(
+            &h_32,
+            &p_blind_32,
+            &insiders,
+            b"SVC_CONTRACT_0",
+            &neq_blob
+        ));
+
+        let cosign_sig =
+            mock_crypto::prove_ed25519_schnorr(&s_client, &h_32, b"COSIGN_SVC_0", &[0x66; 32])
+                .unwrap();
+        assert!(verify_ed25519_schnorr(
+            &h_32,
+            &p_blind_32,
+            b"COSIGN_SVC_0",
+            &cosign_sig
+        ));
+
+        // Insider trying to masquerade as external client MUST fail!
+        assert!(mock_crypto::prove_stealth_non_insider(
+            &rho,
+            &pk_dir1,
+            &insiders,
+            b"SVC_CONTRACT_0",
+            &[0x55; 32],
+        )
+        .is_none());
     }
 }
