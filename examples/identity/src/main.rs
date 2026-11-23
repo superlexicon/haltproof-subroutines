@@ -21,11 +21,37 @@ const NICKNAME_UPDATED: [u8; 32] = event_topic("NicknameUpdated(address,string)"
 const DELEGATE_UPDATED: [u8; 32] = event_topic("DelegateUpdated(address,bool)");
 const EXECUTED_CALL: [u8; 32] = event_topic("Executed(address,bytes4)");
 const AUTH_SIGNED: [u8; 32] = event_topic("AuthorizationSigned(address,uint64)");
+const HFS_ASSOC_UPDATED: [u8; 32] =
+    event_topic("HfsAssociationUpdated(address,bytes32,uint64)");
+const HFS_ASSOC_NOTIFIED: [u8; 32] =
+    event_topic("HfsAssociationNotified(address,bytes32,address)");
+const DELEGATED_HFS_ASSOC_UPDATED: [u8; 32] =
+    event_topic("DelegatedHfsAssociationUpdated(address,address,bytes32,uint64)");
+
+/// Validity states for subroutines in this Identity's Associated HFS Register:
+/// - `0` (`UNLISTED`): Not recorded in this Identity's register.
+/// - `1` (`PENDING`): Inbound / unverified association awaiting owner review (shown in Spam/Unverified).
+/// - `2` (`WHITELISTED`): Validly associated & whitelisted by owner/delegate.
+/// - `3` (`SPAM`): Explicitly rejected / blocked as spam; outbound calls to this HFS revert (`-29`).
+pub const HFS_STATUS_UNLISTED: u8 = 0;
+pub const HFS_STATUS_PENDING: u8 = 1;
+pub const HFS_STATUS_WHITELISTED: u8 = 2;
+pub const HFS_STATUS_SPAM: u8 = 3;
+
+pub const IDENTITY_ABI_VERSION: u64 = 2;
+const MAX_HFS_LABEL_LEN: usize = 64;
+const FIXED_HFS_REC_HDR: usize = 83; // [status:1][addr:20][type_id:32][blk:8][actor:20][lbl_len:2]
+const MAX_HFS_REC_BYTES: usize = FIXED_HFS_REC_HDR + MAX_HFS_LABEL_LEN;
+const MAX_HFS_SLICE_LIMIT: u64 = 64;
+const HFS_SLICE_OUT_CAP: usize = 16 + (MAX_HFS_SLICE_LIMIT as usize) * (8 + MAX_HFS_REC_BYTES);
+const MAX_TOTAL_HFS_ENTRIES: u64 = 512;
+const MAX_BATCH_ENTRIES: usize = 32;
 
 const KEY_INIT: &[u8] = b"id:init";
 const KEY_OWNER: &[u8] = b"id:owner";
 const KEY_HANDLE: &[u8] = b"id:handle";
 const KEY_NICKNAME: &[u8] = b"id:nick";
+const KEY_HFS_COUNT: &[u8] = b"id:hfs:cnt";
 
 hps_entry! {
     "initialize(address,string)"                                                      => handle_initialize,
@@ -80,6 +106,19 @@ hps_entry! {
     "setFunctionAuth(address,address,bytes4,bytes32,address)"                         => handle_set_function_auth,
     "authorizeModule(address,address,bytes32,bool,address)"                           => handle_authorize_module,
     "activateCharter(address,address)"                                                => handle_activate_charter,
+    "identityVersion()"                                                               => handle_identity_version,
+    "setHfsAssociation(address,bytes32,uint64,string)"                                => handle_set_hfs_association,
+    "setHfsAssociationBatch(bytes)"                                                   => handle_set_hfs_association_batch,
+    "notifyHfsAssociation(address,bytes32,string)"                                    => handle_notify_hfs_association,
+    "getHfsAssociationStatus(address)"                                                => handle_get_hfs_association_status,
+    "isHfsWhitelisted(address)"                                                       => handle_is_hfs_whitelisted,
+    "getHfsAssociationCount()"                                                        => handle_get_hfs_association_count,
+    "getHfsAssociationsSlice(uint64,uint64)"                                          => handle_get_hfs_associations_slice,
+    "setDelegatedHfsAssociation(address,bytes32,uint64,string)"                       => handle_set_delegated_hfs_association,
+    "setDelegatedHfsAssociationBatch(bytes)"                                          => handle_set_delegated_hfs_association_batch,
+    "notifyDelegatedHfsAssociation(address,address,bytes32,string)"                   => handle_notify_delegated_hfs_association,
+    "getDelegatedHfsAssociationStatus(address,address)"                               => handle_get_delegated_hfs_association_status,
+    "getDelegatedHfsAssociationsSlice(address,uint64,uint64)"                         => handle_get_delegated_hfs_associations_slice,
     "owner()"                                                                         => handle_owner,
     "isAuthorized(address)"                                                           => handle_is_authorized,
     "hasApprovedAuth(address)"                                                        => handle_has_approved_auth,
@@ -100,6 +139,194 @@ fn delegate_key(actor: &[u8; 20]) -> KeyBuilder<32> {
 
 fn auth_stamp_key(auth_obj: &[u8; 20]) -> KeyBuilder<32> {
     KeyBuilder::<32>::new().push(b"ast:").push(auth_obj)
+}
+
+fn hfs_status_key(ns_id: Option<&[u8; 20]>, hfs_addr: &[u8; 20]) -> KeyBuilder<64> {
+    match ns_id {
+        Some(sub) => KeyBuilder::<64>::new()
+            .push(b"dhfs:st:")
+            .push(sub)
+            .push(hfs_addr),
+        None => KeyBuilder::<64>::new().push(b"id:hfs:st:").push(hfs_addr),
+    }
+}
+
+fn hfs_idx_key(ns_id: Option<&[u8; 20]>, hfs_addr: &[u8; 20]) -> KeyBuilder<64> {
+    match ns_id {
+        Some(sub) => KeyBuilder::<64>::new()
+            .push(b"dhfs:idx:")
+            .push(sub)
+            .push(hfs_addr),
+        None => KeyBuilder::<64>::new().push(b"id:hfs:idx:").push(hfs_addr),
+    }
+}
+
+fn hfs_count_key(ns_id: Option<&[u8; 20]>) -> KeyBuilder<48> {
+    match ns_id {
+        Some(sub) => KeyBuilder::<48>::new().push(b"dhfs:cnt:").push(sub),
+        None => KeyBuilder::<48>::new().push(KEY_HFS_COUNT),
+    }
+}
+
+fn hfs_item_key(ns_id: Option<&[u8; 20]>, idx: u64) -> KeyBuilder<64> {
+    match ns_id {
+        Some(sub) => KeyBuilder::<64>::new()
+            .push(b"dhfs:itm:")
+            .push(sub)
+            .push_u64_be(idx),
+        None => KeyBuilder::<64>::new()
+            .push(b"id:hfs:itm:")
+            .push_u64_be(idx),
+    }
+}
+
+fn get_hfs_status_ns(ns_id: Option<&[u8; 20]>, hfs_addr: &[u8; 20]) -> u8 {
+    if *hfs_addr == [0u8; 20] {
+        return HFS_STATUS_UNLISTED;
+    }
+    let sk = hfs_status_key(ns_id, hfs_addr);
+    storage::get_u64(sk.as_slice()) as u8
+}
+
+fn has_deployed_wasm(addr: &[u8; 20]) -> bool {
+    if *addr == [0u8; 20] {
+        return false;
+    }
+    match context::code_hash_of(addr) {
+        Some(h) => h != [0u8; 32],
+        None => false,
+    }
+}
+
+fn pack_hfs_record(
+    status: u8,
+    hfs_addr: &[u8; 20],
+    type_id: &[u8; 32],
+    updated_block: u64,
+    actor: &[u8; 20],
+    label: &[u8],
+    out: &mut [u8; MAX_HFS_REC_BYTES],
+) -> usize {
+    let lbl_len = label.len().min(MAX_HFS_LABEL_LEN);
+    out[0] = status;
+    out[1..21].copy_from_slice(hfs_addr);
+    out[21..53].copy_from_slice(type_id);
+    out[53..61].copy_from_slice(&updated_block.to_be_bytes());
+    out[61..81].copy_from_slice(actor);
+    out[81..83].copy_from_slice(&(lbl_len as u16).to_be_bytes());
+    out[83..83 + lbl_len].copy_from_slice(&label[..lbl_len]);
+    83 + lbl_len
+}
+
+fn upsert_hfs_record_ns(
+    ns_id: Option<&[u8; 20]>,
+    hfs_addr: &[u8; 20],
+    type_id: &[u8; 32],
+    status: u8,
+    actor: &[u8; 20],
+    label: &[u8],
+) -> Result<(u64, [u8; 32]), i32> {
+    if *hfs_addr == [0u8; 20] {
+        return Err(-23);
+    }
+    if status != HFS_STATUS_PENDING
+        && status != HFS_STATUS_WHITELISTED
+        && status != HFS_STATUS_SPAM
+    {
+        return Err(-26);
+    }
+    if label.len() > MAX_HFS_LABEL_LEN {
+        return Err(-27);
+    }
+    if (status == HFS_STATUS_WHITELISTED || status == HFS_STATUS_PENDING)
+        && !has_deployed_wasm(hfs_addr)
+    {
+        return Err(-28); // Must be a deployed WASM HFS subroutine (not a raw EOA)
+    }
+
+    let ik_lookup = hfs_idx_key(ns_id, hfs_addr);
+    let existing_plus_one = storage::get_u64(ik_lookup.as_slice());
+    let now = context::block_number();
+
+    let mut eff_type = *type_id;
+    let mut prev_label_buf = [0u8; MAX_HFS_LABEL_LEN];
+    let mut prev_label_len = 0usize;
+
+    let idx = if existing_plus_one > 0 {
+        let i = existing_plus_one - 1;
+        let itm_k = hfs_item_key(ns_id, i);
+        let mut old_buf = [0u8; MAX_HFS_REC_BYTES];
+        let old_n = storage::get_into(itm_k.as_slice(), &mut old_buf).unwrap_or(0);
+        if old_n >= FIXED_HFS_REC_HDR {
+            if eff_type == [0u8; 32] {
+                eff_type.copy_from_slice(&old_buf[21..53]);
+            }
+            if label.is_empty() {
+                let l_len = u16::from_be_bytes([old_buf[81], old_buf[82]]) as usize;
+                let safe_l = l_len
+                    .min(MAX_HFS_LABEL_LEN)
+                    .min(old_n.saturating_sub(FIXED_HFS_REC_HDR));
+                prev_label_buf[..safe_l]
+                    .copy_from_slice(&old_buf[FIXED_HFS_REC_HDR..FIXED_HFS_REC_HDR + safe_l]);
+                prev_label_len = safe_l;
+            }
+        }
+        i
+    } else {
+        let ck = hfs_count_key(ns_id);
+        let cnt = storage::get_u64(ck.as_slice());
+        if cnt >= MAX_TOTAL_HFS_ENTRIES {
+            return Err(-30);
+        }
+        storage::set_u64(ck.as_slice(), cnt + 1);
+        storage::set_u64(ik_lookup.as_slice(), cnt + 1);
+        cnt
+    };
+
+    let eff_label: &[u8] = if !label.is_empty() {
+        label
+    } else {
+        &prev_label_buf[..prev_label_len]
+    };
+
+    let mut rec_buf = [0u8; MAX_HFS_REC_BYTES];
+    let rec_len = pack_hfs_record(
+        status,
+        hfs_addr,
+        &eff_type,
+        now,
+        actor,
+        eff_label,
+        &mut rec_buf,
+    );
+    let itm_k = hfs_item_key(ns_id, idx);
+    storage::set(itm_k.as_slice(), &rec_buf[..rec_len]);
+
+    let sk = hfs_status_key(ns_id, hfs_addr);
+    storage::set_u64(sk.as_slice(), status as u64);
+
+    Ok((idx, eff_type))
+}
+
+/// Outbound execution firewall + automatic `PENDING -> WHITELISTED` promotion when an authorized
+/// Identity owner/delegate actively invokes a subroutine.
+fn guard_and_promote_outbound_hfs(target: &[u8; 20]) -> Result<(), i32> {
+    let st = get_hfs_status_ns(None, target);
+    if st == HFS_STATUS_SPAM {
+        return Err(-29); // Blocked by Identity's on-chain Spam HFS firewall!
+    }
+    if st == HFS_STATUS_PENDING && has_deployed_wasm(target) {
+        let caller = context::msg_sender();
+        if let Ok((_, eff_type)) =
+            upsert_hfs_record_ns(None, target, &[0u8; 32], HFS_STATUS_WHITELISTED, &caller, &[])
+        {
+            events::emit(
+                &[HFS_ASSOC_UPDATED, addr_topic(target), eff_type],
+                &(HFS_STATUS_WHITELISTED as u64).to_be_bytes(),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn check_owner(actor: &[u8; 20]) -> Result<(), i32> {
@@ -242,6 +469,7 @@ fn handle_execute(args: &CalldataReader) -> Result<(), i32> {
     if sub_cd.len() < 4 {
         return Err(-25);
     }
+    guard_and_promote_outbound_hfs(&target)?;
 
     let sel = [sub_cd[0], sub_cd[1], sub_cd[2], sub_cd[3]];
     if sel == const { selector("approve()") }
@@ -266,6 +494,8 @@ fn handle_init_constitution_auth(args: &CalldataReader) -> Result<(), i32> {
     let target_hps = args.address(3).ok_or(-3)?;
     let policy_id = args.bytes32(4).ok_or(-3)?;
     let action_hash = args.bytes32(5).ok_or(-3)?;
+    guard_and_promote_outbound_hfs(&constitution)?;
+    guard_and_promote_outbound_hfs(&target_hps)?;
 
     let sub_cd = CallEncoder::<192>::new(const { selector("initializeFromConstitution(address,address,address,bytes32,bytes32)") })
     .push_address(&registry)
@@ -976,6 +1206,7 @@ fn handle_activate_charter(args: &CalldataReader) -> Result<(), i32> {
     require_authorized()?;
     let charter = args.address(0).ok_or(-3)?;
     let shareholder_auth = args.address(1).ok_or(-3)?;
+    guard_and_promote_outbound_hfs(&charter)?;
 
     let sub_cd = CallEncoder::<64>::new(const { selector("activateCharter(address)") })
         .push_address(&shareholder_auth);
@@ -993,6 +1224,7 @@ fn handle_approve_asset(args: &CalldataReader) -> Result<(), i32> {
     let spender = args.address(1).ok_or(-3)?;
     let amount = args.u64(2).ok_or(-3)?;
     let auth_obj = args.address(3).ok_or(-3)?;
+    guard_and_promote_outbound_hfs(&ledger)?;
 
     let sub_cd = CallEncoder::<128>::new(const { selector("approve(address,uint64,address)") })
         .push_address(&spender)
@@ -1003,6 +1235,319 @@ fn handle_approve_asset(args: &CalldataReader) -> Result<(), i32> {
         return Err(-24);
     }
     ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_identity_version(_args: &CalldataReader) -> Result<(), i32> {
+    ret::write_u64_word(IDENTITY_ABI_VERSION);
+    Ok(())
+}
+
+fn handle_set_hfs_association(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let caller = context::msg_sender();
+    let hfs_addr = args.address(0).ok_or(-3)?;
+    let type_id = args.bytes32(1).ok_or(-3)?;
+    let status_u64 = args.u64(2).ok_or(-3)?;
+    let label = args.dynamic_bytes(3).ok_or(-3)?;
+    if status_u64 > u8::MAX as u64 {
+        return Err(-26);
+    }
+    let status = status_u64 as u8;
+    let (_, eff_type) = upsert_hfs_record_ns(None, &hfs_addr, &type_id, status, &caller, label)?;
+    events::emit(
+        &[HFS_ASSOC_UPDATED, addr_topic(&hfs_addr), eff_type],
+        &(status as u64).to_be_bytes(),
+    );
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn apply_batch_ns(
+    ns_id: Option<&[u8; 20]>,
+    packed: &[u8],
+    actor: &[u8; 20],
+) -> Result<u64, i32> {
+    if packed.len() < 2 {
+        return Err(-3);
+    }
+    let count = u16::from_be_bytes([packed[0], packed[1]]) as usize;
+    if count > MAX_BATCH_ENTRIES {
+        return Err(-30);
+    }
+    let mut pos = 2usize;
+    let mut updated = 0u64;
+    let mut i = 0usize;
+    while i < count {
+        if pos + 54 > packed.len() {
+            return Err(-3);
+        }
+        let mut hfs_addr = [0u8; 20];
+        hfs_addr.copy_from_slice(&packed[pos..pos + 20]);
+        let mut type_id = [0u8; 32];
+        type_id.copy_from_slice(&packed[pos + 20..pos + 52]);
+        let status = packed[pos + 52];
+        let l_len = packed[pos + 53] as usize;
+        pos += 54;
+        if pos + l_len > packed.len() {
+            return Err(-3);
+        }
+        let label = &packed[pos..pos + l_len];
+        pos += l_len;
+
+        let (_, eff_type) = upsert_hfs_record_ns(ns_id, &hfs_addr, &type_id, status, actor, label)?;
+        match ns_id {
+            Some(sub) => {
+                events::emit(
+                    &[
+                        DELEGATED_HFS_ASSOC_UPDATED,
+                        addr_topic(sub),
+                        addr_topic(&hfs_addr),
+                        eff_type,
+                    ],
+                    &(status as u64).to_be_bytes(),
+                );
+            }
+            None => {
+                events::emit(
+                    &[HFS_ASSOC_UPDATED, addr_topic(&hfs_addr), eff_type],
+                    &(status as u64).to_be_bytes(),
+                );
+            }
+        }
+        updated += 1;
+        i += 1;
+    }
+    Ok(updated)
+}
+
+fn handle_set_hfs_association_batch(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let caller = context::msg_sender();
+    let packed = args.dynamic_bytes(0).ok_or(-3)?;
+    let updated = apply_batch_ns(None, packed, &caller)?;
+    ret::write_u64_word(updated);
+    Ok(())
+}
+
+fn handle_notify_hfs_association(args: &CalldataReader) -> Result<(), i32> {
+    if storage::get_u64(KEY_INIT) != 1 {
+        return Err(-20);
+    }
+    let caller = context::msg_sender();
+    let hfs_addr = args.address(0).ok_or(-3)?;
+    let type_id = args.bytes32(1).ok_or(-3)?;
+    let label = args.dynamic_bytes(2).ok_or(-3)?;
+
+    if !has_deployed_wasm(&hfs_addr) {
+        return Err(-28);
+    }
+
+    if is_actor_authorized(&caller) {
+        let (_, eff_type) = upsert_hfs_record_ns(
+            None,
+            &hfs_addr,
+            &type_id,
+            HFS_STATUS_WHITELISTED,
+            &caller,
+            label,
+        )?;
+        events::emit(
+            &[HFS_ASSOC_UPDATED, addr_topic(&hfs_addr), eff_type],
+            &(HFS_STATUS_WHITELISTED as u64).to_be_bytes(),
+        );
+        ret::write_u64_word(HFS_STATUS_WHITELISTED as u64);
+        return Ok(());
+    }
+
+    let cur = get_hfs_status_ns(None, &hfs_addr);
+    if cur != HFS_STATUS_UNLISTED {
+        // Never allow an external caller to overwrite owner's existing state!
+        ret::write_u64_word(cur as u64);
+        return Ok(());
+    }
+
+    let (_, eff_type) =
+        upsert_hfs_record_ns(None, &hfs_addr, &type_id, HFS_STATUS_PENDING, &caller, label)?;
+    events::emit(
+        &[HFS_ASSOC_NOTIFIED, addr_topic(&hfs_addr), eff_type],
+        &caller,
+    );
+    ret::write_u64_word(HFS_STATUS_PENDING as u64);
+    Ok(())
+}
+
+fn handle_get_hfs_association_status(args: &CalldataReader) -> Result<(), i32> {
+    let hfs_addr = args.address(0).ok_or(-3)?;
+    ret::write_u64_word(get_hfs_status_ns(None, &hfs_addr) as u64);
+    Ok(())
+}
+
+fn handle_is_hfs_whitelisted(args: &CalldataReader) -> Result<(), i32> {
+    let hfs_addr = args.address(0).ok_or(-3)?;
+    ret::write_bool(get_hfs_status_ns(None, &hfs_addr) == HFS_STATUS_WHITELISTED);
+    Ok(())
+}
+
+fn handle_get_hfs_association_count(_args: &CalldataReader) -> Result<(), i32> {
+    ret::write_u64_word(storage::get_u64(KEY_HFS_COUNT));
+    Ok(())
+}
+
+fn write_hfs_slice_ns(ns_id: Option<&[u8; 20]>, offset: u64, limit: u64) {
+    let safe_limit = limit.min(MAX_HFS_SLICE_LIMIT);
+    let ck = hfs_count_key(ns_id);
+    let total = storage::get_u64(ck.as_slice());
+
+    let mut out = [0u8; HFS_SLICE_OUT_CAP];
+    out[0..8].copy_from_slice(&total.to_be_bytes());
+
+    let mut pos = 16usize;
+    let mut returned = 0u64;
+    let mut i = offset;
+    let end = offset.saturating_add(safe_limit).min(total);
+    let mut item_buf = [0u8; MAX_HFS_REC_BYTES];
+
+    while i < end {
+        let ik = hfs_item_key(ns_id, i);
+        let n = storage::get_into(ik.as_slice(), &mut item_buf).unwrap_or(0);
+        if n >= FIXED_HFS_REC_HDR && pos + 8 + n <= HFS_SLICE_OUT_CAP {
+            out[pos..pos + 8].copy_from_slice(&i.to_be_bytes());
+            pos += 8;
+            out[pos..pos + n].copy_from_slice(&item_buf[..n]);
+            pos += n;
+            returned += 1;
+        }
+        i += 1;
+    }
+
+    out[8..16].copy_from_slice(&returned.to_be_bytes());
+    ret::write(&out[..pos]);
+}
+
+fn handle_get_hfs_associations_slice(args: &CalldataReader) -> Result<(), i32> {
+    let offset = args.u64(0).ok_or(-3)?;
+    let limit = args.u64(1).ok_or(-3)?;
+    write_hfs_slice_ns(None, offset, limit);
+    Ok(())
+}
+
+// --- Delegated v1 Identity Extension Mode (`msg_sender()` = legacy v1 Identity HFS via `execute`) ---
+
+fn require_caller_identity_hps() -> Result<[u8; 20], i32> {
+    if storage::get_u64(KEY_INIT) != 1 {
+        return Err(-20);
+    }
+    let caller = context::msg_sender();
+    if !has_deployed_wasm(&caller) {
+        return Err(-21);
+    }
+    Ok(caller)
+}
+
+fn handle_set_delegated_hfs_association(args: &CalldataReader) -> Result<(), i32> {
+    let subject_id = require_caller_identity_hps()?;
+    let hfs_addr = args.address(0).ok_or(-3)?;
+    let type_id = args.bytes32(1).ok_or(-3)?;
+    let status_u64 = args.u64(2).ok_or(-3)?;
+    let label = args.dynamic_bytes(3).ok_or(-3)?;
+    if status_u64 > u8::MAX as u64 {
+        return Err(-26);
+    }
+    let status = status_u64 as u8;
+    let (_, eff_type) =
+        upsert_hfs_record_ns(Some(&subject_id), &hfs_addr, &type_id, status, &subject_id, label)?;
+    events::emit(
+        &[
+            DELEGATED_HFS_ASSOC_UPDATED,
+            addr_topic(&subject_id),
+            addr_topic(&hfs_addr),
+            eff_type,
+        ],
+        &(status as u64).to_be_bytes(),
+    );
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_set_delegated_hfs_association_batch(args: &CalldataReader) -> Result<(), i32> {
+    let subject_id = require_caller_identity_hps()?;
+    let packed = args.dynamic_bytes(0).ok_or(-3)?;
+    let updated = apply_batch_ns(Some(&subject_id), packed, &subject_id)?;
+    ret::write_u64_word(updated);
+    Ok(())
+}
+
+fn handle_notify_delegated_hfs_association(args: &CalldataReader) -> Result<(), i32> {
+    if storage::get_u64(KEY_INIT) != 1 {
+        return Err(-20);
+    }
+    let caller = context::msg_sender();
+    let subject_id = args.address(0).ok_or(-3)?;
+    let hfs_addr = args.address(1).ok_or(-3)?;
+    let type_id = args.bytes32(2).ok_or(-3)?;
+    let label = args.dynamic_bytes(3).ok_or(-3)?;
+
+    if !has_deployed_wasm(&subject_id) || !has_deployed_wasm(&hfs_addr) {
+        return Err(-28);
+    }
+
+    if caller == subject_id {
+        let (_, eff_type) = upsert_hfs_record_ns(
+            Some(&subject_id),
+            &hfs_addr,
+            &type_id,
+            HFS_STATUS_WHITELISTED,
+            &caller,
+            label,
+        )?;
+        events::emit(
+            &[
+                DELEGATED_HFS_ASSOC_UPDATED,
+                addr_topic(&subject_id),
+                addr_topic(&hfs_addr),
+                eff_type,
+            ],
+            &(HFS_STATUS_WHITELISTED as u64).to_be_bytes(),
+        );
+        ret::write_u64_word(HFS_STATUS_WHITELISTED as u64);
+        return Ok(());
+    }
+
+    let cur = get_hfs_status_ns(Some(&subject_id), &hfs_addr);
+    if cur != HFS_STATUS_UNLISTED {
+        ret::write_u64_word(cur as u64);
+        return Ok(());
+    }
+
+    let (_, eff_type) = upsert_hfs_record_ns(
+        Some(&subject_id),
+        &hfs_addr,
+        &type_id,
+        HFS_STATUS_PENDING,
+        &caller,
+        label,
+    )?;
+    events::emit(
+        &[HFS_ASSOC_NOTIFIED, addr_topic(&hfs_addr), eff_type],
+        &caller,
+    );
+    ret::write_u64_word(HFS_STATUS_PENDING as u64);
+    Ok(())
+}
+
+fn handle_get_delegated_hfs_association_status(args: &CalldataReader) -> Result<(), i32> {
+    let subject_id = args.address(0).ok_or(-3)?;
+    let hfs_addr = args.address(1).ok_or(-3)?;
+    ret::write_u64_word(get_hfs_status_ns(Some(&subject_id), &hfs_addr) as u64);
+    Ok(())
+}
+
+fn handle_get_delegated_hfs_associations_slice(args: &CalldataReader) -> Result<(), i32> {
+    let subject_id = args.address(0).ok_or(-3)?;
+    let offset = args.u64(1).ok_or(-3)?;
+    let limit = args.u64(2).ok_or(-3)?;
+    write_hfs_slice_ns(Some(&subject_id), offset, limit);
     Ok(())
 }
 
@@ -1108,5 +1653,180 @@ mod tests {
             mock::transact_as(owner_eoa, id_hps, q_del.as_slice()).unwrap()[31],
             1
         );
+    }
+
+    fn encode_notify_hfs(hfs_addr: [u8; 20], type_id: [u8; 32], label: &[u8]) -> Vec<u8> {
+        let mut cd = Vec::new();
+        cd.extend_from_slice(&const { selector("notifyHfsAssociation(address,bytes32,string)") });
+        let mut w0 = [0u8; 32];
+        w0[12..32].copy_from_slice(&hfs_addr);
+        cd.extend_from_slice(&w0);
+        cd.extend_from_slice(&type_id);
+        let mut w2 = [0u8; 32];
+        w2[24..32].copy_from_slice(&96u64.to_be_bytes());
+        cd.extend_from_slice(&w2);
+        let mut lw = [0u8; 32];
+        lw[24..32].copy_from_slice(&(label.len() as u64).to_be_bytes());
+        cd.extend_from_slice(&lw);
+        cd.extend_from_slice(label);
+        cd.resize(cd.len() + (32 - label.len() % 32) % 32, 0);
+        cd
+    }
+
+    fn encode_set_hfs(
+        hfs_addr: [u8; 20],
+        type_id: [u8; 32],
+        status: u64,
+        label: &[u8],
+    ) -> Vec<u8> {
+        let mut cd = Vec::new();
+        cd.extend_from_slice(
+            &const { selector("setHfsAssociation(address,bytes32,uint64,string)") },
+        );
+        let mut w0 = [0u8; 32];
+        w0[12..32].copy_from_slice(&hfs_addr);
+        cd.extend_from_slice(&w0);
+        cd.extend_from_slice(&type_id);
+        let mut w2 = [0u8; 32];
+        w2[24..32].copy_from_slice(&status.to_be_bytes());
+        cd.extend_from_slice(&w2);
+        let mut w3 = [0u8; 32];
+        w3[24..32].copy_from_slice(&128u64.to_be_bytes());
+        cd.extend_from_slice(&w3);
+        let mut lw = [0u8; 32];
+        lw[24..32].copy_from_slice(&(label.len() as u64).to_be_bytes());
+        cd.extend_from_slice(&lw);
+        cd.extend_from_slice(label);
+        cd.resize(cd.len() + (32 - label.len() % 32) % 32, 0);
+        cd
+    }
+
+    fn encode_exec(target: [u8; 20], inner: &[u8]) -> Vec<u8> {
+        let mut cd = Vec::new();
+        cd.extend_from_slice(&const { selector("execute(address,bytes)") });
+        let mut w0 = [0u8; 32];
+        w0[12..32].copy_from_slice(&target);
+        cd.extend_from_slice(&w0);
+        let mut w1 = [0u8; 32];
+        w1[24..32].copy_from_slice(&64u64.to_be_bytes());
+        cd.extend_from_slice(&w1);
+        let mut lw = [0u8; 32];
+        lw[24..32].copy_from_slice(&(inner.len() as u64).to_be_bytes());
+        cd.extend_from_slice(&lw);
+        cd.extend_from_slice(inner);
+        cd.resize(cd.len() + (32 - inner.len() % 32) % 32, 0);
+        cd
+    }
+
+    fn dummy_target_hps(_cd: &[u8]) -> i32 {
+        ret::write_u64_word(42);
+        0
+    }
+
+    #[test]
+    fn hfs_whitelist_states_firewall_and_inbound_spam_isolation() {
+        mock::reset();
+        let id_hps = [0xAA; 20];
+        let owner_eoa = [0x01; 20];
+        let spammer_eoa = [0x66; 20];
+        let valid_charter = [0xC1; 20];
+        let invited_charter = [0xC2; 20];
+        let spam_charter = [0xC3; 20];
+        let fake_eoa = [0xEE; 20];
+
+        mock::register_hps(id_hps, dispatch_calldata);
+        mock::register_hps(valid_charter, dummy_target_hps);
+        mock::register_hps(invited_charter, dummy_target_hps);
+        mock::register_hps(spam_charter, dummy_target_hps);
+        mock::set_block_number(90_000);
+
+        mock::transact_as(owner_eoa, id_hps, &init_identity_cd(owner_eoa, b"alice.id")).unwrap();
+
+        let mut t_chr = [0u8; 32];
+        t_chr[..17].copy_from_slice(b"CORPORATE_CHARTER");
+
+        // 1. Rejects non-WASM EOA addresses in notifyHfsAssociation (-28)
+        assert_eq!(
+            mock::transact_as(
+                spammer_eoa,
+                id_hps,
+                &encode_notify_hfs(fake_eoa, t_chr, b"Fake EOA")
+            ),
+            Err(-28)
+        );
+
+        // 2. External caller notifying `invited_charter` & `spam_charter` records PENDING (1)
+        let r_inv = mock::transact_as(
+            spammer_eoa,
+            id_hps,
+            &encode_notify_hfs(invited_charter, t_chr, b"Invited Venture Pte. Ltd."),
+        )
+        .unwrap();
+        assert_eq!(r_inv[31], HFS_STATUS_PENDING);
+
+        let r_spm = mock::transact_as(
+            spammer_eoa,
+            id_hps,
+            &encode_notify_hfs(spam_charter, t_chr, b"Phishing Airdrop Corp"),
+        )
+        .unwrap();
+        assert_eq!(r_spm[31], HFS_STATUS_PENDING);
+
+        // 3. Owner explicitly whitelists `valid_charter` (2) and blocks `spam_charter` (3)
+        mock::transact_as(
+            owner_eoa,
+            id_hps,
+            &encode_set_hfs(
+                valid_charter,
+                t_chr,
+                HFS_STATUS_WHITELISTED as u64,
+                b"Sovereign Robotics Pte. Ltd.",
+            ),
+        )
+        .unwrap();
+        mock::transact_as(
+            owner_eoa,
+            id_hps,
+            &encode_set_hfs(spam_charter, [0u8; 32], HFS_STATUS_SPAM as u64, b""),
+        )
+        .unwrap();
+
+        // 4. Spammer CANNOT overwrite SPAM (3) or WHITELISTED (2) back to PENDING!
+        let r_retry = mock::transact_as(
+            spammer_eoa,
+            id_hps,
+            &encode_notify_hfs(spam_charter, t_chr, b"Try Overwrite"),
+        )
+        .unwrap();
+        assert_eq!(r_retry[31], HFS_STATUS_SPAM);
+
+        // 5. On-chain firewall blocks `execute` to `spam_charter` (-29)!
+        let ping_cd = [0x11, 0x22, 0x33, 0x44];
+        assert_eq!(
+            mock::transact_as(owner_eoa, id_hps, &encode_exec(spam_charter, &ping_cd)),
+            Err(-29)
+        );
+
+        // 6. Calling `execute` on `invited_charter` (currently PENDING = 1) succeeds AND auto-promotes to WHITELISTED (2)!
+        mock::transact_as(owner_eoa, id_hps, &encode_exec(invited_charter, &ping_cd)).unwrap();
+        let q_inv = CallEncoder::<64>::new(const { selector("getHfsAssociationStatus(address)") })
+            .push_address(&invited_charter);
+        assert_eq!(
+            mock::transact_as(owner_eoa, id_hps, q_inv.as_slice()).unwrap()[31],
+            HFS_STATUS_WHITELISTED
+        );
+
+        // 7. Slice query returns all 3 entries with preserved labels & exact states
+        let q_slice = CallEncoder::<96>::new(
+            const { selector("getHfsAssociationsSlice(uint64,uint64)") },
+        )
+        .push_u64(0)
+        .push_u64(32);
+        let raw = mock::transact_as(owner_eoa, id_hps, q_slice.as_slice()).unwrap();
+        let total = u64::from_be_bytes(raw[0..8].try_into().unwrap());
+        let returned = u64::from_be_bytes(raw[8..16].try_into().unwrap());
+        assert_eq!(total, 3);
+        assert_eq!(returned, 3);
+        assert_eq!(raw[16 + 8], HFS_STATUS_WHITELISTED); // invited_charter promoted to 2!
     }
 }
