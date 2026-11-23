@@ -37,6 +37,8 @@ const ALLOWED_ENV_IMPORTS: &[&str] = &[
     "host_he_verify_pok",
     "host_he_verify_decryption_share",
     "host_he_lagrange_decrypt",
+    "host_bp_verify_range_u64",
+    "host_bp_verify_r1cs",
 ];
 
 #[derive(Debug, Clone)]

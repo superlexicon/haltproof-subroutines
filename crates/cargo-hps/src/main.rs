@@ -369,10 +369,10 @@ fn cmd_build(
             })
         })
         .ok_or_else(|| anyhow!("selected crate has no `[[bin]]` or `cdylib` target"))?;
-    let artifact_stem = bin_target["name"]
+    let raw_target_name = bin_target["name"]
         .as_str()
-        .ok_or_else(|| anyhow!("missing target name"))?
-        .replace('-', "_");
+        .ok_or_else(|| anyhow!("missing target name"))?;
+    let artifact_stem = raw_target_name.replace('-', "_");
 
     println!(
         "Compiling HPS `{}` for wasm32-unknown-unknown (release, 2 MiB linear memory)...",
@@ -404,10 +404,16 @@ fn cmd_build(
         );
     }
 
-    let raw_wasm_path = target_root
-        .join("wasm32-unknown-unknown")
-        .join("release")
-        .join(format!("{artifact_stem}.wasm"));
+    let release_dir = target_root.join("wasm32-unknown-unknown").join("release");
+    let raw_wasm_path = {
+        let p_underscore = release_dir.join(format!("{artifact_stem}.wasm"));
+        let p_raw = release_dir.join(format!("{raw_target_name}.wasm"));
+        if p_underscore.exists() {
+            p_underscore
+        } else {
+            p_raw
+        }
+    };
     let raw_bytes = fs::read(&raw_wasm_path)
         .with_context(|| format!("expected compiled WASM at '{}'", raw_wasm_path.display()))?;
 

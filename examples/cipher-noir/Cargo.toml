@@ -11,3 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 hps-sdk = { path = "../../crates/hps-sdk" }
+
+[dev-dependencies]
+curve25519-dalek = "4"
+sha2 = "0.10"

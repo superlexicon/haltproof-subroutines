@@ -83,6 +83,7 @@ hps_entry! {
     "getFulfilledOutput(bytes32)"                                          => handle_get_fulfilled_output,
     "getDecryptionProof(bytes32)"                                          => handle_get_decryption_proof,
     "getDecryptedTallies(bytes32)"                                         => handle_get_decrypted_tallies,
+    "getDecryptedPoints(bytes32)"                                          => handle_get_decrypted_points,
 }
 
 #[derive(Clone, Copy)]
@@ -1415,7 +1416,18 @@ fn handle_submit_decryption_shares(args: &CalldataReader) -> Result<(), i32> {
             dmeta.max_plaintext_val,
         )
         .ok_or(-27)?;
-        let tally_u64 = maybe_tally.ok_or(-29)?;
+        let tally_u64 = if dmeta.max_plaintext_val == 0 {
+            // Raw-point / Zero-check mode (`max_plaintext_val == 0`):
+            // Returns `tally = 1` iff `M == 𝒪` (`m_32 == IDENTITY_POINT_BYTES`), `0` otherwise,
+            // while persisting full `(D_32, M_32)` points for DDH-blinded consumer protocols!
+            if m_32 == vrf::IDENTITY_POINT_BYTES {
+                1
+            } else {
+                0
+            }
+        } else {
+            maybe_tally.ok_or(-29)?
+        };
 
         let f_off = slot * 72;
         fulfilled_blob[f_off..f_off + 32].copy_from_slice(&d_32);
@@ -1495,6 +1507,37 @@ fn handle_get_decrypted_tallies(args: &CalldataReader) -> Result<(), i32> {
         }
     }
     ret::write(&out[..18 + slot_count * 8]);
+    Ok(())
+}
+
+/// Compact decrypted-point reader (`[status:1][slot_count:1][epoch_id_be8][signer_bitmap_be8][slot_count * (D_32 || M_32)]`)
+/// for DDH-blinded threshold card dealing and 1-bit blind equality checks.
+fn handle_get_decrypted_points(args: &CalldataReader) -> Result<(), i32> {
+    let dec_req_id = args.bytes32(0).ok_or(-3)?;
+    let dmeta = load_dec_req(&dec_req_id).ok_or(-22)?;
+    let slot_count = (dmeta.slot_count as usize).min(MAX_DEC_SLOTS);
+    let mut out = [0u8; 18 + MAX_DEC_SLOTS * 64];
+    out[0] = dmeta.status;
+    out[1] = slot_count as u8;
+    out[2..10].copy_from_slice(&dmeta.epoch_id.to_be_bytes());
+    out[10..18].copy_from_slice(&dmeta.signer_bitmap.to_be_bytes());
+    if dmeta.status == REQ_FULFILLED && slot_count > 0 {
+        let mut fbuf = [0u8; MAX_DEC_SLOTS * 72];
+        if let Some(rn) = storage::get_into(
+            key_dec_fulfilled(&dec_req_id).as_slice(),
+            &mut fbuf[..slot_count * 72],
+        ) {
+            if rn >= slot_count * 72 {
+                let mut s = 0usize;
+                while s < slot_count {
+                    out[18 + s * 64..18 + (s + 1) * 64]
+                        .copy_from_slice(&fbuf[s * 72..s * 72 + 64]);
+                    s += 1;
+                }
+            }
+        }
+    }
+    ret::write(&out[..18 + slot_count * 64]);
     Ok(())
 }
 

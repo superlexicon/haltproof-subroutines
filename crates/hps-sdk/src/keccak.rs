@@ -155,6 +155,134 @@ pub const fn keccak256(input: &[u8]) -> [u8; 32] {
     out
 }
 
+#[inline(never)]
+fn keccak_f1600_mut(st: &mut [u64; 25]) {
+    let mut round = 0usize;
+    while round < 24 {
+        let b0 = st[0] ^ st[5] ^ st[10] ^ st[15] ^ st[20];
+        let b1 = st[1] ^ st[6] ^ st[11] ^ st[16] ^ st[21];
+        let b2 = st[2] ^ st[7] ^ st[12] ^ st[17] ^ st[22];
+        let b3 = st[3] ^ st[8] ^ st[13] ^ st[18] ^ st[23];
+        let b4 = st[4] ^ st[9] ^ st[14] ^ st[19] ^ st[24];
+
+        let t0 = b4 ^ b1.rotate_left(1);
+        let t1 = b0 ^ b2.rotate_left(1);
+        let t2 = b1 ^ b3.rotate_left(1);
+        let t3 = b2 ^ b4.rotate_left(1);
+        let t4 = b3 ^ b0.rotate_left(1);
+
+        st[0] ^= t0; st[5] ^= t0; st[10] ^= t0; st[15] ^= t0; st[20] ^= t0;
+        st[1] ^= t1; st[6] ^= t1; st[11] ^= t1; st[16] ^= t1; st[21] ^= t1;
+        st[2] ^= t2; st[7] ^= t2; st[12] ^= t2; st[17] ^= t2; st[22] ^= t2;
+        st[3] ^= t3; st[8] ^= t3; st[13] ^= t3; st[18] ^= t3; st[23] ^= t3;
+        st[4] ^= t4; st[9] ^= t4; st[14] ^= t4; st[19] ^= t4; st[24] ^= t4;
+
+        let r1 = st[1].rotate_left(1);
+        let r6 = st[6].rotate_left(44);
+        let r9 = st[9].rotate_left(20);
+        let r22 = st[22].rotate_left(61);
+        let r14 = st[14].rotate_left(39);
+        let r20 = st[20].rotate_left(18);
+        let r2 = st[2].rotate_left(62);
+        let r12 = st[12].rotate_left(43);
+        let r13 = st[13].rotate_left(25);
+        let r19 = st[19].rotate_left(8);
+        let r23 = st[23].rotate_left(56);
+        let r15 = st[15].rotate_left(41);
+        let r4 = st[4].rotate_left(27);
+        let r24 = st[24].rotate_left(14);
+        let r21 = st[21].rotate_left(2);
+        let r8 = st[8].rotate_left(55);
+        let r16 = st[16].rotate_left(45);
+        let r5 = st[5].rotate_left(36);
+        let r3 = st[3].rotate_left(28);
+        let r18 = st[18].rotate_left(21);
+        let r17 = st[17].rotate_left(15);
+        let r11 = st[11].rotate_left(10);
+        let r7 = st[7].rotate_left(6);
+        let r10 = st[10].rotate_left(3);
+
+        st[10] = r1; st[7] = r10; st[11] = r7; st[17] = r11; st[18] = r17;
+        st[3] = r18; st[5] = r3; st[16] = r5; st[8] = r16; st[21] = r8;
+        st[24] = r21; st[4] = r24; st[15] = r4; st[23] = r15; st[19] = r23;
+        st[13] = r19; st[12] = r13; st[2] = r12; st[20] = r2; st[14] = r20;
+        st[22] = r14; st[9] = r22; st[6] = r9; st[1] = r6;
+
+        let (a0, a1, a2, a3, a4) = (st[0], st[1], st[2], st[3], st[4]);
+        st[0] = a0 ^ ((!a1) & a2); st[1] = a1 ^ ((!a2) & a3); st[2] = a2 ^ ((!a3) & a4); st[3] = a3 ^ ((!a4) & a0); st[4] = a4 ^ ((!a0) & a1);
+        let (a0, a1, a2, a3, a4) = (st[5], st[6], st[7], st[8], st[9]);
+        st[5] = a0 ^ ((!a1) & a2); st[6] = a1 ^ ((!a2) & a3); st[7] = a2 ^ ((!a3) & a4); st[8] = a3 ^ ((!a4) & a0); st[9] = a4 ^ ((!a0) & a1);
+        let (a0, a1, a2, a3, a4) = (st[10], st[11], st[12], st[13], st[14]);
+        st[10] = a0 ^ ((!a1) & a2); st[11] = a1 ^ ((!a2) & a3); st[12] = a2 ^ ((!a3) & a4); st[13] = a3 ^ ((!a4) & a0); st[14] = a4 ^ ((!a0) & a1);
+        let (a0, a1, a2, a3, a4) = (st[15], st[16], st[17], st[18], st[19]);
+        st[15] = a0 ^ ((!a1) & a2); st[16] = a1 ^ ((!a2) & a3); st[17] = a2 ^ ((!a3) & a4); st[18] = a3 ^ ((!a4) & a0); st[19] = a4 ^ ((!a0) & a1);
+        let (a0, a1, a2, a3, a4) = (st[20], st[21], st[22], st[23], st[24]);
+        st[20] = a0 ^ ((!a1) & a2); st[21] = a1 ^ ((!a2) & a3); st[22] = a2 ^ ((!a3) & a4); st[23] = a3 ^ ((!a4) & a0); st[24] = a4 ^ ((!a0) & a1);
+
+        st[0] ^= RC[round];
+        round += 1;
+    }
+}
+
+/// Zero-allocation `#![no_std]` streaming Keccak-256 sponge hasher.
+pub struct KeccakHasher {
+    state: [u64; 25],
+    buf: [u8; 136],
+    pos: usize,
+}
+
+impl KeccakHasher {
+    pub const fn new() -> Self {
+        Self {
+            state: [0u64; 25],
+            buf: [0u8; 136],
+            pos: 0,
+        }
+    }
+
+    pub fn update(&mut self, data: &[u8]) {
+        let mut idx = 0usize;
+        while idx < data.len() {
+            let take = (136 - self.pos).min(data.len() - idx);
+            self.buf[self.pos..self.pos + take].copy_from_slice(&data[idx..idx + take]);
+            self.pos += take;
+            idx += take;
+            if self.pos == 136 {
+                let mut lane = 0;
+                while lane < 17 {
+                    self.state[lane] ^= load_u64_le(&self.buf, lane * 8);
+                    lane += 1;
+                }
+                keccak_f1600_mut(&mut self.state);
+                self.pos = 0;
+            }
+        }
+    }
+
+    pub fn finalize(mut self) -> [u8; 32] {
+        let mut b = self.pos;
+        while b < 136 {
+            self.buf[b] = 0;
+            b += 1;
+        }
+        self.buf[self.pos] ^= 0x01;
+        self.buf[135] ^= 0x80;
+        let mut lane = 0;
+        while lane < 17 {
+            self.state[lane] ^= load_u64_le(&self.buf, lane * 8);
+            lane += 1;
+        }
+        keccak_f1600_mut(&mut self.state);
+        let mut out = [0u8; 32];
+        let mut w = 0;
+        while w < 4 {
+            out[w * 8..(w + 1) * 8].copy_from_slice(&self.state[w].to_le_bytes());
+            w += 1;
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{event_topic, selector};

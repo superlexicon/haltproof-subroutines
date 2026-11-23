@@ -14,6 +14,7 @@
 
 #![cfg_attr(target_arch = "wasm32", no_std)]
 
+pub mod bulletproofs;
 pub mod governance;
 pub mod ifrs;
 pub mod keccak;
