@@ -27,6 +27,7 @@ members = [
     "examples/vrf-beacon",
     "examples/lottery",
     "examples/secret-ballot",
+    "examples/subnet-registry",
 ]
 
 [workspace.package]

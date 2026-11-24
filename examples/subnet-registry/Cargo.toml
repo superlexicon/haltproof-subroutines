@@ -1,0 +1,13 @@
+[package]
+name = "subnet-registry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Global On-Chain Subnet & Validator Stats Endpoint Registry (HPS #23) — stores SuperLexicon subnet metadata, GPS coordinates, and RPC/PubSub validator URLs on-chain with operator ownership guards and 1-call binary slice queries"
+
+[[bin]]
+name = "subnet_registry"
+path = "src/main.rs"
+
+[dependencies]
+hps-sdk = { path = "../../crates/hps-sdk" }
