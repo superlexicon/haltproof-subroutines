@@ -24,7 +24,7 @@ use hps_sdk::{context, event_topic, events, hps_entry, ret, storage};
 
 pub const MAX_POST_RING: u32 = 32;
 pub const MAX_POST_LEN: usize = 280;
-pub const MAX_DM_LEN: usize = 280;
+pub const MAX_DM_LEN: usize = 768;
 pub const MAX_COMMENT_LEN: usize = 160;
 
 const KEY_CFG: &[u8] = b"sf:cfg";
@@ -314,7 +314,7 @@ fn handle_send_dm(args: &CalldataReader) -> Result<(), i32> {
     }
 
     let dm_ch = canonical_dm_channel(&cfg.charter, &caller, &recipient);
-    messaging_post_attributed::<512>(&cfg.messaging, &dm_ch, &caller, msg)?;
+    messaging_post_attributed::<1024>(&cfg.messaging, &dm_ch, &caller, msg)?;
 
     let mut ev = [0u8; 40];
     ev[0..20].copy_from_slice(&caller);
