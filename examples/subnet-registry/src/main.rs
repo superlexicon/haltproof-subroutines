@@ -19,6 +19,8 @@ use hps_sdk::{context, event_topic, events, hps_entry, ret, storage};
 
 pub const STATUS_ACTIVE: u8 = 1;
 pub const STATUS_ARCHIVED: u8 = 2;
+/// Forming / Waiting-for-Peers beacon (`< min_validators`, advertising GPS + RF frequency until quorum locks).
+pub const STATUS_FORMING: u8 = 3;
 
 const MAX_SID_LEN: usize = 32;
 const MAX_NAME_LEN: usize = 80;
@@ -120,6 +122,14 @@ fn id_lookup_key(sid: &[u8]) -> KeyBuilder<64> {
 
 fn item_key(idx: u64) -> KeyBuilder<32> {
     KeyBuilder::<32>::new().push(b"sub:").push_u64_be(idx)
+}
+
+/// Bounded `no_std` scan checking whether `endpoints` JSON marks `"forming":true` / `"forming": true`.
+fn endpoints_marks_forming(endpoints: &[u8]) -> bool {
+    let needle_a = br#""forming":true"#;
+    let needle_b = br#""forming": true"#;
+    endpoints.windows(needle_a.len()).any(|w| w == needle_a)
+        || endpoints.windows(needle_b.len()).any(|w| w == needle_b)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -278,7 +288,17 @@ fn handle_upsert_subnet(args: &CalldataReader) -> Result<(), i32> {
             prev_reg.copy_from_slice(&old_buf[82..102]);
             prev_reg
         };
-        let st = old_buf[0];
+        let prev_st = old_buf[0];
+        let st = if prev_st == STATUS_ARCHIVED {
+            STATUS_ARCHIVED
+        } else if endpoints_marks_forming(endpoints) {
+            STATUS_FORMING
+        } else if prev_st == STATUS_FORMING && validator_count >= 3 {
+            // Automatically promote a forming subnet to ACTIVE once quorum (>=3) is reached!
+            STATUS_ACTIVE
+        } else {
+            prev_st
+        };
         let n = pack_subnet_record(
             st,
             sid,
@@ -302,9 +322,14 @@ fn handle_upsert_subnet(args: &CalldataReader) -> Result<(), i32> {
         let idx = storage::get_u64(KEY_TOTAL);
         storage::set_u64(KEY_TOTAL, idx + 1);
         storage::set_u64(lk.as_slice(), idx + 1);
+        let init_status = if endpoints_marks_forming(endpoints) {
+            STATUS_FORMING
+        } else {
+            STATUS_ACTIVE
+        };
 
         let n = pack_subnet_record(
-            STATUS_ACTIVE,
+            init_status,
             sid,
             name,
             transport,
@@ -322,7 +347,7 @@ fn handle_upsert_subnet(args: &CalldataReader) -> Result<(), i32> {
         );
         let ik = item_key(idx);
         storage::set(ik.as_slice(), &rec_buf[..n]);
-        (idx, STATUS_ACTIVE, caller, operator_identity)
+        (idx, init_status, caller, operator_identity)
     };
 
     let sid_hash = keccak256(sid);
@@ -347,7 +372,10 @@ fn handle_set_subnet_status(args: &CalldataReader) -> Result<(), i32> {
     require_init()?;
     let raw_sid = args.dynamic_bytes(0).ok_or(-1)?;
     let next_status = args.u64(1).ok_or(-1)?;
-    if next_status != (STATUS_ACTIVE as u64) && next_status != (STATUS_ARCHIVED as u64) {
+    if next_status != (STATUS_ACTIVE as u64)
+        && next_status != (STATUS_ARCHIVED as u64)
+        && next_status != (STATUS_FORMING as u64)
+    {
         return Err(-18);
     }
 
@@ -685,5 +713,78 @@ mod tests {
         let lon1 = i32::from_be_bytes(r1[14..18].try_into().unwrap());
         assert_eq!(lat1, -338_688_000);
         assert_eq!(lon1, -706_693_000);
+    }
+
+    #[test]
+    fn forming_subnet_advertises_gps_and_freq_then_promotes_to_active_at_three_peers() {
+        mock::reset();
+        let reg = [0xBB; 20];
+        let admin = [0x01; 20];
+        let solo_op = [0x04; 20];
+
+        mock::register_hps(reg, dispatch_calldata);
+        mock::set_block_number(7_000);
+
+        let init_cd = CallEncoder::<128>::new(selector("initialize(address)")).push_address(&admin);
+        assert!(mock::transact_as(admin, reg, init_cd.as_slice()).is_ok());
+
+        // 1. Solo node advertises GPS + 915.250 MHz while waiting for 2 more peers (1/3)
+        let forming_ep = br#"{"forming":true,"minValidators":3,"haveValidators":1,"fuzzyRadiusM":500,"locationLabel":"Austin Hill Country, TX"}"#;
+        let cd_form = encode_upsert(
+            b"form-atx-915",
+            b"Austin Hill Country Forming Mesh",
+            b"flrc",
+            915_250_000,
+            1,
+            302_672_000,
+            -977_431_000,
+            &[0u8; 20],
+            &[0u8; 20],
+            forming_ep,
+        );
+        assert!(mock::transact_as(solo_op, reg, &cd_form).is_ok());
+
+        let get_cd = {
+            let mut v = Vec::new();
+            v.extend_from_slice(&selector("getSubnetById(string)"));
+            let mut w = [0u8; 32];
+            w[31] = 32;
+            v.extend_from_slice(&w);
+            let sid = b"form-atx-915";
+            let mut lw = [0u8; 32];
+            lw[31] = sid.len() as u8;
+            v.extend_from_slice(&lw);
+            v.extend_from_slice(sid);
+            v.extend(std::iter::repeat(0u8).take(32 - sid.len()));
+            v
+        };
+        let rec1 = mock::transact_as(solo_op, reg, &get_cd).unwrap();
+        assert_eq!(rec1[8], STATUS_FORMING);
+        assert_eq!(u32::from_be_bytes(rec1[14..18].try_into().unwrap()), 1);
+        assert_eq!(
+            u64::from_be_bytes(rec1[26..34].try_into().unwrap()),
+            915_250_000
+        );
+
+        // 2. Once 3/3 peers lock quorum & start Block 0, upserting with validator_count=3 & forming:false promotes to STATUS_ACTIVE!
+        mock::set_block_number(7_025);
+        let active_ep = br#"{"forming":false,"locationLabel":"Austin Hill Country, TX","publicRpcUrls":[]}"#;
+        let cd_act = encode_upsert(
+            b"form-atx-915",
+            b"Austin Hill Country 915.25 MHz Mesh",
+            b"flrc",
+            915_250_000,
+            3,
+            302_672_000,
+            -977_431_000,
+            &[0u8; 20],
+            &[0u8; 20],
+            active_ep,
+        );
+        assert!(mock::transact_as(solo_op, reg, &cd_act).is_ok());
+
+        let rec2 = mock::transact_as(solo_op, reg, &get_cd).unwrap();
+        assert_eq!(rec2[8], STATUS_ACTIVE);
+        assert_eq!(u32::from_be_bytes(rec2[14..18].try_into().unwrap()), 3);
     }
 }
