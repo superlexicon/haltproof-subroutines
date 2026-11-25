@@ -28,6 +28,7 @@ members = [
     "examples/lottery",
     "examples/secret-ballot",
     "examples/subnet-registry",
+    "examples/reward-voucher",
 ]
 
 [workspace.package]
