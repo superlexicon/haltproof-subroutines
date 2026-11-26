@@ -30,11 +30,12 @@
 
 use hps_sdk::abi::CalldataReader;
 use hps_sdk::call::{self, CallEncoder};
+use hps_sdk::governance::SUBGROUP_DEVELOPERS;
 use hps_sdk::keccak::keccak256;
 use hps_sdk::storage::KeyBuilder;
 use hps_sdk::{context, event_topic, events, hps_entry, ret, selector, storage};
 
-pub const APP_STORE_ABI_VERSION: u64 = 1;
+pub const APP_STORE_ABI_VERSION: u64 = 2;
 
 pub const STATUS_ACTIVE: u8 = 1;
 pub const STATUS_ARCHIVED: u8 = 2;
@@ -75,6 +76,7 @@ pub const ERR_ALREADY_INIT: i32 = -11;
 pub const ERR_NOT_ADMIN: i32 = -12;
 pub const ERR_UNAUTHORIZED_PUBLISHER: i32 = -14;
 pub const ERR_SLUG_OWNED_BY_OTHER: i32 = -15;
+pub const ERR_NOT_AUTHORIZED_DEVELOPER: i32 = -16;
 pub const ERR_INVALID_CHUNK_PARAMS: i32 = -33;
 pub const ERR_BUNDLE_HASH_MISMATCH: i32 = -34;
 pub const ERR_BUNDLE_NOT_SEALED: i32 = -35;
@@ -83,13 +85,19 @@ pub const ERR_APP_NOT_FOUND: i32 = -37;
 
 const KEY_INIT: &[u8] = b"as:init";
 const KEY_ADMIN: &[u8] = b"as:admin";
+const KEY_DEV_CHARTER: &[u8] = b"as:dev_chr";
+const KEY_DEV_SUBGROUP: &[u8] = b"as:dev_sgrp";
 const KEY_TOTAL_APPS: &[u8] = b"as:total_apps";
 const KEY_TOTAL_BUNDLES: &[u8] = b"as:total_bundles";
 
 const SEL_ID_OWNER: [u8; 4] = selector("owner()");
 const SEL_ID_IS_DEVICE: [u8; 4] = selector("isOwnerDevice(address)");
+const SEL_CHR_IS_ACTIVE: [u8; 4] = selector("isActive()");
+const SEL_CHR_IS_DEV_ACTOR: [u8; 4] = selector("isSubgroupAuthorizedActor(bytes32,address)");
 
 const EV_INITIALIZED: [u8; 32] = event_topic("AppStoreInitialized(address)");
+const EV_DEV_GATE_UPDATED: [u8; 32] =
+    event_topic("AuthorizedPublisherGroupUpdated(address,bytes32)");
 const EV_BUNDLE_SEALED: [u8; 32] =
     event_topic("UiBundleSealed(bytes32,address,uint64,uint64,uint64)");
 const EV_APP_PUBLISHED: [u8; 32] =
@@ -103,6 +111,10 @@ static mut SLICE_OUT_SCRATCH: [u8; SLICE_OUT_CAP] = [0u8; SLICE_OUT_CAP];
 
 hps_entry! {
     "initialize(address)"                                                                                      => handle_initialize,
+    "initializeWithDeveloperGate(address,address,bytes32)"                                                     => handle_initialize_with_dev_gate,
+    "setAuthorizedPublisherGroup(address,bytes32)"                                                             => handle_set_authorized_publisher_group,
+    "authorizedPublisherGroup()"                                                                               => handle_authorized_publisher_group,
+    "canPublish(address)"                                                                                      => handle_can_publish,
     "abiVersion()"                                                                                             => handle_abi_version,
     "admin()"                                                                                                  => handle_admin,
     "rotateAdmin(address)"                                                                                     => handle_rotate_admin,
@@ -166,6 +178,39 @@ fn caller_is_admin(caller: &[u8; 20]) -> bool {
         return false;
     }
     is_authorized_for_identity(caller, &adm)
+}
+
+fn get_dev_gate() -> ([u8; 20], [u8; 32]) {
+    let chr = storage::get_address(KEY_DEV_CHARTER).unwrap_or([0u8; 20]);
+    let sgrp = storage::get_bytes32(KEY_DEV_SUBGROUP).unwrap_or(SUBGROUP_DEVELOPERS);
+    let norm_sgrp = if sgrp == [0u8; 32] {
+        SUBGROUP_DEVELOPERS
+    } else {
+        sgrp
+    };
+    (chr, norm_sgrp)
+}
+
+fn can_actor_publish(actor: &[u8; 20]) -> bool {
+    if *actor == [0u8; 20] {
+        return false;
+    }
+    if caller_is_admin(actor) {
+        return true;
+    }
+    let (dev_chr, dev_sgrp) = get_dev_gate();
+    if dev_chr == [0u8; 20] {
+        // Standalone test mode when no CorporateCharter developer gate has been bound yet
+        return true;
+    }
+    let act_cd = CallEncoder::<16>::new(SEL_CHR_IS_ACTIVE);
+    if !matches!(call::call_bool(&dev_chr, act_cd.as_slice()), Ok(true)) {
+        return false;
+    }
+    let mem_cd = CallEncoder::<96>::new(SEL_CHR_IS_DEV_ACTOR)
+        .push_bytes32(&dev_sgrp)
+        .push_address(actor);
+    matches!(call::call_bool(&dev_chr, mem_cd.as_slice()), Ok(true))
 }
 
 fn bundle_meta_key(ui_hash: &[u8; 32]) -> KeyBuilder<64> {
@@ -274,6 +319,68 @@ fn handle_initialize(r: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
+fn handle_initialize_with_dev_gate(r: &CalldataReader) -> Result<(), i32> {
+    if storage::get_u64(KEY_INIT) == 1 {
+        return Err(ERR_ALREADY_INIT);
+    }
+    let admin = r.address(0).ok_or(ERR_BAD_ARGS)?;
+    let dev_charter = r.address(1).ok_or(ERR_BAD_ARGS)?;
+    let subgroup_slug = r.bytes32(2).unwrap_or(SUBGROUP_DEVELOPERS);
+    if admin == [0u8; 20] || dev_charter == [0u8; 20] {
+        return Err(ERR_BAD_ARGS);
+    }
+    let eff_slug = if subgroup_slug == [0u8; 32] {
+        SUBGROUP_DEVELOPERS
+    } else {
+        subgroup_slug
+    };
+    storage::set_u64(KEY_INIT, 1);
+    storage::set_address(KEY_ADMIN, &admin);
+    storage::set_address(KEY_DEV_CHARTER, &dev_charter);
+    storage::set(KEY_DEV_SUBGROUP, &eff_slug);
+    events::emit(&[EV_INITIALIZED, addr_topic(&admin)], &[]);
+    events::emit(&[EV_DEV_GATE_UPDATED, addr_topic(&dev_charter), eff_slug], &[]);
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_set_authorized_publisher_group(r: &CalldataReader) -> Result<(), i32> {
+    let caller = context::msg_sender();
+    if !caller_is_admin(&caller) {
+        return Err(ERR_NOT_ADMIN);
+    }
+    let dev_charter = r.address(0).ok_or(ERR_BAD_ARGS)?;
+    let subgroup_slug = r.bytes32(1).unwrap_or(SUBGROUP_DEVELOPERS);
+    if dev_charter == [0u8; 20] {
+        return Err(ERR_BAD_ARGS);
+    }
+    let eff_slug = if subgroup_slug == [0u8; 32] {
+        SUBGROUP_DEVELOPERS
+    } else {
+        subgroup_slug
+    };
+    storage::set_address(KEY_DEV_CHARTER, &dev_charter);
+    storage::set(KEY_DEV_SUBGROUP, &eff_slug);
+    events::emit(&[EV_DEV_GATE_UPDATED, addr_topic(&dev_charter), eff_slug], &[]);
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_authorized_publisher_group(_r: &CalldataReader) -> Result<(), i32> {
+    let (dev_chr, dev_sgrp) = get_dev_gate();
+    let mut out = [0u8; 64];
+    out[12..32].copy_from_slice(&dev_chr);
+    out[32..64].copy_from_slice(&dev_sgrp);
+    ret::write(&out);
+    Ok(())
+}
+
+fn handle_can_publish(r: &CalldataReader) -> Result<(), i32> {
+    let actor = r.address(0).ok_or(ERR_BAD_ARGS)?;
+    ret::write_bool(can_actor_publish(&actor));
+    Ok(())
+}
+
 fn handle_abi_version(_r: &CalldataReader) -> Result<(), i32> {
     ret::write_u64_word(APP_STORE_ABI_VERSION);
     Ok(())
@@ -296,6 +403,10 @@ fn handle_rotate_admin(r: &CalldataReader) -> Result<(), i32> {
 }
 
 fn handle_upload_bundle_chunk(r: &CalldataReader) -> Result<(), i32> {
+    let caller = context::msg_sender();
+    if !can_actor_publish(&caller) {
+        return Err(ERR_NOT_AUTHORIZED_DEVELOPER);
+    }
     let ui_hash = r.bytes32(0).ok_or(ERR_BAD_ARGS)?;
     let chunk_idx = r.u64(1).ok_or(ERR_BAD_ARGS)?;
     let total_chunks = r.u64(2).ok_or(ERR_BAD_ARGS)?;
@@ -501,6 +612,9 @@ fn handle_publish_app(r: &CalldataReader) -> Result<(), i32> {
     } else {
         caller
     };
+    if !can_actor_publish(&effective_publisher) && !can_actor_publish(&caller) {
+        return Err(ERR_NOT_AUTHORIZED_DEVELOPER);
+    }
 
     // If both defaultHfsAddr and wasmCodeHash are provided, verify on-chain code_hash matches!
     if default_hfs_addr != [0u8; 20] && wasm_code_hash != [0u8; 32] {
@@ -1010,5 +1124,91 @@ mod tests {
         assert_eq!(&resolved[32..64], &expected_hash);
         assert_eq!(&resolved[64..96], &wasm_hash);
         assert_eq!(resolved[127], EXEC_MODE_SANDBOX_IFRAME);
+    }
+
+    #[test]
+    fn enforces_superlexicon_developers_social_subgroup_gate_on_bundle_upload_and_publish() {
+        mock::reset();
+        let store_addr = [0xAA; 20];
+        let slx_charter = [0x51; 20];
+        let admin = [0x01; 20];
+        let approved_dev = [0x11; 20];
+        let stranger = [0x19; 20];
+        let hfs_inst = [0x77; 20];
+        let wasm_hash = [0x55; 32];
+
+        mock::register_hps(store_addr, dispatch_calldata);
+        mock::set_code_hash(hfs_inst, wasm_hash);
+
+        mock::register_hps(slx_charter, |raw| {
+            let Some((sel, args)) = CalldataReader::parse(raw) else { return -1; };
+            if sel == SEL_CHR_IS_ACTIVE {
+                ret::write_bool(true);
+                return 0;
+            }
+            if sel == SEL_CHR_IS_DEV_ACTOR {
+                let sgrp = args.bytes32(0).unwrap_or([0u8; 32]);
+                let actor = args.address(1).unwrap_or([0u8; 20]);
+                let ok = sgrp == SUBGROUP_DEVELOPERS && actor == [0x11; 20];
+                ret::write_bool(ok);
+                return 0;
+            }
+            -2
+        });
+
+        let init_cd = CallEncoder::<128>::new(selector(
+            "initializeWithDeveloperGate(address,address,bytes32)",
+        ))
+        .push_address(&admin)
+        .push_address(&slx_charter)
+        .push_bytes32(&SUBGROUP_DEVELOPERS);
+        mock::transact_as(admin, store_addr, init_cd.as_slice()).expect("init gated store");
+
+        // Verify canPublish(stranger) == false, canPublish(approved_dev) == true
+        let q_stranger =
+            CallEncoder::<64>::new(selector("canPublish(address)")).push_address(&stranger);
+        assert_eq!(
+            mock::transact_as(stranger, store_addr, q_stranger.as_slice()).unwrap()[31],
+            0
+        );
+        let q_dev =
+            CallEncoder::<64>::new(selector("canPublish(address)")).push_address(&approved_dev);
+        assert_eq!(
+            mock::transact_as(approved_dev, store_addr, q_dev.as_slice()).unwrap()[31],
+            1
+        );
+
+        let ui = b"<html><body>SLX Approved Dev App</body></html>";
+        let ui_hash = keccak256(ui);
+        let up_cd = encode_upload_chunk(ui_hash, 0, 1, ENCODING_GZIP, 128, ui);
+
+        // Stranger outside Superlexicon · Developers is blocked (-16)
+        assert_eq!(
+            mock::transact_as(stranger, store_addr, &up_cd),
+            Err(ERR_NOT_AUTHORIZED_DEVELOPER)
+        );
+
+        // Approved Superlexicon · Developers member uploads & publishes cleanly
+        mock::transact_as(approved_dev, store_addr, &up_cd).expect("dev bundle upload");
+        let slug = keccak256(b"slx-dev-tool");
+        let pub_cd = encode_publish_app(
+            slug,
+            [0u8; 20],
+            wasm_hash,
+            hfs_inst,
+            ui_hash,
+            4,
+            0,
+            "SLX Dev Tool",
+            "Published by member of Superlexicon Developers social subgroup",
+            "🛠️",
+            "1.0.0",
+        );
+        assert_eq!(
+            mock::transact_as(stranger, store_addr, &pub_cd),
+            Err(ERR_NOT_AUTHORIZED_DEVELOPER)
+        );
+        let res = mock::transact_as(approved_dev, store_addr, &pub_cd).expect("dev publish");
+        assert_eq!(res[31], 1);
     }
 }

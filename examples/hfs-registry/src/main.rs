@@ -15,12 +15,15 @@
 #![cfg_attr(target_arch = "wasm32", no_main)]
 
 use hps_sdk::abi::CalldataReader;
+use hps_sdk::governance::is_confusable_superlexicon_name;
 use hps_sdk::keccak::keccak256;
 use hps_sdk::storage::KeyBuilder;
 use hps_sdk::{context, event_topic, events, hps_entry, ret, storage};
 
 pub const STATUS_ACTIVE: u8 = 1;
 pub const STATUS_ARCHIVED: u8 = 2;
+pub const ERR_SOVEREIGN_ALREADY_PINNED: i32 = -24;
+pub const ERR_RESERVED_SUPERLEXICON_NAME: i32 = -25;
 
 const MAX_LABEL_LEN: usize = 64;
 const MAX_META_LEN: usize = 512;
@@ -35,8 +38,10 @@ const SLICE_OUT_CAP: usize = 16 + (MAX_SLICE_LIMIT as usize) * MAX_REC_BYTES;
 const KEY_INIT: &[u8] = b"hfsreg:init";
 const KEY_ADMIN: &[u8] = b"hfsreg:admin";
 const KEY_TOTAL_COUNT: &[u8] = b"hfsreg:total";
+const KEY_SOVEREIGN_CHARTER: &[u8] = b"hfsreg:sov_slx";
 
 const EV_INITIALIZED: [u8; 32] = event_topic("HfsRegistryInitialized(address)");
+const EV_SOVEREIGN_PINNED: [u8; 32] = event_topic("SovereignCharterPinned(address)");
 const EV_CODE_HASH_SET: [u8; 32] =
     event_topic("HfsTypeCodeHashUpdated(bytes32,bytes32,uint64,bool)");
 const EV_REGISTERED: [u8; 32] =
@@ -47,6 +52,8 @@ const EV_STATUS_CHANGED: [u8; 32] =
 hps_entry! {
     "initialize(address)"                                                  => handle_initialize,
     "rotateAdmin(address)"                                                 => handle_rotate_admin,
+    "pinSovereignCharter(address)"                                         => handle_pin_sovereign_charter,
+    "sovereignCharter()"                                                   => handle_sovereign_charter,
     "setTypeCodeHash(bytes32,bytes32,uint64,bool)"                         => handle_set_type_code_hash,
     "registerInstance(bytes32,address,address,string,bytes)"               => handle_register_instance,
     "setInstanceStatus(bytes32,uint64,uint64)"                             => handle_set_instance_status,
@@ -174,6 +181,36 @@ fn handle_rotate_admin(args: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
+fn get_sovereign_charter() -> [u8; 20] {
+    storage::get_address(KEY_SOVEREIGN_CHARTER).unwrap_or([0u8; 20])
+}
+
+/// Casts the sovereign `Superlexicon Pte. Ltd.` `CorporateCharter` address in stone (write-once).
+/// Once set to a non-zero deployed WASM contract, it can NEVER be overwritten or reassigned.
+fn handle_pin_sovereign_charter(args: &CalldataReader) -> Result<(), i32> {
+    let _ = require_admin()?;
+    if get_sovereign_charter() != [0u8; 20] {
+        return Err(ERR_SOVEREIGN_ALREADY_PINNED);
+    }
+    let charter = args.address(0).ok_or(-1)?;
+    if charter == [0u8; 20] {
+        return Err(-2);
+    }
+    let ch = context::code_hash_of(&charter).ok_or(-20)?;
+    if ch == [0u8; 32] {
+        return Err(-20);
+    }
+    storage::set_address(KEY_SOVEREIGN_CHARTER, &charter);
+    events::emit(&[EV_SOVEREIGN_PINNED, addr_topic(&charter)], &[]);
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_sovereign_charter(_args: &CalldataReader) -> Result<(), i32> {
+    ret::write_address(&get_sovereign_charter());
+    Ok(())
+}
+
 fn handle_set_type_code_hash(args: &CalldataReader) -> Result<(), i32> {
     let _ = require_admin()?;
     let type_id = args.bytes32(0).ok_or(-1)?;
@@ -239,6 +276,18 @@ fn handle_register_instance(args: &CalldataReader) -> Result<(), i32> {
 
     let caller = context::msg_sender();
     let admin = get_admin();
+
+    // Protocol-level anti-imposter reservation for `Superlexicon Pte. Ltd.` and confusable names:
+    // Only the cast-in-stone `sovereignCharter()` (or registry `admin` once `sovereignCharter` is pinned)
+    // may register labels matching or resembling `Superlexicon`!
+    if is_confusable_superlexicon_name(label) {
+        let sov = get_sovereign_charter();
+        let allowed = sov != [0u8; 20] && (primary_addr == sov || caller == admin);
+        if !allowed {
+            return Err(ERR_RESERVED_SUPERLEXICON_NAME);
+        }
+    }
+
     let d_hash = compute_dedup_hash(&type_id, &primary_addr, meta);
     let dk = dedup_key(&d_hash);
     let existing_plus_one = storage::get_u64(dk.as_slice());
@@ -563,5 +612,95 @@ mod tests {
         assert_eq!(total, 2);
         assert_eq!(returned, 2);
         assert_eq!(&raw[16 + 8 + 5..16 + 8 + 25], &dex1);
+    }
+
+    #[test]
+    fn casts_sovereign_superlexicon_charter_in_stone_and_blocks_imposters() {
+        mock::reset();
+        let reg_addr = [0xAA; 20];
+        let admin = [0x01; 20];
+        let attacker = [0x09; 20];
+        let attacker_id = [0x19; 20];
+        let slx_charter = [0x51; 20];
+        let imposter_charter = [0x99; 20];
+        let legit_charter = [0x88; 20];
+        let charter_ch = [0xCC; 32];
+
+        mock::register_hps_with_code_hash(reg_addr, [0x99; 32], dispatch_calldata);
+        mock::register_hps_with_code_hash(slx_charter, charter_ch, dispatch_calldata);
+        mock::register_hps_with_code_hash(imposter_charter, charter_ch, dispatch_calldata);
+        mock::register_hps_with_code_hash(legit_charter, charter_ch, dispatch_calldata);
+
+        let init_cd = CallEncoder::<64>::new(selector("initialize(address)")).push_address(&admin);
+        assert!(mock::transact_as(admin, reg_addr, init_cd.as_slice()).is_ok());
+
+        let t_chr = pad_type(b"CORPORATE_CHARTER");
+
+        // Before sovereign charter is pinned, nobody can claim Superlexicon name
+        let imp1 = encode_register(
+            &t_chr,
+            &imposter_charter,
+            &attacker_id,
+            b"Superlexicon Pte. Ltd.",
+            b"{}",
+        );
+        assert_eq!(
+            mock::transact_as(attacker, reg_addr, &imp1),
+            Err(ERR_RESERVED_SUPERLEXICON_NAME)
+        );
+
+        // Pin sovereign Superlexicon charter (write-once!)
+        let pin_cd = CallEncoder::<64>::new(selector("pinSovereignCharter(address)"))
+            .push_address(&slx_charter);
+        assert_eq!(mock::transact_as(attacker, reg_addr, pin_cd.as_slice()), Err(-12));
+        assert!(mock::transact_as(admin, reg_addr, pin_cd.as_slice()).is_ok());
+
+        // Attempting to overwrite cast-in-stone sovereign charter fails even for admin!
+        let pin2_cd = CallEncoder::<64>::new(selector("pinSovereignCharter(address)"))
+            .push_address(&imposter_charter);
+        assert_eq!(
+            mock::transact_as(admin, reg_addr, pin2_cd.as_slice()),
+            Err(ERR_SOVEREIGN_ALREADY_PINNED)
+        );
+
+        // Canonical Superlexicon charter registers cleanly
+        let ok_slx = encode_register(
+            &t_chr,
+            &slx_charter,
+            &[0x11; 20],
+            b"Superlexicon Pte. Ltd.",
+            br#"{"jurisdiction":"SG"}"#,
+        );
+        assert!(mock::transact_as(attacker, reg_addr, &ok_slx).is_ok());
+
+        // Confusable/homoglyph/typosquatted imposter charters are ALL blocked!
+        for spoof in [
+            "SuperLexicon Labs Inc.",
+            "Super1exic0n Pte Ltd",
+            "Ѕupеrlехісоn SG",
+            "Super-Lexcon Corp",
+        ] {
+            let bad = encode_register(
+                &t_chr,
+                &imposter_charter,
+                &attacker_id,
+                spoof.as_bytes(),
+                b"{}",
+            );
+            assert_eq!(
+                mock::transact_as(attacker, reg_addr, &bad),
+                Err(ERR_RESERVED_SUPERLEXICON_NAME)
+            );
+        }
+
+        // Unrelated legitimate company registers cleanly
+        let ok_legit = encode_register(
+            &t_chr,
+            &legit_charter,
+            &attacker_id,
+            b"Merlion Robotics Pte. Ltd.",
+            b"{}",
+        );
+        assert!(mock::transact_as(attacker, reg_addr, &ok_legit).is_ok());
     }
 }

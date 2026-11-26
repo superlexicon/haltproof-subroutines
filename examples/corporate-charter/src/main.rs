@@ -26,25 +26,29 @@
 use hps_sdk::abi::CalldataReader;
 use hps_sdk::call::{self, CallEncoder};
 use hps_sdk::governance::{
-    compute_sha_doc_hash, require_approved_hfs_code_hash, require_valid_authorization_hps,
+    company_group_channel_hash, compute_sha_doc_hash, is_confusable_superlexicon_name,
+    query_sovereign_charter, require_approved_hfs_code_hash, require_valid_authorization_hps,
     require_valid_identity, verify_and_consume_auth, ActionHasher, AuthorizedModuleSpec,
     FunctionAuthRule, PolicySpec, ShareClassSpec, StageSpec, ACTION_ACTIVATE_CHARTER,
-    ACTION_ADD_DIRECTOR, ACTION_AUTHORIZE_MODULE, ACTION_DEFINE_ROLE, ACTION_GRANT_ROLE,
-    ACTION_REGISTER_SHARE_CLASS, ACTION_REMOVE_DIRECTOR, ACTION_REVOKE_ROLE,
-    ACTION_SET_ACCOUNTING_LEDGER, ACTION_SET_FUNCTION_AUTH, ACTION_SET_TREASURY,
-    CAP_EQUITY_SETTLEMENT, CAP_IFRS_RECORDER, CAP_MERCHANT_PAYMENT, CHARTER_STATE_ACTIVE,
-    CHARTER_STATE_PENDING_RATIFICATION, CHARTER_STATE_UNINITIALIZED, ERR_CHARTER_ALREADY_ACTIVE,
-    ERR_CHARTER_MISMATCH, ERR_CHARTER_NOT_ACTIVE, ERR_DIRECTOR_CONSENT_REQUIRED,
-    ERR_FUNCTION_AUTH_NOT_SET, ERR_GOVERNANCE_DOWNGRADE, ERR_NOT_EXISTING_SHAREHOLDER,
-    ERR_NO_BIDS_IN_STAGE, ERR_POLICY_INVALID, ERR_RESERVED_GOVERNANCE_ROLE, ERR_ROLE_NOT_DEFINED,
-    ERR_SHA_SIGNATURE_REQUIRED, ERR_STALE_CAPITAL_SNAPSHOT, ERR_UNAUTHORIZED_MODULE,
-    HFS_TYPE_IFRS_LEDGER, HFS_TYPE_PRODUCT_LEDGER, HFS_TYPE_SHARE_CAPITAL, MAX_AUTHORIZED_MODULES,
-    MAX_DEFINED_ROLES, MAX_ENCODED_POLICY_BYTES, MAX_MEMBERS_PER_STAGE, MAX_SHARE_CLASSES,
-    POLICY_BANK_ORACLE, POLICY_BOARD_RESOLUTION, POLICY_FIRST_SHAREHOLDER_RESOLUTION,
-    POLICY_PRODUCT_MANAGEMENT, POLICY_SHAREHOLDER_SUPERMAJORITY, POLICY_SHARE_ISSUANCE_AUCTION,
+    ACTION_ADD_DIRECTOR, ACTION_AUTHORIZE_MODULE, ACTION_DEFINE_ROLE, ACTION_GRANT_AUDITOR_KEY,
+    ACTION_GRANT_ROLE, ACTION_REGISTER_SHARE_CLASS, ACTION_REMOVE_DIRECTOR, ACTION_REVOKE_ROLE,
+    ACTION_ROTATE_AUDIT_KEY, ACTION_SET_ACCOUNTING_LEDGER, ACTION_SET_FUNCTION_AUTH,
+    ACTION_SET_TREASURY, CAP_EQUITY_SETTLEMENT, CAP_IFRS_RECORDER, CAP_MERCHANT_PAYMENT,
+    CHARTER_STATE_ACTIVE, CHARTER_STATE_PENDING_RATIFICATION, CHARTER_STATE_UNINITIALIZED,
+    ERR_CHARTER_ALREADY_ACTIVE, ERR_CHARTER_MISMATCH, ERR_CHARTER_NOT_ACTIVE,
+    ERR_DIRECTOR_CONSENT_REQUIRED, ERR_FUNCTION_AUTH_NOT_SET, ERR_GOVERNANCE_DOWNGRADE,
+    ERR_MESSAGING_NOT_CONFIGURED, ERR_NOT_ACTIVE_DIRECTOR, ERR_NOT_EXISTING_SHAREHOLDER,
+    ERR_NOT_SUBGROUP_MEMBER, ERR_NO_BIDS_IN_STAGE, ERR_POLICY_INVALID, ERR_RESERVED_ENTITY_NAME,
+    ERR_RESERVED_GOVERNANCE_ROLE, ERR_ROLE_NOT_DEFINED, ERR_SHA_SIGNATURE_REQUIRED,
+    ERR_STALE_CAPITAL_SNAPSHOT, ERR_SUBGROUP_ALREADY_EXISTS, ERR_SUBGROUP_NOT_FOUND,
+    ERR_UNAUTHORIZED_MODULE, HFS_TYPE_CORPORATE_SOCIAL_GROUP, HFS_TYPE_IFRS_LEDGER,
+    HFS_TYPE_PRODUCT_LEDGER, HFS_TYPE_SHARE_CAPITAL, MAX_AUTHORIZED_MODULES, MAX_DEFINED_ROLES,
+    MAX_ENCODED_POLICY_BYTES, MAX_MEMBERS_PER_STAGE, MAX_SHARE_CLASSES, POLICY_BANK_ORACLE,
+    POLICY_BOARD_RESOLUTION, POLICY_FIRST_SHAREHOLDER_RESOLUTION, POLICY_PRODUCT_MANAGEMENT,
+    POLICY_SHAREHOLDER_SUPERMAJORITY, POLICY_SHARE_ISSUANCE_AUCTION,
     POLICY_SHARE_TRANSFER_AUCTION, POLICY_SUPER_GOVERNANCE, ROLE_BANK_ORACLE,
     ROLE_CHIEF_ACCOUNTANT, ROLE_DIRECTOR, ROLE_PRODUCT_MANAGER, ROLE_SHAREHOLDER,
-    ROLE_TREASURY_MANAGER, ACTION_GRANT_AUDITOR_KEY, ACTION_ROTATE_AUDIT_KEY,
+    ROLE_TREASURY_MANAGER, SUBGROUP_ALL_MEMBERS,
 };
 use hps_sdk::keccak::keccak256;
 use hps_sdk::storage::KeyBuilder;
@@ -77,6 +81,18 @@ const AUDIT_OFFICER_WRAPPED: [u8; 32] =
     event_topic("AuditKeyWrappedForOfficer(uint64,address,address)");
 const AUDITOR_KEY_GRANTED: [u8; 32] =
     event_topic("AuditorCategoryKeyGranted(uint64,bytes32,address,bytes32)");
+const ENTITY_CONFIGURED: [u8; 32] =
+    event_topic("EntityProfileConfigured(address,bytes32,bool)");
+const COMPANY_GROUP_SYNCED: [u8; 32] =
+    event_topic("CompanySocialGroupSynced(bytes32,uint64)");
+const COMPANY_SUBGROUP_CREATED: [u8; 32] =
+    event_topic("CompanySubgroupCreated(bytes32,bytes32,address)");
+const COMPANY_SUBGROUP_MEMBER_ADDED: [u8; 32] =
+    event_topic("CompanySubgroupMemberAdded(bytes32,address,address)");
+const COMPANY_SUBGROUP_MEMBER_REMOVED: [u8; 32] =
+    event_topic("CompanySubgroupMemberRemoved(bytes32,address,address)");
+const COMPANY_GROUP_MESSAGE_POSTED: [u8; 32] =
+    event_topic("CompanyGroupMessagePosted(bytes32,bytes32,address)");
 
 const ROLE_CEO: [u8; 32] = keccak256(b"ROLE_CEO");
 const ROLE_COO: [u8; 32] = keccak256(b"ROLE_COO");
@@ -124,13 +140,43 @@ const KEY_BOARD_EXPIRY: &[u8] = b"chr:board_exp";
 const KEY_SHARE_CLASSES_BLOB: &[u8] = b"chr:sh_classes";
 const KEY_AUDIT_EPOCH: &[u8] = b"chr:aud:ep";
 const KEY_AUD_GRANT_CNT: &[u8] = b"chr:aud:gcnt";
+const KEY_ENTITY_NAME: &[u8] = b"chr:ent:name";
+const KEY_ENTITY_JURISDICTION: &[u8] = b"chr:ent:jur";
+const KEY_ENTITY_REG_ID: &[u8] = b"chr:ent:regid";
+const KEY_SOVEREIGN_SEALED: &[u8] = b"chr:sov_slx";
+const KEY_MESSAGING_HPS: &[u8] = b"chr:msg_hps";
+const KEY_ALL_GROUP_INIT: &[u8] = b"chr:sgrp:all_init";
+const KEY_SUBGROUP_CNT: &[u8] = b"chr:sgrp:cnt";
 const MAX_AUDIT_ENVELOPE_BYTES: usize = 256;
 const MAX_IAS24_INSIDERS: usize = 64;
+const MAX_ENTITY_NAME_LEN: usize = 96;
+const MAX_JURISDICTION_LEN: usize = 48;
+const MAX_REG_ID_LEN: usize = 48;
+const MAX_COMPANY_SUBGROUPS: usize = 32;
+const MAX_SUBGROUP_MEMBERS: usize = 64;
+const MAX_SUBGROUP_LABEL_LEN: usize = 64;
+const MAX_SOCIAL_MSG_LEN: usize = 4096;
 
 hps_entry! {
     "initialize(address,bytes)"                                                 => handle_initialize,
     "initializeWithGovernance(address,bytes,bytes,bytes,bytes)"                 => handle_initialize_with_governance_5,
     "initializeWithGovernance(address,bytes,bytes,bytes,bytes,bytes)"           => handle_initialize_with_governance_6,
+    "initializeEntityWithGovernance(address,string,string,string,address,address,bytes,bytes,bytes,bytes,bytes)" => handle_initialize_entity_with_governance,
+    "configureEntityAndSocial(string,string,string,address,address)"            => handle_configure_entity_and_social,
+    "setRegistrationId(string)"                                                 => handle_set_registration_id,
+    "entityProfile()"                                                           => handle_entity_profile,
+    "isSovereignSuperlexicon()"                                                 => handle_is_sovereign_superlexicon,
+    "messagingHps()"                                                            => handle_messaging_hps,
+    "companyGroupChannelHash(bytes32)"                                          => handle_company_group_channel_hash,
+    "syncCompanySocialGroup()"                                                  => handle_sync_company_social_group,
+    "isCompanySocialMember(address)"                                            => handle_is_company_social_member,
+    "createCompanySubgroup(bytes32,string,bytes)"                               => handle_create_company_subgroup,
+    "addSubgroupMember(bytes32,address)"                                        => handle_add_subgroup_member,
+    "removeSubgroupMember(bytes32,address)"                                     => handle_remove_subgroup_member,
+    "isSubgroupMember(bytes32,address)"                                         => handle_is_subgroup_member,
+    "isSubgroupAuthorizedActor(bytes32,address)"                                => handle_is_subgroup_authorized_actor,
+    "postCompanyGroupMessage(bytes32,bytes)"                                    => handle_post_company_group_message,
+    "getCompanySocialOverview(address)"                                         => handle_get_company_social_overview,
     "activateCharter(address)"                                                  => handle_activate_charter,
     "state()"                                                                   => handle_state,
     "isActive()"                                                                => handle_is_active,
@@ -1067,6 +1113,7 @@ fn handle_initialize(args: &CalldataReader) -> Result<(), i32> {
     storage::set_u64(KEY_INIT, 1);
     storage::set_u64(KEY_STATE, CHARTER_STATE_PENDING_RATIFICATION);
     seed_initial_director_consents(&caller);
+    auto_provision_company_social_group();
 
     events::emit(
         &[CHARTER_INITIALIZED, addr_topic(&registry)],
@@ -1341,6 +1388,7 @@ fn execute_initialize_with_governance(
     storage::set_u64(KEY_INIT, 1);
     storage::set_u64(KEY_STATE, CHARTER_STATE_PENDING_RATIFICATION);
     seed_initial_director_consents(&caller);
+    auto_provision_company_social_group();
 
     events::emit(
         &[CHARTER_INITIALIZED, addr_topic(registry)],
@@ -1403,6 +1451,7 @@ fn handle_activate_charter(args: &CalldataReader) -> Result<(), i32> {
     storage::set_u64(KEY_STATE, CHARTER_STATE_ACTIVE);
     storage::set_u64(KEY_ACTIVATED_BLOCK, now);
     storage::set_address(KEY_ACTIVATION_AUTH, &shareholder_auth);
+    auto_provision_company_social_group();
 
     events::emit(
         &[
@@ -1787,6 +1836,7 @@ fn handle_add_director(args: &CalldataReader) -> Result<(), i32> {
     verify_and_consume_auth(&registry, &super_auth, &me, &req_pol, &action_hash, &caller)?;
 
     let now = context::block_number();
+    notify_member_company_social_if_needed(&new_director, None);
     if new_director == caller {
         set_director_consented(&new_director, true);
         events::emit(
@@ -1935,6 +1985,7 @@ fn handle_consent_to_directorship(_args: &CalldataReader) -> Result<(), i32> {
             );
         }
     }
+    notify_member_company_social_if_needed(&caller, None);
 
     ret::write_bool(true);
     Ok(())
@@ -2042,6 +2093,7 @@ fn handle_grant_role(args: &CalldataReader) -> Result<(), i32> {
     verify_and_consume_auth(&registry, &board_auth, &me, &req_pol, &action_hash, &caller)?;
 
     let new_count = grant_role_internal(&role_id, &account)?;
+    notify_member_company_social_if_needed(&account, None);
     events::emit(
         &[
             ROLE_GRANTED,
@@ -3281,6 +3333,1107 @@ fn handle_hash_grant_auditor_category_key(args: &CalldataReader) -> Result<(), i
     Ok(())
 }
 
+// ============================================================================
+// Entity Profile, Cast-in-Stone `Superlexicon Pte. Ltd.` Guard, Automatic
+// Company Social Group (`All Members`), & Director-Managed Social Sub-Groups
+// ============================================================================
+
+const SOCIAL_VIEW_CAP: usize = 24_576;
+static mut SOCIAL_VIEW_SCRATCH: [u8; SOCIAL_VIEW_CAP] = [0u8; SOCIAL_VIEW_CAP];
+
+fn subgroup_idx_key(slug: &[u8; 32]) -> KeyBuilder<48> {
+    KeyBuilder::<48>::new().push(b"chr:sgrp:idx:").push(slug)
+}
+
+fn subgroup_rec_key(idx: usize) -> KeyBuilder<32> {
+    KeyBuilder::<32>::new()
+        .push(b"chr:sgrp:rec:")
+        .push_u64_be(idx as u64)
+}
+
+fn subgroup_member_key(slug: &[u8; 32], member: &[u8; 20]) -> KeyBuilder<68> {
+    KeyBuilder::<68>::new()
+        .push(b"chr:sgrp:mem:")
+        .push(slug)
+        .push(member)
+}
+
+fn company_notified_key(member: &[u8; 20]) -> KeyBuilder<40> {
+    KeyBuilder::<40>::new().push(b"chr:sgrp:notf:").push(member)
+}
+
+fn channel_bound_key(chan_hash: &[u8; 32]) -> KeyBuilder<48> {
+    KeyBuilder::<48>::new()
+        .push(b"chr:sgrp:cbnd:")
+        .push(chan_hash)
+}
+
+#[derive(Clone, Copy)]
+struct SubgroupRec {
+    slug: [u8; 32],
+    channel_hash: [u8; 32],
+    creator_director: [u8; 20],
+    created_blk: u64,
+    active: u8,
+    label_len: u8,
+    member_count: u8,
+    label: [u8; MAX_SUBGROUP_LABEL_LEN],
+    members: [[u8; 20]; MAX_SUBGROUP_MEMBERS],
+}
+
+const FIXED_SUBGROUP_HDR: usize = 32 + 32 + 20 + 8 + 3; // 95B
+const MAX_SUBGROUP_REC_LEN: usize =
+    FIXED_SUBGROUP_HDR + MAX_SUBGROUP_LABEL_LEN + MAX_SUBGROUP_MEMBERS * 20;
+
+impl SubgroupRec {
+    fn save(&self, idx: usize) {
+        let ll = (self.label_len as usize).min(MAX_SUBGROUP_LABEL_LEN);
+        let mc = (self.member_count as usize).min(MAX_SUBGROUP_MEMBERS);
+        let mut buf = [0u8; MAX_SUBGROUP_REC_LEN];
+        buf[0..32].copy_from_slice(&self.slug);
+        buf[32..64].copy_from_slice(&self.channel_hash);
+        buf[64..84].copy_from_slice(&self.creator_director);
+        buf[84..92].copy_from_slice(&self.created_blk.to_be_bytes());
+        buf[92] = self.active;
+        buf[93] = ll as u8;
+        buf[94] = mc as u8;
+        buf[95..95 + ll].copy_from_slice(&self.label[..ll]);
+        let mut m = 0usize;
+        while m < mc {
+            let off = 95 + ll + m * 20;
+            buf[off..off + 20].copy_from_slice(&self.members[m]);
+            m += 1;
+        }
+        let total = 95 + ll + mc * 20;
+        storage::set(subgroup_rec_key(idx).as_slice(), &buf[..total]);
+    }
+
+    fn load(idx: usize) -> Option<Self> {
+        let mut buf = [0u8; MAX_SUBGROUP_REC_LEN];
+        let n = storage::get_into(subgroup_rec_key(idx).as_slice(), &mut buf)?;
+        if n < FIXED_SUBGROUP_HDR {
+            return None;
+        }
+        let mut slug = [0u8; 32];
+        slug.copy_from_slice(&buf[0..32]);
+        let mut channel_hash = [0u8; 32];
+        channel_hash.copy_from_slice(&buf[32..64]);
+        let mut creator_director = [0u8; 20];
+        creator_director.copy_from_slice(&buf[64..84]);
+        let created_blk = u64::from_be_bytes(buf[84..92].try_into().ok()?);
+        let active = buf[92];
+        let ll = (buf[93] as usize).min(MAX_SUBGROUP_LABEL_LEN);
+        let mc = (buf[94] as usize).min(MAX_SUBGROUP_MEMBERS);
+        if 95 + ll + mc * 20 > n {
+            return None;
+        }
+        let mut label = [0u8; MAX_SUBGROUP_LABEL_LEN];
+        label[..ll].copy_from_slice(&buf[95..95 + ll]);
+        let mut members = [[0u8; 20]; MAX_SUBGROUP_MEMBERS];
+        let mut m = 0usize;
+        while m < mc {
+            let off = 95 + ll + m * 20;
+            members[m].copy_from_slice(&buf[off..off + 20]);
+            m += 1;
+        }
+        Some(Self {
+            slug,
+            channel_hash,
+            creator_director,
+            created_blk,
+            active,
+            label_len: ll as u8,
+            member_count: mc as u8,
+            label,
+            members,
+        })
+    }
+}
+
+fn has_deployed_wasm_at(addr: &[u8; 20]) -> bool {
+    if *addr == [0u8; 20] {
+        return false;
+    }
+    match context::code_hash_of(addr) {
+        Some(ch) => ch != [0u8; 32],
+        None => false,
+    }
+}
+
+fn load_entity_name_into(buf: &mut [u8; MAX_ENTITY_NAME_LEN]) -> usize {
+    storage::get_into(KEY_ENTITY_NAME, buf)
+        .unwrap_or(0)
+        .min(MAX_ENTITY_NAME_LEN)
+}
+
+fn build_default_group_assoc_label(out: &mut [u8; 64], suffix: &[u8]) -> usize {
+    let mut name_buf = [0u8; MAX_ENTITY_NAME_LEN];
+    let nlen = load_entity_name_into(&mut name_buf);
+    let prefix: &[u8] = if nlen > 0 {
+        &name_buf[..nlen]
+    } else {
+        b"Corporate Charter"
+    };
+    let max_pref = 64usize.saturating_sub(suffix.len());
+    let plen = prefix.len().min(max_pref);
+    out[..plen].copy_from_slice(&prefix[..plen]);
+    let slen = suffix.len().min(64 - plen);
+    out[plen..plen + slen].copy_from_slice(&suffix[..slen]);
+    plen + slen
+}
+
+fn notify_member_company_social_if_needed(member: &[u8; 20], custom_label: Option<&[u8]>) {
+    if !has_deployed_wasm_at(member) {
+        return;
+    }
+    if custom_label.is_none() {
+        let nk = company_notified_key(member);
+        if storage::get_u64(nk.as_slice()) == 1 {
+            return;
+        }
+        storage::set_u64(nk.as_slice(), 1);
+    }
+    let mut lbl_buf = [0u8; 64];
+    let lbl: &[u8] = if let Some(cl) = custom_label {
+        let n = cl.len().min(64);
+        &cl[..n]
+    } else {
+        let n = build_default_group_assoc_label(&mut lbl_buf, b" - All Members");
+        &lbl_buf[..n]
+    };
+    let me = context::self_address();
+    let cd = CallEncoder::<224>::new(const {
+        selector("notifyHfsAssociation(address,bytes32,string)")
+    })
+    .push_address(&me)
+    .push_bytes32(&HFS_TYPE_CORPORATE_SOCIAL_GROUP)
+    .push_u64(96)
+    .push_dynamic_bytes_tail(lbl);
+    let _ = call::call_raw(member, cd.as_slice());
+}
+
+fn ensure_messaging_channel_bound(messaging_hps: &[u8; 20], chan_hash: &[u8; 32]) {
+    if !has_deployed_wasm_at(messaging_hps) {
+        return;
+    }
+    let bk = channel_bound_key(chan_hash);
+    if storage::get_u64(bk.as_slice()) == 1 {
+        return;
+    }
+    let me = context::self_address();
+    let cd = CallEncoder::<96>::new(const { selector("bindChannelController(bytes32,address)") })
+        .push_bytes32(chan_hash)
+        .push_address(&me);
+    if call::call_raw(messaging_hps, cd.as_slice()).is_ok() {
+        storage::set_u64(bk.as_slice(), 1);
+    }
+}
+
+fn enumerate_all_company_members(out: &mut [[u8; 20]; MAX_SUBGROUP_MEMBERS]) -> usize {
+    let mut count = 0usize;
+    let push_uniq =
+        |list: &mut [[u8; 20]; MAX_SUBGROUP_MEMBERS], cnt: &mut usize, addr: &[u8; 20]| {
+            if *addr == [0u8; 20] || *cnt >= MAX_SUBGROUP_MEMBERS {
+                return;
+            }
+            let mut i = 0usize;
+            while i < *cnt {
+                if list[i] == *addr {
+                    return;
+                }
+                i += 1;
+            }
+            list[*cnt] = *addr;
+            *cnt += 1;
+        };
+
+    if let Some(init_by) = storage::get_address(KEY_INITIALIZER) {
+        push_uniq(out, &mut count, &init_by);
+    }
+
+    let mut dirs = [[0u8; 20]; MAX_MEMBERS_PER_STAGE];
+    let d_cnt = load_directors(&mut dirs);
+    let mut d = 0usize;
+    while d < d_cnt {
+        push_uniq(out, &mut count, &dirs[d]);
+        d += 1;
+    }
+
+    let mut pdirs = [[0u8; 20]; MAX_MEMBERS_PER_STAGE];
+    let pd_cnt = load_pending_directors(&mut pdirs);
+    let mut pd = 0usize;
+    while pd < pd_cnt {
+        push_uniq(out, &mut count, &pdirs[pd]);
+        pd += 1;
+    }
+
+    let r_cnt = storage::get_u64(KEY_DEFINED_ROLES_COUNT) as usize;
+    let mut r = 0usize;
+    while r < r_cnt.min(MAX_DEFINED_ROLES) {
+        if let Some(rid) = storage::get_bytes32(defined_role_at_key(r as u64).as_slice()) {
+            let mut r_mems = [[0u8; 20]; MAX_MEMBERS_PER_STAGE];
+            let rm_cnt = load_role_members(&rid, &mut r_mems);
+            let mut m = 0usize;
+            while m < rm_cnt {
+                push_uniq(out, &mut count, &r_mems[m]);
+                m += 1;
+            }
+        }
+        r += 1;
+    }
+
+    let mut classes = [ShareClassSpec::empty(); MAX_SHARE_CLASSES];
+    let sc_cnt = load_share_classes(&mut classes);
+    let mut c = 0usize;
+    while c < sc_cnt {
+        let led = &classes[c].ledger;
+        if has_deployed_wasm_at(led) {
+            let hc_cd = CallEncoder::<16>::new(const { selector("registeredHolderCount()") });
+            let h_cnt = call::call_u64(led, hc_cd.as_slice()).unwrap_or(0).min(64);
+            let mut h = 0u64;
+            while h < h_cnt {
+                let ha_cd = CallEncoder::<64>::new(const {
+                    selector("registeredHolderAt(uint64)")
+                })
+                .push_u64(h);
+                if let Ok(raw) = call::call_raw(led, ha_cd.as_slice()) {
+                    if raw.len() >= 32 {
+                        let mut holder = [0u8; 20];
+                        holder.copy_from_slice(&raw[12..32]);
+                        let bal_cd =
+                            CallEncoder::<64>::new(const { selector("balanceOf(address)") })
+                                .push_address(&holder);
+                        if call::call_u64(led, bal_cd.as_slice()).unwrap_or(0) > 0 {
+                            push_uniq(out, &mut count, &holder);
+                        }
+                    }
+                }
+                h += 1;
+            }
+        }
+        c += 1;
+    }
+
+    count
+}
+
+fn auto_provision_company_social_group() -> usize {
+    storage::set_u64(KEY_ALL_GROUP_INIT, 1);
+    let me = context::self_address();
+    let all_chan = company_group_channel_hash(&me, &SUBGROUP_ALL_MEMBERS);
+    if let Some(msg_hps) = storage::get_address(KEY_MESSAGING_HPS) {
+        if msg_hps != [0u8; 20] {
+            ensure_messaging_channel_bound(&msg_hps, &all_chan);
+        }
+    }
+    let mut members = [[0u8; 20]; MAX_SUBGROUP_MEMBERS];
+    let cnt = enumerate_all_company_members(&mut members);
+    let mut i = 0usize;
+    while i < cnt {
+        notify_member_company_social_if_needed(&members[i], None);
+        i += 1;
+    }
+    events::emit(&[COMPANY_GROUP_SYNCED, all_chan], &(cnt as u64).to_be_bytes());
+    cnt
+}
+
+fn is_active_consented_director(registry: &[u8; 20], candidate: &[u8; 20]) -> bool {
+    if *candidate == [0u8; 20] || !has_director_consented(candidate) {
+        return false;
+    }
+    if require_valid_identity(registry, candidate).is_err() {
+        return false;
+    }
+    let mut dirs = [[0u8; 20]; MAX_MEMBERS_PER_STAGE];
+    let count = load_directors(&mut dirs);
+    let mut i = 0usize;
+    while i < count {
+        if &dirs[i] == candidate {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn is_company_social_member_internal(registry: &[u8; 20], account: &[u8; 20]) -> bool {
+    if *account == [0u8; 20] || require_valid_identity(registry, account).is_err() {
+        return false;
+    }
+    if let Some(init_by) = storage::get_address(KEY_INITIALIZER) {
+        if init_by == *account {
+            return true;
+        }
+    }
+    let mut dirs = [[0u8; 20]; MAX_MEMBERS_PER_STAGE];
+    let d_cnt = load_directors(&mut dirs);
+    let mut d = 0usize;
+    while d < d_cnt {
+        if &dirs[d] == account {
+            return true;
+        }
+        d += 1;
+    }
+    if storage::get_u64(director_pending_key(account).as_slice()) == 1 {
+        return true;
+    }
+    let r_cnt = storage::get_u64(KEY_DEFINED_ROLES_COUNT) as usize;
+    let mut r = 0usize;
+    while r < r_cnt.min(MAX_DEFINED_ROLES) {
+        if let Some(rid) = storage::get_bytes32(defined_role_at_key(r as u64).as_slice()) {
+            if storage::get_u64(role_has_key(&rid, account).as_slice()) == 1 {
+                return true;
+            }
+        }
+        r += 1;
+    }
+    let (holder_common, _) = compute_converted_common_totals(account);
+    if holder_common > 0 {
+        return true;
+    }
+    let mut classes = [ShareClassSpec::empty(); MAX_SHARE_CLASSES];
+    let sc_cnt = load_share_classes(&mut classes);
+    let mut c = 0usize;
+    while c < sc_cnt {
+        let bal_cd = CallEncoder::<64>::new(const { selector("balanceOf(address)") })
+            .push_address(account);
+        if call::call_u64(&classes[c].ledger, bal_cd.as_slice()).unwrap_or(0) > 0 {
+            return true;
+        }
+        c += 1;
+    }
+    false
+}
+
+fn is_subgroup_member_internal(
+    registry: &[u8; 20],
+    slug: &[u8; 32],
+    account: &[u8; 20],
+) -> bool {
+    if *slug == [0u8; 32] || *slug == SUBGROUP_ALL_MEMBERS {
+        return is_company_social_member_internal(registry, account);
+    }
+    if *account == [0u8; 20] {
+        return false;
+    }
+    let idx_plus_1 = storage::get_u64(subgroup_idx_key(slug).as_slice()) as usize;
+    if idx_plus_1 == 0 {
+        return false;
+    }
+    if storage::get_u64(subgroup_member_key(slug, account).as_slice()) != 1 {
+        return false;
+    }
+    let Some(rec) = SubgroupRec::load(idx_plus_1 - 1) else {
+        return false;
+    };
+    if rec.active != 1 {
+        return false;
+    }
+    require_valid_identity(registry, account).is_ok()
+}
+
+fn identity_authorizes_actor(identity_hps: &[u8; 20], actor: &[u8; 20]) -> bool {
+    if *identity_hps == [0u8; 20] || *actor == [0u8; 20] {
+        return false;
+    }
+    if identity_hps == actor {
+        return true;
+    }
+    if !has_deployed_wasm_at(identity_hps) {
+        return false;
+    }
+    let auth_cd =
+        CallEncoder::<64>::new(const { selector("isAuthorized(address)") }).push_address(actor);
+    if let Ok(true) = call::call_bool(identity_hps, auth_cd.as_slice()) {
+        return true;
+    }
+    let own_cd = CallEncoder::<16>::new(const { selector("owner()") });
+    if let Ok(raw) = call::call_raw(identity_hps, own_cd.as_slice()) {
+        if raw.len() >= 32 && raw[0..12] == [0u8; 12] && &raw[12..32] == actor {
+            return true;
+        }
+    }
+    false
+}
+
+fn configure_entity_and_social_internal(
+    legal_name: &[u8],
+    jurisdiction: &[u8],
+    reg_id: &[u8],
+    hfs_registry: &[u8; 20],
+    messaging_hps: &[u8; 20],
+) -> Result<(), i32> {
+    if legal_name.is_empty()
+        || legal_name.len() > MAX_ENTITY_NAME_LEN
+        || jurisdiction.len() > MAX_JURISDICTION_LEN
+        || reg_id.len() > MAX_REG_ID_LEN
+    {
+        return Err(-59);
+    }
+
+    let me = context::self_address();
+    let already_sovereign = storage::get_u64(KEY_SOVEREIGN_SEALED) == 1;
+
+    // Protocol-level anti-imposter rule:
+    // Any entity name matching or confusable with `Superlexicon` MUST be the single cast-in-stone
+    // `HfsRegistry.sovereignCharter()` instance (`Superlexicon Pte. Ltd.` incorporated in Singapore)!
+    if is_confusable_superlexicon_name(legal_name) {
+        let eff_hfs_reg = if *hfs_registry != [0u8; 20] {
+            *hfs_registry
+        } else {
+            storage::get_address(KEY_HFS_REGISTRY).unwrap_or([0u8; 20])
+        };
+        let Some(sov_addr) = query_sovereign_charter(&eff_hfs_reg) else {
+            return Err(ERR_RESERVED_ENTITY_NAME);
+        };
+        if sov_addr != me {
+            return Err(ERR_RESERVED_ENTITY_NAME);
+        }
+        // Canonicalize Superlexicon's legal name & Singapore jurisdiction in stone
+        if legal_name != b"Superlexicon Pte. Ltd."
+            || (jurisdiction != b"Singapore" && jurisdiction != b"SG")
+        {
+            return Err(ERR_RESERVED_ENTITY_NAME);
+        }
+        storage::set_u64(KEY_SOVEREIGN_SEALED, 1);
+    } else if already_sovereign {
+        // Sovereign charter's legal name can never be changed away from `Superlexicon Pte. Ltd.`
+        return Err(ERR_RESERVED_ENTITY_NAME);
+    }
+
+    if !already_sovereign {
+        storage::set(KEY_ENTITY_NAME, legal_name);
+        storage::set(KEY_ENTITY_JURISDICTION, jurisdiction);
+    }
+    if !reg_id.is_empty() {
+        let mut prev_reg = [0u8; MAX_REG_ID_LEN];
+        let prev_len = storage::get_into(KEY_ENTITY_REG_ID, &mut prev_reg).unwrap_or(0);
+        if !already_sovereign || prev_len == 0 {
+            storage::set(KEY_ENTITY_REG_ID, reg_id);
+        }
+    }
+    if *hfs_registry != [0u8; 20] && storage::get_address(KEY_HFS_REGISTRY).is_none() {
+        storage::set_address(KEY_HFS_REGISTRY, hfs_registry);
+    }
+    if *messaging_hps != [0u8; 20] {
+        storage::set_address(KEY_MESSAGING_HPS, messaging_hps);
+    }
+
+    auto_provision_company_social_group();
+
+    let name_hash = keccak256(legal_name);
+    let is_sov = storage::get_u64(KEY_SOVEREIGN_SEALED) == 1;
+    events::emit(
+        &[ENTITY_CONFIGURED, addr_topic(&me), name_hash],
+        &[u8::from(is_sov)],
+    );
+    Ok(())
+}
+
+fn handle_initialize_entity_with_governance(args: &CalldataReader) -> Result<(), i32> {
+    let registry = args.address(0).ok_or(-3)?;
+    let legal_name = args.dynamic_bytes(1).ok_or(-3)?;
+    let jurisdiction = args.dynamic_bytes(2).ok_or(-3)?;
+    let reg_id = args.dynamic_bytes(3).ok_or(-3)?;
+    let hfs_registry = args.address(4).ok_or(-3)?;
+    let messaging_hps = args.address(5).ok_or(-3)?;
+    let roles_blob = args.dynamic_bytes(6).ok_or(-3)?;
+    let policies_blob = args.dynamic_bytes(7).ok_or(-3)?;
+    let fn_auths_blob = args.dynamic_bytes(8).ok_or(-3)?;
+    let share_classes_blob = args.dynamic_bytes(9).ok_or(-3)?;
+    let modules_blob = args.dynamic_bytes(10).ok_or(-3)?;
+
+    execute_initialize_with_governance(
+        &registry,
+        roles_blob,
+        policies_blob,
+        fn_auths_blob,
+        share_classes_blob,
+        modules_blob,
+    )?;
+    configure_entity_and_social_internal(
+        legal_name,
+        jurisdiction,
+        reg_id,
+        &hfs_registry,
+        &messaging_hps,
+    )?;
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_configure_entity_and_social(args: &CalldataReader) -> Result<(), i32> {
+    let (registry, caller) = ensure_initialized_any_state_caller()?;
+    let init_by = storage::get_address(KEY_INITIALIZER).unwrap_or([0u8; 20]);
+    if caller != init_by && !is_active_consented_director(&registry, &caller) {
+        return Err(ERR_NOT_ACTIVE_DIRECTOR);
+    }
+    // If entity name was already set on a non-sovereign charter, only allow updating unset messaging/regId
+    let mut existing_name = [0u8; MAX_ENTITY_NAME_LEN];
+    let existing_len = load_entity_name_into(&mut existing_name);
+    let legal_name = args.dynamic_bytes(0).ok_or(-3)?;
+    let jurisdiction = args.dynamic_bytes(1).ok_or(-3)?;
+    let reg_id = args.dynamic_bytes(2).ok_or(-3)?;
+    let hfs_registry = args.address(3).ok_or(-3)?;
+    let messaging_hps = args.address(4).ok_or(-3)?;
+
+    if existing_len > 0 && legal_name != &existing_name[..existing_len] {
+        return Err(-61);
+    }
+
+    configure_entity_and_social_internal(
+        legal_name,
+        jurisdiction,
+        reg_id,
+        &hfs_registry,
+        &messaging_hps,
+    )?;
+    ret::write_bool(true);
+    Ok(())
+}
+
+/// Allows an active consented Director to stamp the official corporate registry number (e.g.
+/// Singapore ACRA UEN) once issued, locking it on-chain when sovereign-sealed.
+fn handle_set_registration_id(args: &CalldataReader) -> Result<(), i32> {
+    let (registry, caller) = ensure_initialized_any_state_caller()?;
+    if !is_active_consented_director(&registry, &caller) {
+        return Err(ERR_NOT_ACTIVE_DIRECTOR);
+    }
+    let reg_id = args.dynamic_bytes(0).ok_or(-3)?;
+    if reg_id.is_empty() || reg_id.len() > MAX_REG_ID_LEN {
+        return Err(-59);
+    }
+    let mut prev = [0u8; MAX_REG_ID_LEN];
+    let prev_len = storage::get_into(KEY_ENTITY_REG_ID, &mut prev).unwrap_or(0);
+    if storage::get_u64(KEY_SOVEREIGN_SEALED) == 1 && prev_len > 0 {
+        return Err(-61);
+    }
+    storage::set(KEY_ENTITY_REG_ID, reg_id);
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_entity_profile(_args: &CalldataReader) -> Result<(), i32> {
+    let mut name_buf = [0u8; MAX_ENTITY_NAME_LEN];
+    let nlen = load_entity_name_into(&mut name_buf);
+    let mut jur_buf = [0u8; MAX_JURISDICTION_LEN];
+    let jlen = storage::get_into(KEY_ENTITY_JURISDICTION, &mut jur_buf)
+        .unwrap_or(0)
+        .min(MAX_JURISDICTION_LEN);
+    let mut reg_buf = [0u8; MAX_REG_ID_LEN];
+    let rlen = storage::get_into(KEY_ENTITY_REG_ID, &mut reg_buf)
+        .unwrap_or(0)
+        .min(MAX_REG_ID_LEN);
+
+    let msg_hps = storage::get_address(KEY_MESSAGING_HPS).unwrap_or([0u8; 20]);
+    let hfs_reg = storage::get_address(KEY_HFS_REGISTRY).unwrap_or([0u8; 20]);
+    let all_chan = company_group_channel_hash(&context::self_address(), &SUBGROUP_ALL_MEMBERS);
+    let sgrp_cnt = storage::get_u64(KEY_SUBGROUP_CNT) as u16;
+
+    let mut out = [0u8; 81 + MAX_ENTITY_NAME_LEN + MAX_JURISDICTION_LEN + MAX_REG_ID_LEN];
+    out[0] = u8::from(storage::get_u64(KEY_SOVEREIGN_SEALED) == 1);
+    out[1..3].copy_from_slice(&(nlen as u16).to_be_bytes());
+    out[3..5].copy_from_slice(&(jlen as u16).to_be_bytes());
+    out[5..7].copy_from_slice(&(rlen as u16).to_be_bytes());
+    out[7..27].copy_from_slice(&msg_hps);
+    out[27..47].copy_from_slice(&hfs_reg);
+    out[47..79].copy_from_slice(&all_chan);
+    out[79..81].copy_from_slice(&sgrp_cnt.to_be_bytes());
+
+    let mut pos = 81usize;
+    out[pos..pos + nlen].copy_from_slice(&name_buf[..nlen]);
+    pos += nlen;
+    out[pos..pos + jlen].copy_from_slice(&jur_buf[..jlen]);
+    pos += jlen;
+    out[pos..pos + rlen].copy_from_slice(&reg_buf[..rlen]);
+    pos += rlen;
+
+    ret::write(&out[..pos]);
+    Ok(())
+}
+
+fn handle_is_sovereign_superlexicon(_args: &CalldataReader) -> Result<(), i32> {
+    ret::write_bool(storage::get_u64(KEY_SOVEREIGN_SEALED) == 1);
+    Ok(())
+}
+
+fn handle_messaging_hps(_args: &CalldataReader) -> Result<(), i32> {
+    let addr = storage::get_address(KEY_MESSAGING_HPS).unwrap_or([0u8; 20]);
+    ret::write_address(&addr);
+    Ok(())
+}
+
+fn handle_company_group_channel_hash(args: &CalldataReader) -> Result<(), i32> {
+    let slug = args.bytes32(0).ok_or(-3)?;
+    let ch = company_group_channel_hash(&context::self_address(), &slug);
+    ret::write_word(&ch);
+    Ok(())
+}
+
+fn handle_sync_company_social_group(_args: &CalldataReader) -> Result<(), i32> {
+    if storage::get_u64(KEY_INIT) != 1 {
+        return Err(-57);
+    }
+    let cnt = auto_provision_company_social_group();
+    ret::write_u64_word(cnt as u64);
+    Ok(())
+}
+
+fn handle_is_company_social_member(args: &CalldataReader) -> Result<(), i32> {
+    if storage::get_u64(KEY_INIT) != 1 {
+        ret::write_bool(false);
+        return Ok(());
+    }
+    let Some(registry) = storage::get_address(KEY_REGISTRY) else {
+        ret::write_bool(false);
+        return Ok(());
+    };
+    let account = args.address(0).ok_or(-3)?;
+    ret::write_bool(is_company_social_member_internal(&registry, &account));
+    Ok(())
+}
+
+/// Any single active consented Director of this `CorporateCharter` can create a company-linked
+/// social subgroup (e.g. `keccak256("developers")` -> `"Superlexicon · Developers"`).
+fn handle_create_company_subgroup(args: &CalldataReader) -> Result<(), i32> {
+    let (registry, caller) = ensure_initialized_any_state_caller()?;
+    if !is_active_consented_director(&registry, &caller) {
+        return Err(ERR_NOT_ACTIVE_DIRECTOR);
+    }
+    let slug = args.bytes32(0).ok_or(-3)?;
+    let label = args.dynamic_bytes(1).ok_or(-3)?;
+    let members_packed = args.dynamic_bytes(2).ok_or(-3)?;
+
+    if slug == [0u8; 32]
+        || slug == SUBGROUP_ALL_MEMBERS
+        || label.is_empty()
+        || label.len() > MAX_SUBGROUP_LABEL_LEN
+        || members_packed.len() % 20 != 0
+    {
+        return Err(-59);
+    }
+
+    // Non-sovereign charters cannot name a subgroup after `Superlexicon`!
+    if storage::get_u64(KEY_SOVEREIGN_SEALED) != 1 && is_confusable_superlexicon_name(label) {
+        return Err(ERR_RESERVED_ENTITY_NAME);
+    }
+
+    if storage::get_u64(subgroup_idx_key(&slug).as_slice()) != 0 {
+        return Err(ERR_SUBGROUP_ALREADY_EXISTS);
+    }
+
+    let cur_cnt = storage::get_u64(KEY_SUBGROUP_CNT) as usize;
+    if cur_cnt >= MAX_COMPANY_SUBGROUPS {
+        return Err(-61);
+    }
+
+    let me = context::self_address();
+    let chan_hash = company_group_channel_hash(&me, &slug);
+
+    let mut members = [[0u8; 20]; MAX_SUBGROUP_MEMBERS];
+    members[0] = caller;
+    let mut mc = 1usize;
+
+    let packed_cnt = members_packed.len() / 20;
+    let mut i = 0usize;
+    while i < packed_cnt {
+        if mc >= MAX_SUBGROUP_MEMBERS {
+            return Err(-61);
+        }
+        let mut cand = [0u8; 20];
+        cand.copy_from_slice(&members_packed[i * 20..(i + 1) * 20]);
+        if cand == [0u8; 20] {
+            return Err(-59);
+        }
+        let mut dup = false;
+        let mut k = 0usize;
+        while k < mc {
+            if members[k] == cand {
+                dup = true;
+                break;
+            }
+            k += 1;
+        }
+        if !dup {
+            require_valid_identity(&registry, &cand)?;
+            members[mc] = cand;
+            mc += 1;
+        }
+        i += 1;
+    }
+
+    let mut lbl_arr = [0u8; MAX_SUBGROUP_LABEL_LEN];
+    lbl_arr[..label.len()].copy_from_slice(label);
+
+    let rec = SubgroupRec {
+        slug,
+        channel_hash: chan_hash,
+        creator_director: caller,
+        created_blk: context::block_number(),
+        active: 1,
+        label_len: label.len() as u8,
+        member_count: mc as u8,
+        label: lbl_arr,
+        members,
+    };
+    rec.save(cur_cnt);
+    storage::set_u64(subgroup_idx_key(&slug).as_slice(), (cur_cnt + 1) as u64);
+    storage::set_u64(KEY_SUBGROUP_CNT, (cur_cnt + 1) as u64);
+
+    if let Some(msg_hps) = storage::get_address(KEY_MESSAGING_HPS) {
+        if msg_hps != [0u8; 20] {
+            ensure_messaging_channel_bound(&msg_hps, &chan_hash);
+        }
+    }
+
+    let mut m = 0usize;
+    while m < mc {
+        storage::set_u64(subgroup_member_key(&slug, &members[m]).as_slice(), 1);
+        notify_member_company_social_if_needed(&members[m], Some(label));
+        m += 1;
+    }
+
+    events::emit(
+        &[COMPANY_SUBGROUP_CREATED, slug, chan_hash, addr_topic(&caller)],
+        &(mc as u64).to_be_bytes(),
+    );
+    ret::write_word(&chan_hash);
+    Ok(())
+}
+
+fn handle_add_subgroup_member(args: &CalldataReader) -> Result<(), i32> {
+    let (registry, caller) = ensure_initialized_any_state_caller()?;
+    if !is_active_consented_director(&registry, &caller) {
+        return Err(ERR_NOT_ACTIVE_DIRECTOR);
+    }
+    let slug = args.bytes32(0).ok_or(-3)?;
+    let member = args.address(1).ok_or(-3)?;
+    if slug == [0u8; 32] || slug == SUBGROUP_ALL_MEMBERS || member == [0u8; 20] {
+        return Err(-59);
+    }
+    require_valid_identity(&registry, &member)?;
+
+    let idx_plus_1 = storage::get_u64(subgroup_idx_key(&slug).as_slice()) as usize;
+    if idx_plus_1 == 0 {
+        return Err(ERR_SUBGROUP_NOT_FOUND);
+    }
+    let idx = idx_plus_1 - 1;
+    let mut rec = SubgroupRec::load(idx).ok_or(ERR_SUBGROUP_NOT_FOUND)?;
+    if rec.active != 1 {
+        return Err(ERR_SUBGROUP_NOT_FOUND);
+    }
+
+    let mc = rec.member_count as usize;
+    let mut i = 0usize;
+    while i < mc {
+        if rec.members[i] == member {
+            storage::set_u64(subgroup_member_key(&slug, &member).as_slice(), 1);
+            ret::write_u64_word(mc as u64);
+            return Ok(());
+        }
+        i += 1;
+    }
+    if mc >= MAX_SUBGROUP_MEMBERS {
+        return Err(-61);
+    }
+    rec.members[mc] = member;
+    rec.member_count = (mc + 1) as u8;
+    rec.save(idx);
+    storage::set_u64(subgroup_member_key(&slug, &member).as_slice(), 1);
+
+    let ll = rec.label_len as usize;
+    notify_member_company_social_if_needed(&member, Some(&rec.label[..ll]));
+
+    events::emit(
+        &[
+            COMPANY_SUBGROUP_MEMBER_ADDED,
+            slug,
+            addr_topic(&member),
+            addr_topic(&caller),
+        ],
+        &((mc + 1) as u64).to_be_bytes(),
+    );
+    ret::write_u64_word((mc + 1) as u64);
+    Ok(())
+}
+
+fn handle_remove_subgroup_member(args: &CalldataReader) -> Result<(), i32> {
+    let (registry, caller) = ensure_initialized_any_state_caller()?;
+    if !is_active_consented_director(&registry, &caller) {
+        return Err(ERR_NOT_ACTIVE_DIRECTOR);
+    }
+    let slug = args.bytes32(0).ok_or(-3)?;
+    let member = args.address(1).ok_or(-3)?;
+    let idx_plus_1 = storage::get_u64(subgroup_idx_key(&slug).as_slice()) as usize;
+    if idx_plus_1 == 0 {
+        return Err(ERR_SUBGROUP_NOT_FOUND);
+    }
+    let idx = idx_plus_1 - 1;
+    let mut rec = SubgroupRec::load(idx).ok_or(ERR_SUBGROUP_NOT_FOUND)?;
+
+    let mc = rec.member_count as usize;
+    let mut found: Option<usize> = None;
+    let mut i = 0usize;
+    while i < mc {
+        if rec.members[i] == member {
+            found = Some(i);
+            break;
+        }
+        i += 1;
+    }
+    let Some(rm_idx) = found else {
+        return Err(-62);
+    };
+
+    let mut j = rm_idx;
+    while j + 1 < mc {
+        rec.members[j] = rec.members[j + 1];
+        j += 1;
+    }
+    rec.members[mc - 1] = [0u8; 20];
+    rec.member_count = (mc - 1) as u8;
+    rec.save(idx);
+    storage::set_u64(subgroup_member_key(&slug, &member).as_slice(), 0);
+
+    events::emit(
+        &[
+            COMPANY_SUBGROUP_MEMBER_REMOVED,
+            slug,
+            addr_topic(&member),
+            addr_topic(&caller),
+        ],
+        &((mc - 1) as u64).to_be_bytes(),
+    );
+    ret::write_u64_word((mc - 1) as u64);
+    Ok(())
+}
+
+fn handle_is_subgroup_member(args: &CalldataReader) -> Result<(), i32> {
+    if storage::get_u64(KEY_INIT) != 1 {
+        ret::write_bool(false);
+        return Ok(());
+    }
+    let Some(registry) = storage::get_address(KEY_REGISTRY) else {
+        ret::write_bool(false);
+        return Ok(());
+    };
+    let slug = args.bytes32(0).ok_or(-3)?;
+    let account = args.address(1).ok_or(-3)?;
+    ret::write_bool(is_subgroup_member_internal(&registry, &slug, &account));
+    Ok(())
+}
+
+/// Checks whether `actor_or_eoa` is EITHER a direct `Identity` HFS member of `subgroupSlug` OR an
+/// authorized owner / device / delegate EOA of an `Identity` HFS member of `subgroupSlug`.
+/// Used by both `AppStore` and `lexicon`'s Web JSON-RPC deployment gateway!
+fn handle_is_subgroup_authorized_actor(args: &CalldataReader) -> Result<(), i32> {
+    if storage::get_u64(KEY_INIT) != 1 {
+        ret::write_bool(false);
+        return Ok(());
+    }
+    let Some(registry) = storage::get_address(KEY_REGISTRY) else {
+        ret::write_bool(false);
+        return Ok(());
+    };
+    let slug = args.bytes32(0).ok_or(-3)?;
+    let actor = args.address(1).ok_or(-3)?;
+    if actor == [0u8; 20] {
+        ret::write_bool(false);
+        return Ok(());
+    }
+    if is_subgroup_member_internal(&registry, &slug, &actor) {
+        ret::write_bool(true);
+        return Ok(());
+    }
+
+    if slug == [0u8; 32] || slug == SUBGROUP_ALL_MEMBERS {
+        let mut all_mems = [[0u8; 20]; MAX_SUBGROUP_MEMBERS];
+        let cnt = enumerate_all_company_members(&mut all_mems);
+        let mut i = 0usize;
+        while i < cnt {
+            if identity_authorizes_actor(&all_mems[i], &actor) {
+                ret::write_bool(true);
+                return Ok(());
+            }
+            i += 1;
+        }
+        ret::write_bool(false);
+        return Ok(());
+    }
+
+    let idx_plus_1 = storage::get_u64(subgroup_idx_key(&slug).as_slice()) as usize;
+    if idx_plus_1 == 0 {
+        ret::write_bool(false);
+        return Ok(());
+    }
+    let Some(rec) = SubgroupRec::load(idx_plus_1 - 1) else {
+        ret::write_bool(false);
+        return Ok(());
+    };
+    if rec.active != 1 {
+        ret::write_bool(false);
+        return Ok(());
+    }
+    let mc = rec.member_count as usize;
+    let mut i = 0usize;
+    while i < mc {
+        let m = &rec.members[i];
+        if require_valid_identity(&registry, m).is_ok() && identity_authorizes_actor(m, &actor) {
+            ret::write_bool(true);
+            return Ok(());
+        }
+        i += 1;
+    }
+    ret::write_bool(false);
+    Ok(())
+}
+
+fn handle_post_company_group_message(args: &CalldataReader) -> Result<(), i32> {
+    let (registry, caller) = ensure_initialized_any_state_caller()?;
+    let slug = args.bytes32(0).ok_or(-3)?;
+    let msg = args.dynamic_bytes(1).ok_or(-3)?;
+    if msg.is_empty() || msg.len() > MAX_SOCIAL_MSG_LEN {
+        return Err(-59);
+    }
+    if !is_subgroup_member_internal(&registry, &slug, &caller) {
+        return Err(ERR_NOT_SUBGROUP_MEMBER);
+    }
+    let msg_hps = storage::get_address(KEY_MESSAGING_HPS).ok_or(ERR_MESSAGING_NOT_CONFIGURED)?;
+    if msg_hps == [0u8; 20] || !has_deployed_wasm_at(&msg_hps) {
+        return Err(ERR_MESSAGING_NOT_CONFIGURED);
+    }
+
+    let chan_hash = company_group_channel_hash(&context::self_address(), &slug);
+    ensure_messaging_channel_bound(&msg_hps, &chan_hash);
+
+    let cd = CallEncoder::<4352>::new(const {
+        selector("postAttributedMessage(bytes32,address,bytes)")
+    })
+    .push_bytes32(&chan_hash)
+    .push_address(&caller)
+    .push_u64(96)
+    .push_dynamic_bytes_tail(msg);
+
+    call::call_raw(&msg_hps, cd.as_slice()).map_err(|_| -66)?;
+    events::emit(
+        &[
+            COMPANY_GROUP_MESSAGE_POSTED,
+            slug,
+            chan_hash,
+            addr_topic(&caller),
+        ],
+        &(msg.len() as u64).to_be_bytes(),
+    );
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_get_company_social_overview(args: &CalldataReader) -> Result<(), i32> {
+    let viewer = args.address(0).unwrap_or([0u8; 20]);
+    let registry = storage::get_address(KEY_REGISTRY).unwrap_or([0u8; 20]);
+    let is_sov = storage::get_u64(KEY_SOVEREIGN_SEALED) == 1;
+    let viewer_in_all = if registry != [0u8; 20] && viewer != [0u8; 20] {
+        is_company_social_member_internal(&registry, &viewer)
+    } else {
+        false
+    };
+    let viewer_is_dir = if registry != [0u8; 20] && viewer != [0u8; 20] {
+        is_active_consented_director(&registry, &viewer)
+    } else {
+        false
+    };
+    let c_state = storage::get_u64(KEY_STATE) as u8;
+
+    let mut name_buf = [0u8; MAX_ENTITY_NAME_LEN];
+    let nlen = load_entity_name_into(&mut name_buf);
+    let mut jur_buf = [0u8; MAX_JURISDICTION_LEN];
+    let jlen = storage::get_into(KEY_ENTITY_JURISDICTION, &mut jur_buf)
+        .unwrap_or(0)
+        .min(MAX_JURISDICTION_LEN);
+    let mut reg_buf = [0u8; MAX_REG_ID_LEN];
+    let rlen = storage::get_into(KEY_ENTITY_REG_ID, &mut reg_buf)
+        .unwrap_or(0)
+        .min(MAX_REG_ID_LEN);
+
+    let msg_hps = storage::get_address(KEY_MESSAGING_HPS).unwrap_or([0u8; 20]);
+    let all_chan = company_group_channel_hash(&context::self_address(), &SUBGROUP_ALL_MEMBERS);
+
+    let mut all_members = [[0u8; 20]; MAX_SUBGROUP_MEMBERS];
+    let all_cnt = if storage::get_u64(KEY_INIT) == 1 {
+        enumerate_all_company_members(&mut all_members)
+    } else {
+        0
+    };
+
+    let sgrp_cnt = (storage::get_u64(KEY_SUBGROUP_CNT) as usize).min(MAX_COMPANY_SUBGROUPS);
+
+    unsafe {
+        let out = &mut *core::ptr::addr_of_mut!(SOCIAL_VIEW_SCRATCH);
+        out[0] = u8::from(is_sov);
+        out[1] = u8::from(viewer_in_all);
+        out[2] = u8::from(viewer_is_dir);
+        out[3] = c_state;
+        out[4..6].copy_from_slice(&(nlen as u16).to_be_bytes());
+        out[6..8].copy_from_slice(&(jlen as u16).to_be_bytes());
+        out[8..10].copy_from_slice(&(rlen as u16).to_be_bytes());
+        out[10..30].copy_from_slice(&msg_hps);
+        out[30..62].copy_from_slice(&all_chan);
+        out[62..64].copy_from_slice(&(all_cnt as u16).to_be_bytes());
+
+        let mut pos = 65usize;
+        out[pos..pos + nlen].copy_from_slice(&name_buf[..nlen]);
+        pos += nlen;
+        out[pos..pos + jlen].copy_from_slice(&jur_buf[..jlen]);
+        pos += jlen;
+        out[pos..pos + rlen].copy_from_slice(&reg_buf[..rlen]);
+        pos += rlen;
+
+        let mut m = 0usize;
+        while m < all_cnt {
+            out[pos..pos + 20].copy_from_slice(&all_members[m]);
+            pos += 20;
+            m += 1;
+        }
+
+        let mut written_sgrps = 0u8;
+        let mut s = 0usize;
+        while s < sgrp_cnt {
+            if let Some(rec) = SubgroupRec::load(s) {
+                let ll = rec.label_len as usize;
+                let mc = rec.member_count as usize;
+                let needed = 98 + ll + mc * 20;
+                if pos + needed <= SOCIAL_VIEW_CAP {
+                    let v_mem = viewer != [0u8; 20]
+                        && registry != [0u8; 20]
+                        && is_subgroup_member_internal(&registry, &rec.slug, &viewer);
+                    out[pos..pos + 32].copy_from_slice(&rec.slug);
+                    out[pos + 32..pos + 64].copy_from_slice(&rec.channel_hash);
+                    out[pos + 64..pos + 84].copy_from_slice(&rec.creator_director);
+                    out[pos + 84..pos + 92].copy_from_slice(&rec.created_blk.to_be_bytes());
+                    out[pos + 92] = rec.active;
+                    out[pos + 93] = u8::from(v_mem);
+                    out[pos + 94..pos + 96].copy_from_slice(&(ll as u16).to_be_bytes());
+                    out[pos + 96..pos + 98].copy_from_slice(&(mc as u16).to_be_bytes());
+                    pos += 98;
+                    out[pos..pos + ll].copy_from_slice(&rec.label[..ll]);
+                    pos += ll;
+                    let mut k = 0usize;
+                    while k < mc {
+                        out[pos..pos + 20].copy_from_slice(&rec.members[k]);
+                        pos += 20;
+                        k += 1;
+                    }
+                    written_sgrps += 1;
+                }
+            }
+            s += 1;
+        }
+        out[64] = written_sgrps;
+        ret::write(&out[..pos]);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3928,6 +5081,321 @@ mod tests {
                     .as_slice()
             ),
             ERR_STALE_CAPITAL_SNAPSHOT
+        );
+    }
+
+    #[test]
+    fn casts_superlexicon_in_stone_blocks_imposters_and_manages_company_social_and_dev_subgroups() {
+        use hps_sdk::governance::SUBGROUP_DEVELOPERS;
+
+        mock::reset();
+        let slx_charter = [0x51; 20];
+        let imposter_charter = [0x99; 20];
+        let reg_addr = [0xB0; 20];
+        let hfs_reg = [0xBB; 20];
+        let msg_hps = [0xCC; 20];
+        let slx_ord_ledger = [0x52; 20];
+
+        // Founders & Developer
+        let manogaran_id = [0x11; 20];
+        let manogaran_eoa = [0xE1; 20];
+        let sarah_id = [0x12; 20];
+        let sarah_eoa = [0xE2; 20];
+        let external_dev_id = [0x13; 20];
+        let external_dev_eoa = [0xE3; 20];
+        let stranger_id = [0x19; 20];
+
+        mock::register_hps_with_code_hash(reg_addr, [0x71; 32], reg_stub::dispatch);
+        mock::register_hps_with_code_hash(slx_ord_ledger, [0x72; 32], share_stub::dispatch);
+        mock::register_hps_with_code_hash(slx_charter, [0x73; 32], dispatch_calldata);
+        mock::register_hps_with_code_hash(imposter_charter, [0x73; 32], dispatch_calldata);
+
+        // Stub HfsRegistry pinning `slx_charter` as sovereignCharter()
+        mock::register_hps_with_code_hash(hfs_reg, [0x74; 32], |raw| {
+            let Some((sel, _)) = CalldataReader::parse(raw) else { return -1; };
+            if sel == const { selector("sovereignCharter()") } {
+                ret::write_address(&[0x51; 20]);
+                return 0;
+            }
+            -2
+        });
+
+        // Stub Messaging HFS (`bindChannelController` + `postAttributedMessage`)
+        mock::register_hps_with_code_hash(msg_hps, [0x75; 32], |raw| {
+            let Some((sel, _)) = CalldataReader::parse(raw) else { return -1; };
+            if sel == const { selector("bindChannelController(bytes32,address)") } {
+                storage::set_u64(b"bound_cnt", storage::get_u64(b"bound_cnt") + 1);
+                return 0;
+            }
+            if sel == const { selector("postAttributedMessage(bytes32,address,bytes)") } {
+                storage::set_u64(b"msg_cnt", storage::get_u64(b"msg_cnt") + 1);
+                return 0;
+            }
+            -2
+        });
+
+        // Stub Identity HFS instances mapping each Identity -> owner EOA + recording `notifyHfsAssociation`
+        for (id_addr, eoa_addr) in [
+            (manogaran_id, manogaran_eoa),
+            (sarah_id, sarah_eoa),
+            (external_dev_id, external_dev_eoa),
+        ] {
+            mock::register_hps_with_code_hash(id_addr, [0x76; 32], |raw| {
+                let Some((sel, args)) = CalldataReader::parse(raw) else { return -1; };
+                if sel == const { selector("isAuthorized(address)") } {
+                    let cand = args.address(0).unwrap_or([0u8; 20]);
+                    let own = storage::get_address(b"owner").unwrap_or([0u8; 20]);
+                    ret::write_bool(cand == own);
+                    return 0;
+                }
+                if sel == const { selector("owner()") } {
+                    let own = storage::get_address(b"owner").unwrap_or([0u8; 20]);
+                    ret::write_address(&own);
+                    return 0;
+                }
+                if sel == const { selector("notifyHfsAssociation(address,bytes32,string)") } {
+                    storage::set_u64(b"notified", storage::get_u64(b"notified") + 1);
+                    ret::write_u64_word(2);
+                    return 0;
+                }
+                -2
+            });
+            mock::set_self_address(id_addr);
+            storage::set_address(b"owner", &eoa_addr);
+        }
+
+        // Seed 100,000 shares solely to Manogaran Thanabalan on SLX-ORD ledger
+        mock::set_self_address(slx_ord_ledger);
+        storage::set_address(b"charter", &slx_charter);
+        storage::set_u64(&manogaran_id, 100_000);
+        storage::set_u64(b"supply", 100_000);
+
+        // Build governance blobs: Directors = [Manogaran Thanabalan, Sarah Jean Rodrigues]
+        let mut roles_blob = Vec::new();
+        roles_blob.extend_from_slice(&2u16.to_be_bytes());
+        for (rid, members) in [
+            (ROLE_SHAREHOLDER, &[][..]),
+            (ROLE_DIRECTOR, &[manogaran_id, sarah_id][..]),
+        ] {
+            roles_blob.extend_from_slice(&rid);
+            roles_blob.extend_from_slice(&(members.len() as u16).to_be_bytes());
+            for m in members {
+                roles_blob.extend_from_slice(m);
+            }
+        }
+        let pol_super = PolicySpec::new(100)
+            .add_stage(StageSpec::new(7_500, 50).add_role(ROLE_SHAREHOLDER, 1).unwrap())
+            .unwrap();
+        let pol_board = PolicySpec::new(100)
+            .add_stage(
+                StageSpec::new(2, 50)
+                    .add_member(manogaran_id, 1)
+                    .unwrap()
+                    .add_member(sarah_id, 1)
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut policies_blob = Vec::new();
+        policies_blob.extend_from_slice(&3u16.to_be_bytes());
+        for (pid, spec) in [
+            (POLICY_SUPER_GOVERNANCE, &pol_super),
+            (POLICY_FIRST_SHAREHOLDER_RESOLUTION, &pol_super),
+            (POLICY_BOARD_RESOLUTION, &pol_board),
+        ] {
+            let mut sb = [0u8; 512];
+            let slen = spec.encode(&mut sb).unwrap();
+            policies_blob.extend_from_slice(&[0u8; 20]);
+            policies_blob.extend_from_slice(&pid);
+            policies_blob.extend_from_slice(&(slen as u16).to_be_bytes());
+            policies_blob.extend_from_slice(&sb[..slen]);
+        }
+        let mut sc_blob = Vec::new();
+        sc_blob.extend_from_slice(&1u16.to_be_bytes());
+        sc_blob.extend_from_slice(
+            &ShareClassSpec {
+                ledger: slx_ord_ledger,
+                votes_per_share: 1,
+                conversion_numer: 1,
+                conversion_denom: 1,
+            }
+            .encode(),
+        );
+
+        let encode_cfg_entity =
+            |name: &[u8], jur: &[u8], reg_id: &[u8], hreg: &[u8; 20], mhps: &[u8; 20]| -> Vec<u8> {
+                let mut cd = Vec::new();
+                cd.extend_from_slice(&selector(
+                    "configureEntityAndSocial(string,string,string,address,address)",
+                ));
+                let mut head = [0u8; 5 * 32];
+                head[3 * 32 + 12..4 * 32].copy_from_slice(hreg);
+                head[4 * 32 + 12..5 * 32].copy_from_slice(mhps);
+                let mut tail = Vec::new();
+                for (i, b) in [name, jur, reg_id].iter().enumerate() {
+                    let off = 5 * 32 + tail.len();
+                    head[i * 32 + 24..(i + 1) * 32].copy_from_slice(&(off as u64).to_be_bytes());
+                    let mut lw = [0u8; 32];
+                    lw[24..32].copy_from_slice(&(b.len() as u64).to_be_bytes());
+                    tail.extend_from_slice(&lw);
+                    let pad = (b.len() + 31) & !31;
+                    let st = tail.len();
+                    tail.resize(st + pad, 0);
+                    tail[st..st + b.len()].copy_from_slice(b);
+                }
+                cd.extend_from_slice(&head);
+                cd.extend_from_slice(&tail);
+                cd
+            };
+
+        let init_charter_at = |addr: [u8; 20], sender: [u8; 20]| {
+            let mut init_cd = Vec::new();
+            init_cd.extend_from_slice(&selector(
+                "initializeWithGovernance(address,bytes,bytes,bytes,bytes,bytes)",
+            ));
+            let blobs: [&[u8]; 5] = [&roles_blob, &policies_blob, &[], &sc_blob, &[]];
+            let mut head = [0u8; 6 * 32];
+            head[12..32].copy_from_slice(&reg_addr);
+            let mut tail = Vec::new();
+            for (i, b) in blobs.iter().enumerate() {
+                let off = 6 * 32 + tail.len();
+                head[(i + 1) * 32 + 24..(i + 2) * 32]
+                    .copy_from_slice(&(off as u64).to_be_bytes());
+                let mut len_w = [0u8; 32];
+                len_w[24..32].copy_from_slice(&(b.len() as u64).to_be_bytes());
+                tail.extend_from_slice(&len_w);
+                let pad_len = (b.len() + 31) & !31;
+                let start = tail.len();
+                tail.resize(start + pad_len, 0);
+                tail[start..start + b.len()].copy_from_slice(b);
+            }
+            init_cd.extend_from_slice(&head);
+            init_cd.extend_from_slice(&tail);
+            assert!(mock::transact_as(sender, addr, &init_cd).is_ok());
+        };
+
+        // 1. Imposter charter attempting to claim "Superlexicon Pte. Ltd." or confusable names MUST REVERT (-110)!
+        init_charter_at(imposter_charter, stranger_id);
+        for spoof in [
+            "Superlexicon Pte. Ltd.",
+            "Super1exic0n Labs",
+            "Ѕupеrlехісоn Pte Ltd",
+            "Super-Lexcon SG",
+        ] {
+            let bad = encode_cfg_entity(spoof.as_bytes(), b"Singapore", b"", &hfs_reg, &msg_hps);
+            assert_eq!(
+                mock::transact_as(stranger_id, imposter_charter, &bad),
+                Err(ERR_RESERVED_ENTITY_NAME)
+            );
+        }
+
+        // 2. Canonical sovereign `slx_charter` casts `Superlexicon Pte. Ltd.` (Singapore) in stone!
+        init_charter_at(slx_charter, manogaran_id);
+        let ok_cfg = encode_cfg_entity(
+            b"Superlexicon Pte. Ltd.",
+            b"Singapore",
+            b"",
+            &hfs_reg,
+            &msg_hps,
+        );
+        assert!(mock::transact_as(manogaran_id, slx_charter, &ok_cfg).is_ok());
+
+        // Sarah consents to directorship & Manogaran (100,000 shares = 100%) activates the charter
+        assert!(
+            mock::transact_as(sarah_id, slx_charter, &selector("consentToDirectorship()")).is_ok()
+        );
+        let sov_res =
+            mock::transact_as(manogaran_id, slx_charter, &selector("isSovereignSuperlexicon()"))
+                .unwrap();
+        assert_eq!(sov_res[31], 1);
+
+        // 3. Automatic Company-Wide Social Group (`All Members`): both Manogaran and Sarah are members immediately!
+        for member in [manogaran_id, sarah_id] {
+            let chk = CallEncoder::<64>::new(selector("isCompanySocialMember(address)"))
+                .push_address(&member);
+            assert_eq!(
+                mock::transact_as(member, slx_charter, chk.as_slice()).unwrap()[31],
+                1
+            );
+        }
+        let chk_stranger = CallEncoder::<64>::new(selector("isCompanySocialMember(address)"))
+            .push_address(&stranger_id);
+        assert_eq!(
+            mock::transact_as(stranger_id, slx_charter, chk_stranger.as_slice()).unwrap()[31],
+            0
+        );
+
+        // Sarah can immediately chat in `All Members` (`[0u8; 32]`), while stranger is blocked (`-114`)!
+        let post_all = CallEncoder::<192>::new(selector("postCompanyGroupMessage(bytes32,bytes)"))
+            .push_bytes32(&[0u8; 32])
+            .push_u64(64)
+            .push_dynamic_bytes_tail(b"Hello Superlexicon boardroom!");
+        assert!(mock::transact_as(sarah_id, slx_charter, post_all.as_slice()).is_ok());
+        assert_eq!(
+            mock::transact_as(stranger_id, slx_charter, post_all.as_slice()),
+            Err(ERR_NOT_SUBGROUP_MEMBER)
+        );
+
+        // 4. Active consented Director (Sarah) creates `Superlexicon · Developers` subgroup and adds `external_dev_id`!
+        let lbl = b"Superlexicon - Developers";
+        let mut create_sg = Vec::new();
+        create_sg.extend_from_slice(&selector("createCompanySubgroup(bytes32,string,bytes)"));
+        create_sg.extend_from_slice(&SUBGROUP_DEVELOPERS);
+        let mut w_off1 = [0u8; 32];
+        w_off1[24..32].copy_from_slice(&96u64.to_be_bytes());
+        create_sg.extend_from_slice(&w_off1);
+        let lbl_pad = (lbl.len() + 31) & !31;
+        let off2 = 96 + 32 + lbl_pad;
+        let mut w_off2 = [0u8; 32];
+        w_off2[24..32].copy_from_slice(&(off2 as u64).to_be_bytes());
+        create_sg.extend_from_slice(&w_off2);
+        let mut lw = [0u8; 32];
+        lw[24..32].copy_from_slice(&(lbl.len() as u64).to_be_bytes());
+        create_sg.extend_from_slice(&lw);
+        let st = create_sg.len();
+        create_sg.resize(st + lbl_pad, 0);
+        create_sg[st..st + lbl.len()].copy_from_slice(lbl);
+        let mut mw = [0u8; 32];
+        mw[24..32].copy_from_slice(&20u64.to_be_bytes());
+        create_sg.extend_from_slice(&mw);
+        let mst = create_sg.len();
+        create_sg.resize(mst + 32, 0);
+        create_sg[mst..mst + 20].copy_from_slice(&manogaran_id);
+
+        assert_eq!(
+            mock::transact_as(stranger_id, slx_charter, &create_sg),
+            Err(ERR_NOT_ACTIVE_DIRECTOR)
+        );
+        assert!(mock::transact_as(sarah_id, slx_charter, &create_sg).is_ok());
+
+        // Manogaran (the other consented Director) adds `external_dev_id` in 1 click
+        let add_dev = CallEncoder::<96>::new(selector("addSubgroupMember(bytes32,address)"))
+            .push_bytes32(&SUBGROUP_DEVELOPERS)
+            .push_address(&external_dev_id);
+        assert!(mock::transact_as(manogaran_id, slx_charter, add_dev.as_slice()).is_ok());
+
+        // Both `external_dev_id` (Identity HFS) AND `external_dev_eoa` (owner EOA) pass `isSubgroupAuthorizedActor`!
+        for actor in [manogaran_id, manogaran_eoa, sarah_eoa, external_dev_id, external_dev_eoa] {
+            let q = CallEncoder::<96>::new(selector("isSubgroupAuthorizedActor(bytes32,address)"))
+                .push_bytes32(&SUBGROUP_DEVELOPERS)
+                .push_address(&actor);
+            assert_eq!(
+                mock::transact_as(manogaran_id, slx_charter, q.as_slice()).unwrap()[31],
+                1
+            );
+        }
+
+        // Remove `external_dev_id` revokes access immediately
+        let rm_dev = CallEncoder::<96>::new(selector("removeSubgroupMember(bytes32,address)"))
+            .push_bytes32(&SUBGROUP_DEVELOPERS)
+            .push_address(&external_dev_id);
+        assert!(mock::transact_as(sarah_id, slx_charter, rm_dev.as_slice()).is_ok());
+        let q_revoked =
+            CallEncoder::<96>::new(selector("isSubgroupAuthorizedActor(bytes32,address)"))
+                .push_bytes32(&SUBGROUP_DEVELOPERS)
+                .push_address(&external_dev_eoa);
+        assert_eq!(
+            mock::transact_as(manogaran_id, slx_charter, q_revoked.as_slice()).unwrap()[31],
+            0
         );
     }
 }

@@ -111,6 +111,11 @@ pub const HFS_TYPE_CONF_LEDGER: [u8; 32] = hfs_type_id(b"CONF_LEDGER");
 pub const HFS_TYPE_PRODUCT_LEDGER: [u8; 32] = hfs_type_id(b"PRODUCT_LEDGER");
 pub const HFS_TYPE_SHARE_CAPITAL: [u8; 32] = hfs_type_id(b"SHARE_CAPITAL");
 pub const HFS_TYPE_CROWDFUNDING: [u8; 32] = hfs_type_id(b"CROWDFUNDING");
+pub const HFS_TYPE_CORPORATE_SOCIAL_GROUP: [u8; 32] = hfs_type_id(b"CORPORATE_SOCIAL_GROUP");
+
+/// Canonical company-wide and developer subgroup slugs on `CorporateCharter`.
+pub const SUBGROUP_ALL_MEMBERS: [u8; 32] = keccak256(b"ALL_MEMBERS");
+pub const SUBGROUP_DEVELOPERS: [u8; 32] = keccak256(b"developers");
 
 /// Canonical governance & administrative Role IDs defined in `CorporateCharter`.
 pub const ROLE_SHAREHOLDER: [u8; 32] = keccak256(b"ROLE_SHAREHOLDER");
@@ -198,6 +203,12 @@ pub const ERR_STALE_CAPITAL_SNAPSHOT: i32 = -106;
 pub const ERR_FUTURES_BACKING_LOCKED: i32 = -107;
 pub const ERR_GOVERNANCE_DOWNGRADE: i32 = -108;
 pub const ERR_DEX_FORBIDDEN_ON_SHARES: i32 = -109;
+pub const ERR_RESERVED_ENTITY_NAME: i32 = -110;
+pub const ERR_SUBGROUP_NOT_FOUND: i32 = -111;
+pub const ERR_SUBGROUP_ALREADY_EXISTS: i32 = -112;
+pub const ERR_NOT_ACTIVE_DIRECTOR: i32 = -113;
+pub const ERR_NOT_SUBGROUP_MEMBER: i32 = -114;
+pub const ERR_MESSAGING_NOT_CONFIGURED: i32 = -115;
 pub const ERR_CHARTER_MISMATCH: i32 = -19;
 pub const ERR_CONSTITUTION_MISMATCH: i32 = ERR_CHARTER_MISMATCH;
 
@@ -1452,4 +1463,412 @@ pub fn query_charter_accounting_ledger(charter: &[u8; 20]) -> Option<[u8; 20]> {
         Some(addr)
     }
 }
+
+/// Query `HfsRegistry.sovereignCharter()` returning the cast-in-stone `Superlexicon Pte. Ltd.`
+/// `CorporateCharter` address (`None` if unset or zero).
+pub fn query_sovereign_charter(hfs_registry: &[u8; 20]) -> Option<[u8; 20]> {
+    if *hfs_registry == [0u8; 20] {
+        return None;
+    }
+    let cd = CallEncoder::<16>::new(const { selector("sovereignCharter()") });
+    let Ok(raw) = call::call_raw(hfs_registry, cd.as_slice()) else {
+        return None;
+    };
+    if raw.len() < 32 {
+        return None;
+    }
+    let mut addr = [0u8; 20];
+    addr.copy_from_slice(&raw[12..32]);
+    if addr == [0u8; 20] {
+        None
+    } else {
+        Some(addr)
+    }
+}
+
+/// Deterministic `Messaging` 32-byte `channelHash` for a `CorporateCharter` company-wide group
+/// (`subgroup_slug == [0u8; 32]` or `SUBGROUP_ALL_MEMBERS`) or a Director-created subgroup
+/// (e.g. `SUBGROUP_DEVELOPERS = keccak256("developers")`).
+pub fn company_group_channel_hash(charter: &[u8; 20], subgroup_slug: &[u8; 32]) -> [u8; 32] {
+    let canonical = if *subgroup_slug == [0u8; 32] {
+        SUBGROUP_ALL_MEMBERS
+    } else {
+        *subgroup_slug
+    };
+    let mut pre = [0u8; 17 + 20 + 32];
+    pre[0..17].copy_from_slice(b"SLX_CORP_GROUP_V1");
+    pre[17..37].copy_from_slice(charter);
+    pre[37..69].copy_from_slice(&canonical);
+    keccak256(&pre)
+}
+
+#[inline]
+fn fold_confusable_char(ch: char) -> Option<u8> {
+    // Fullwidth ASCII normalization
+    let c = if ('\u{FF01}'..='\u{FF5E}').contains(&ch) {
+        char::from_u32((ch as u32) - 0xFEE0).unwrap_or(ch)
+    } else {
+        ch
+    };
+    match c {
+        'a'..='z' => {
+            let b = c as u8;
+            if b == b'l' || b == b'i' {
+                Some(b'i')
+            } else {
+                Some(b)
+            }
+        }
+        'A'..='Z' => {
+            let b = (c as u8) + 32;
+            if b == b'l' || b == b'i' {
+                Some(b'i')
+            } else {
+                Some(b)
+            }
+        }
+        '0' => Some(b'o'),
+        '1' | '!' | '|' => Some(b'i'),
+        '2' => Some(b'z'),
+        '3' => Some(b'e'),
+        '4' | '@' => Some(b'a'),
+        '5' | '$' => Some(b's'),
+        '6' => Some(b'g'),
+        '7' => Some(b't'),
+        '8' => Some(b'b'),
+        '9' => Some(b'9'),
+        // Latin-1 common accented vowels & consonants
+        'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'À' | 'Á' | 'Â' | 'Ã' | 'Ä' | 'Å' => Some(b'a'),
+        'ç' | 'Ç' => Some(b'c'),
+        'è' | 'é' | 'ê' | 'ë' | 'È' | 'É' | 'Ê' | 'Ë' => Some(b'e'),
+        'ì' | 'í' | 'î' | 'ï' | 'Ì' | 'Í' | 'Î' | 'Ï' | 'ł' | 'Ł' => Some(b'i'),
+        'ñ' | 'Ñ' => Some(b'n'),
+        'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'Ò' | 'Ó' | 'Ô' | 'Õ' | 'Ö' | 'Ø' => Some(b'o'),
+        'ù' | 'ú' | 'û' | 'ü' | 'Ù' | 'Ú' | 'Û' | 'Ü' => Some(b'u'),
+        'ý' | 'ÿ' | 'Ý' => Some(b'y'),
+        // Cyrillic & Greek UTS #39 homoglyphs
+        'а' | 'А' | 'α' | 'Α' => Some(b'a'),
+        'в' | 'В' | 'β' | 'Β' => Some(b'b'),
+        'с' | 'С' | 'ς' => Some(b'c'),
+        'е' | 'Е' | 'ё' | 'Ё' | 'ε' | 'Ε' => Some(b'e'),
+        'і' | 'І' | 'ї' | 'Ї' | 'ӏ' | 'Ӏ' | 'ι' | 'Ι' => Some(b'i'),
+        'ј' | 'Ј' => Some(b'j'),
+        'к' | 'К' | 'κ' | 'Κ' => Some(b'k'),
+        'м' | 'М' | 'μ' | 'Μ' => Some(b'm'),
+        'н' | 'Н' | 'η' | 'Η' => Some(b'h'),
+        'ν' | 'Ν' => Some(b'v'),
+        'о' | 'О' | 'ο' | 'Ο' => Some(b'o'),
+        'р' | 'Р' | 'ρ' | 'Ρ' => Some(b'p'),
+        'ѕ' | 'Ѕ' | 'σ' | 'Σ' => Some(b's'),
+        'т' | 'Т' | 'τ' | 'Τ' => Some(b't'),
+        'у' | 'У' | 'υ' | 'Υ' => Some(b'u'),
+        'х' | 'Х' | 'χ' | 'Χ' => Some(b'x'),
+        _ => None,
+    }
+}
+
+fn is_corporate_noise_token(tok: &[u8]) -> bool {
+    matches!(
+        tok,
+        b"the"
+            | b"pte"
+            | b"itd" // "ltd" under {l,i}->i skeleton
+            | b"pteitd"
+            | b"imited" // "limited" collapsed
+            | b"inc"
+            | b"incorporated"
+            | b"corp"
+            | b"corporation"
+            | b"ic" // "llc" collapsed
+            | b"ip" // "llp" collapsed
+            | b"pic" // "plc"
+            | b"gmbh"
+            | b"ag"
+            | b"sa"
+            | b"co"
+            | b"company"
+            | b"hoidings"
+            | b"hoiding"
+            | b"group"
+            | b"iabs"
+            | b"iab"
+            | b"technoiogies"
+            | b"technoiogy"
+            | b"tech"
+            | b"systems"
+            | b"soiutions"
+            | b"ventures"
+            | b"foundation"
+            | b"dao"
+            | b"network"
+            | b"protocoi"
+            | b"officiai"
+            | b"singapore"
+            | b"sg"
+            | b"giobai"
+            | b"internationai"
+    )
+}
+
+fn slice_contains(hay: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return false;
+    }
+    let end = hay.len() - needle.len();
+    let mut i = 0;
+    while i <= end {
+        if &hay[i..i + needle.len()] == needle {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn bounded_edit_distance_le_2(a: &[u8], b: &[u8]) -> bool {
+    let m = a.len();
+    let n = b.len();
+    if m > 32 || n > 32 {
+        return false;
+    }
+    if m.abs_diff(n) > 2 {
+        return false;
+    }
+    let mut prev = [0u8; 33];
+    let mut curr = [0u8; 33];
+    let mut j = 0;
+    while j <= n {
+        prev[j] = j as u8;
+        j += 1;
+    }
+    let mut i = 1;
+    while i <= m {
+        curr[0] = i as u8;
+        let mut row_min = curr[0];
+        let mut k = 1;
+        while k <= n {
+            let cost = u8::from(a[i - 1] != b[k - 1]);
+            let del = prev[k].saturating_add(1);
+            let ins = curr[k - 1].saturating_add(1);
+            let sub = prev[k - 1].saturating_add(cost);
+            let v = del.min(ins).min(sub);
+            curr[k] = v;
+            if v < row_min {
+                row_min = v;
+            }
+            k += 1;
+        }
+        if row_min > 2 {
+            return false;
+        }
+        prev = curr;
+        i += 1;
+    }
+    prev[n] <= 2
+}
+
+fn skeleton_matches_superlexicon(skel: &[u8]) -> bool {
+    // Under `{1, l, i, !, |} -> 'i'`, `"superlexicon"` maps to `b"superiexicon"`.
+    const ROOT_MAIN: &[u8] = b"superiexicon";
+    const ROOT_SPR: &[u8] = b"spriexicon";
+    const ROOT_SUP: &[u8] = b"supiexicon";
+    const ROOT_SHORT: &[u8] = b"superiex";
+    const ROOT_CHAIN: &[u8] = b"iexiconbiockchain";
+
+    if skel.is_empty() {
+        return false;
+    }
+    if slice_contains(skel, ROOT_MAIN)
+        || slice_contains(skel, ROOT_SPR)
+        || slice_contains(skel, ROOT_SUP)
+        || slice_contains(skel, ROOT_SHORT)
+        || slice_contains(skel, ROOT_CHAIN)
+    {
+        return true;
+    }
+    if bounded_edit_distance_le_2(skel, ROOT_MAIN) {
+        return true;
+    }
+    // Sliding window edit-distance check so compound names like `"mysuperlexconapp"` are caught too
+    if skel.len() > ROOT_MAIN.len() {
+        for win_len in [11usize, 12usize, 13usize] {
+            if skel.len() >= win_len {
+                let end = skel.len() - win_len;
+                let mut i = 0;
+                while i <= end {
+                    if bounded_edit_distance_le_2(&skel[i..i + win_len], ROOT_MAIN) {
+                        return true;
+                    }
+                    i += 1;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Protocol-level anti-imposter check returning `true` if `raw_name` is `"Superlexicon"` or any
+/// confusable/homoglyph/typosquatted variant (`"SuperLexicon Pte Ltd"`, `"Super1exic0n"`,
+/// Cyrillic `"Ѕupеrlехісоn"`, `"Super-Lexcon Labs"`, `"Superlex Holdings"`, `"Lexicon Blockchain"`, etc.).
+pub fn is_confusable_superlexicon_name(raw_name: &[u8]) -> bool {
+    if raw_name.is_empty() {
+        return false;
+    }
+    let slice = if raw_name.len() > 256 {
+        &raw_name[..256]
+    } else {
+        raw_name
+    };
+
+    let mut full_skel = [0u8; 128];
+    let mut full_len = 0usize;
+    let mut core_skel = [0u8; 128];
+    let mut core_len = 0usize;
+
+    let mut cur_tok = [0u8; 64];
+    let mut tok_len = 0usize;
+
+    let flush_token = |tok: &[u8],
+                       full_skel: &mut [u8; 128],
+                       full_len: &mut usize,
+                       core_skel: &mut [u8; 128],
+                       core_len: &mut usize| {
+        if tok.is_empty() {
+            return;
+        }
+        let mut i = 0;
+        while i < tok.len() && *full_len < 128 {
+            let b = tok[i];
+            if *full_len == 0 || full_skel[*full_len - 1] != b {
+                full_skel[*full_len] = b;
+                *full_len += 1;
+            }
+            i += 1;
+        }
+        if !is_corporate_noise_token(tok) {
+            let mut j = 0;
+            while j < tok.len() && *core_len < 128 {
+                let b = tok[j];
+                if *core_len == 0 || core_skel[*core_len - 1] != b {
+                    core_skel[*core_len] = b;
+                    *core_len += 1;
+                }
+                j += 1;
+            }
+        }
+    };
+
+    if let Ok(s) = core::str::from_utf8(slice) {
+        for ch in s.chars() {
+            if let Some(folded) = fold_confusable_char(ch) {
+                if tok_len < 64 && (tok_len == 0 || cur_tok[tok_len - 1] != folded) {
+                    cur_tok[tok_len] = folded;
+                    tok_len += 1;
+                }
+            } else if ch.is_whitespace()
+                || matches!(
+                    ch,
+                    '.' | ',' | '-' | '_' | '(' | ')' | '[' | ']' | '{' | '}' | '/' | '\\' | '&'
+                        | '+' | ':' | ';' | '\'' | '"' | '•' | '·'
+                )
+            {
+                flush_token(
+                    &cur_tok[..tok_len],
+                    &mut full_skel,
+                    &mut full_len,
+                    &mut core_skel,
+                    &mut core_len,
+                );
+                tok_len = 0;
+            }
+        }
+    } else {
+        let mut idx = 0;
+        while idx < slice.len() {
+            let ch = slice[idx] as char;
+            if let Some(folded) = fold_confusable_char(ch) {
+                if tok_len < 64 && (tok_len == 0 || cur_tok[tok_len - 1] != folded) {
+                    cur_tok[tok_len] = folded;
+                    tok_len += 1;
+                }
+            } else {
+                flush_token(
+                    &cur_tok[..tok_len],
+                    &mut full_skel,
+                    &mut full_len,
+                    &mut core_skel,
+                    &mut core_len,
+                );
+                tok_len = 0;
+            }
+            idx += 1;
+        }
+    }
+    flush_token(
+        &cur_tok[..tok_len],
+        &mut full_skel,
+        &mut full_len,
+        &mut core_skel,
+        &mut core_len,
+    );
+
+    skeleton_matches_superlexicon(&core_skel[..core_len])
+        || skeleton_matches_superlexicon(&full_skel[..full_len])
+}
+
+#[cfg(test)]
+mod confusable_tests {
+    use super::*;
+
+    #[test]
+    fn blocks_superlexicon_and_all_imposter_variants() {
+        let blocked = [
+            "Superlexicon Pte. Ltd.",
+            "SuperLexicon",
+            "SUPERLEXICON PTE LTD",
+            "The Super-Lexicon Labs Inc.",
+            "Super1exic0n Pte. Ltd.",
+            "Super!ex|c0n Official",
+            "5uper1ex1c0n DAO",
+            "Suuuperlexicooon Holdings",
+            "Ѕupеrlехісоn Pte. Ltd.", // Cyrillic homoglyphs (Ѕ, е, і, с, о)
+            "Συperlexicοn",           // Greek homoglyphs
+            "Ｓｕｐｅｒｌｅｘｉｃｏｎ", // Fullwidth Unicode
+            "Superlexcon Technologies", // Typosquat (-i)
+            "Suparlexicon SG",          // Typosquat (e->a)
+            "Sperlexicon Corp",         // Typosquat (-u)
+            "Superlexican Pte Ltd",     // Typosquat (o->a)
+            "Superlex Holdings Pte. Ltd.",
+            "Lexicon Blockchain Foundation",
+            "MySuperLexiconApp",
+        ];
+        for name in blocked {
+            assert!(
+                is_confusable_superlexicon_name(name.as_bytes()),
+                "Expected imposter name to be blocked: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn allows_legitimate_non_imposter_company_names() {
+        let allowed = [
+            "Nvidya Systems Pte. Ltd. [SIM-BOT]",
+            "Bostun Dynamix Pte. Ltd. [SIM-BOT]",
+            "Acme Robotics Pte. Ltd.",
+            "Supersonic Aviation Pte. Ltd.",
+            "Supernova BioLabs Inc.",
+            "Lexington Maritime Holdings Ltd.",
+            "Apex Semiconductor Singapore Pte. Ltd.",
+            "Merlion Quantum Dynamics Pte. Ltd.",
+        ];
+        for name in allowed {
+            assert!(
+                !is_confusable_superlexicon_name(name.as_bytes()),
+                "Expected legitimate entity name to be allowed: {name}"
+            );
+        }
+    }
+}
+
 
