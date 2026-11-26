@@ -30,6 +30,7 @@ members = [
     "examples/subnet-registry",
     "examples/reward-voucher",
     "examples/crowdfunding",
+    "examples/app-store",
 ]
 
 [workspace.package]

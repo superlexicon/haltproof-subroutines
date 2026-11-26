@@ -1,0 +1,13 @@
+[package]
+name = "app-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "On-Chain HFS App Store & Content-Addressed UI Bundle Registry (HPS #27) — stores keccak256-verified gzipped HTML/CSS/JS UI bundles alongside Haltproof Subroutines for zero-redeploy app publishing and discovery"
+
+[[bin]]
+name = "app_store"
+path = "src/main.rs"
+
+[dependencies]
+hps-sdk = { path = "../../crates/hps-sdk" }
