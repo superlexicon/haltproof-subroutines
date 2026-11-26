@@ -78,6 +78,7 @@ pub const ACTION_ROTATE_AUDIT_KEY: [u8; 32] = keccak256(b"ROTATE_AUDIT_KEY");
 pub const ACTION_GRANT_AUDITOR_KEY: [u8; 32] = keccak256(b"GRANT_AUDITOR_KEY");
 pub const ACTION_CONFIDENTIAL_BATCH: [u8; 32] = keccak256(b"CONFIDENTIAL_BATCH");
 pub const ACTION_CONFIDENTIAL_RECEIVABLE: [u8; 32] = keccak256(b"CONFIDENTIAL_RECEIVABLE");
+pub const ACTION_LAUNCH_CROWDFUNDING: [u8; 32] = keccak256(b"LAUNCH_CROWDFUNDING");
 
 pub const DOC_TAG_SUBSCRIPTION_AGREEMENT: [u8; 32] = keccak256(b"SHARE_SUBSCRIPTION_AGREEMENT");
 pub const DOC_TAG_SHAREHOLDERS_AGREEMENT: [u8; 32] = keccak256(b"SHAREHOLDERS_AGREEMENT");
@@ -90,6 +91,7 @@ pub const CAP_EQUITY_SETTLEMENT: [u8; 32] = keccak256(b"CAP_EQUITY_SETTLEMENT");
 pub const CAP_MERCHANT_PAYMENT: [u8; 32] = keccak256(b"CAP_MERCHANT_PAYMENT");
 pub const CAP_IFRS_RECORDER: [u8; 32] = keccak256(b"CAP_IFRS_RECORDER");
 pub const CAP_CONFIDENTIAL_LEDGER: [u8; 32] = keccak256(b"CAP_CONFIDENTIAL_LEDGER");
+pub const CAP_CROWDFUNDING_CAMPAIGN: [u8; 32] = keccak256(b"CAP_CROWDFUNDING_CAMPAIGN");
 
 /// Encode a logical `HfsRegistry` `typeName` as a right-padded 32-byte UTF-8 word (matching JS `encodeHfsTypeId`).
 pub const fn hfs_type_id(name: &[u8]) -> [u8; 32] {
@@ -108,6 +110,7 @@ pub const HFS_TYPE_IFRS_LEDGER: [u8; 32] = hfs_type_id(b"IFRS_LEDGER");
 pub const HFS_TYPE_CONF_LEDGER: [u8; 32] = hfs_type_id(b"CONF_LEDGER");
 pub const HFS_TYPE_PRODUCT_LEDGER: [u8; 32] = hfs_type_id(b"PRODUCT_LEDGER");
 pub const HFS_TYPE_SHARE_CAPITAL: [u8; 32] = hfs_type_id(b"SHARE_CAPITAL");
+pub const HFS_TYPE_CROWDFUNDING: [u8; 32] = hfs_type_id(b"CROWDFUNDING");
 
 /// Canonical governance & administrative Role IDs defined in `CorporateCharter`.
 pub const ROLE_SHAREHOLDER: [u8; 32] = keccak256(b"ROLE_SHAREHOLDER");

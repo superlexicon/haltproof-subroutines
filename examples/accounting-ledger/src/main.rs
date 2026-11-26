@@ -36,6 +36,7 @@ use hps_sdk::governance::{
     ERR_MISSING_ROLE, ERR_UNAUTHORIZED_MODULE, HFS_TYPE_PRODUCT_LEDGER, HFS_TYPE_SHARE_CAPITAL,
     POLICY_ACCOUNTING_OPS, POLICY_BOARD_RESOLUTION, ROLE_CHIEF_ACCOUNTANT, ROLE_PRODUCT_MANAGER,
     ROLE_TREASURY_MANAGER, ACTION_CONFIDENTIAL_BATCH, CAP_CONFIDENTIAL_LEDGER, HFS_TYPE_CONF_LEDGER,
+    ACTION_LAUNCH_CROWDFUNDING, HFS_TYPE_CROWDFUNDING,
 };
 use hps_sdk::ifrs::{
     self, AccrualProjection, BalancedBatch, CashFlowClass, Side, ACC_ALLOWANCE_ECL, ACC_CASH,
@@ -242,6 +243,14 @@ hps_entry! {
     "bookConfidentialRollupFromModule(uint64,uint64,bool)"                              => handle_book_conf_rollup_from_module,
     "fundShieldedBatchFromModule(bytes32,uint64,bytes32,bytes,bytes)"                   => handle_fund_shielded_batch_from_module,
     "isVerifiedShieldedBatch(bytes32,address,uint64,bytes32)"                           => handle_is_verified_shielded_batch,
+    // Board-Resolution-Activated Pre-Order Crowdfunding (`HFS_TYPE_CROWDFUNDING`) Hooks
+    "activateCrowdfundingCampaign(address,address)"                                     => handle_activate_crowdfunding_campaign,
+    "hashActivateCrowdfundingCampaign(address,bytes32)"                                 => handle_hash_activate_crowdfunding_campaign,
+    "bookCrowdfundingProceedsFromCampaign(bytes32,uint64,uint64)"                       => handle_book_crowdfunding_proceeds,
+    "bookCrowdfundingBudgetDisbursement(address,uint64,uint64,bytes32)"                 => handle_book_crowdfunding_budget_disbursement,
+    "crowdfundingCampaignCount()"                                                       => handle_crowdfunding_campaign_count,
+    "getCrowdfundingCampaign(uint64)"                                                   => handle_get_crowdfunding_campaign,
+    "isRatifiedCrowdfundingCampaign(address)"                                           => handle_is_ratified_crowdfunding_campaign,
 }
 
 // ============================================================================
@@ -3652,6 +3661,248 @@ fn handle_is_verified_shielded_batch(args: &CalldataReader) -> Result<(), i32> {
         false
     };
     ret::write_bool(ok);
+    Ok(())
+}
+
+// ============================================================================
+// Board-Resolution-Activated Pre-Order Crowdfunding (`HFS_TYPE_CROWDFUNDING`)
+// ============================================================================
+
+const KEY_CF_COUNT: &[u8] = b"ifrs:cf_cnt";
+const SEL_ACTIVATE_CF: [u8; 4] = selector("activateCrowdfundingCampaign(address,address)");
+const EV_CF_ACTIVATED: [u8; 32] =
+    event_topic("CrowdfundingCampaignRatified(uint64,address,address,bytes32)");
+
+fn cf_ratified_key(cf_addr: &[u8; 20]) -> KeyBuilder<48> {
+    KeyBuilder::<48>::new().push(b"ifrs:cf_ok:").push(cf_addr)
+}
+
+fn cf_row_key(idx: u64) -> KeyBuilder<24> {
+    KeyBuilder::<24>::new().push(b"ifrs:cf_row:").push_u64_be(idx)
+}
+
+fn compute_activate_crowdfunding_hash(cf_hps: &[u8; 20], spec_hash: &[u8; 32]) -> [u8; 32] {
+    ActionHasher::<160>::new(&context::self_address(), &ACTION_LAUNCH_CROWDFUNDING)
+        .push_address(cf_hps)
+        .push_bytes32(spec_hash)
+        .finish()
+}
+
+fn handle_hash_activate_crowdfunding_campaign(args: &CalldataReader) -> Result<(), i32> {
+    let cf_hps = args.address(0).ok_or(-3)?;
+    let spec_hash = args.bytes32(1).ok_or(-3)?;
+    ret::write_word(&compute_activate_crowdfunding_hash(&cf_hps, &spec_hash));
+    Ok(())
+}
+
+/// Consumes a passed `CorporateCharter` `BOARD_RESOLUTION` (`auth_obj`), registers `cf_hps` in
+/// `AccountingLedger`, and invokes `cf_hps.onBoardResolutionActivated(auth_obj, caller)` to
+/// transition the pre-order crowdfunding HFS into `STATE_LIVE (2)`.
+fn handle_activate_crowdfunding_campaign(args: &CalldataReader) -> Result<(), i32> {
+    let cf_hps = args.address(0).ok_or(-3)?;
+    let auth_obj = args.address(1).ok_or(-3)?;
+    if cf_hps == [0u8; 20] {
+        return Err(-3);
+    }
+
+    let acc_cd = CallEncoder::<16>::new(const { selector("accountingLedger()") });
+    let raw_acc = call::call_raw(&cf_hps, acc_cd.as_slice()).map_err(|_| ERR_CHARTER_MISMATCH)?;
+    if raw_acc.len() < 32 || raw_acc[12..32] != context::self_address() {
+        return Err(ERR_CHARTER_MISMATCH);
+    }
+
+    let spec_cd = CallEncoder::<16>::new(const { selector("specHash()") });
+    let raw_spec = call::call_raw(&cf_hps, spec_cd.as_slice()).map_err(|_| ERR_INVALID_PRODUCT_PARAMS)?;
+    if raw_spec.len() < 32 {
+        return Err(ERR_INVALID_PRODUCT_PARAMS);
+    }
+    let mut spec_hash = [0u8; 32];
+    spec_hash.copy_from_slice(&raw_spec[..32]);
+
+    let ah = compute_activate_crowdfunding_hash(&cf_hps, &spec_hash);
+    let (_registry, _charter, caller) = require_board_level_auth(&SEL_ACTIVATE_CF, &ah, &auth_obj)?;
+
+    let hfs_reg = storage::get_address(KEY_HFS_REGISTRY).unwrap_or([0u8; 20]);
+    if hfs_reg != [0u8; 20] {
+        require_approved_hfs_code_hash(&hfs_reg, &HFS_TYPE_CROWDFUNDING, &cf_hps)?;
+    }
+
+    let cf_id = storage::get_u64(KEY_CF_COUNT);
+    storage::set_u64(cf_ratified_key(&cf_hps).as_slice(), 1);
+    let mut rec = [0u8; 80];
+    rec[0..20].copy_from_slice(&cf_hps);
+    rec[20..40].copy_from_slice(&auth_obj);
+    rec[40..72].copy_from_slice(&spec_hash);
+    put_u64(&mut rec, 72, context::block_number());
+    storage::set(cf_row_key(cf_id).as_slice(), &rec);
+    storage::set_u64(KEY_CF_COUNT, cf_id + 1);
+
+    let act_cd = CallEncoder::<96>::new(const {
+        selector("onBoardResolutionActivated(address,address)")
+    })
+    .push_address(&auth_obj)
+    .push_address(&caller);
+    let ok = call::call_bool(&cf_hps, act_cd.as_slice())?;
+    if !ok {
+        return Err(ERR_AUTH_CONSUME_FAILED);
+    }
+
+    events::emit(
+        &[
+            EV_CF_ACTIVATED,
+            u64_topic(cf_id),
+            addr_topic(&cf_hps),
+            addr_topic(&auth_obj),
+        ],
+        &spec_hash,
+    );
+    ret::write_u64_word(cf_id);
+    Ok(())
+}
+
+/// Invoked by a Board-activated `Crowdfunding` HFS upon `finalizeCampaign` success after sweeping
+/// escrowed cash into `treasuryIdentity`: books `Dr 1010 Cash / Cr 2300 Contract Liabilities` (IFRS 15).
+fn handle_book_crowdfunding_proceeds(args: &CalldataReader) -> Result<(), i32> {
+    let (_registry, _charter) = ensure_active()?;
+    let caller = context::msg_sender();
+    if storage::get_u64(cf_ratified_key(&caller).as_slice()) != 1 {
+        return Err(ERR_UNAUTHORIZED_MODULE);
+    }
+    let plan_code = args.bytes32(0).ok_or(-3)?;
+    let duration_blocks = args.u64(1).ok_or(-3)?;
+    let total_amount = args.u64(2).ok_or(-3)?;
+
+    let def_id = storage::get_u64(KEY_DEF_COUNT);
+    if def_id >= MAX_DEFERRED_CONTRACTS {
+        return Err(ERR_IFRS_SUBLEDGER_FULL);
+    }
+    let mut totals = load_coa_totals();
+    require_inbound_bank_cash(&totals, total_amount)?;
+    let batch = ifrs::derive_deferred_contract_receipt(total_amount, duration_blocks)?;
+
+    let mut plan_tag = [0u8; 8];
+    plan_tag.copy_from_slice(&plan_code[0..8]);
+    save_def(
+        def_id,
+        &DeferredContractRow {
+            customer: caller,
+            is_related: false,
+            plan_tag,
+            total_amount,
+            posted_earned: 0,
+            start_block: context::block_number(),
+            duration_blocks,
+        },
+    );
+    storage::set_u64(KEY_DEF_COUNT, def_id + 1);
+    let j_id = commit_batch(&mut totals, &batch, &caller, b"CFND")?;
+    ret::write_u64_word(j_id);
+    Ok(())
+}
+
+/// Invoked by a Board-activated `Crowdfunding` HFS when disbursing an unlocked stretch-goal
+/// growth budget line item: transfers cash from `treasuryIdentity` to `vendor` and posts the
+/// codified IAS/IFRS journal entry (`1200 Inventory`, `1500 PPE`, or `6400 R&D / S&M / G&A OpEx`).
+fn handle_book_crowdfunding_budget_disbursement(args: &CalldataReader) -> Result<(), i32> {
+    let (registry, charter) = ensure_active()?;
+    let caller = context::msg_sender();
+    if storage::get_u64(cf_ratified_key(&caller).as_slice()) != 1 {
+        return Err(ERR_UNAUTHORIZED_MODULE);
+    }
+    let vendor = args.address(0).ok_or(-3)?;
+    let ifrs_category = args.u64(1).ok_or(-3)?;
+    let amount = args.u64(2).ok_or(-3)?;
+    let ref_hash = args.bytes32(3).ok_or(-3)?;
+
+    let mut totals = load_coa_totals();
+    disburse_treasury_cash(&registry, &totals, &vendor, amount)?;
+    if detect_related_party(&charter, &vendor) {
+        record_related_party_disclosure(false, amount);
+    }
+
+    let (batch, memo): (BalancedBatch, [u8; 4]) = match ifrs_category {
+        1 => {
+            let mut inv = load_inv_sku(&ref_hash).unwrap_or(InvSkuState {
+                units_on_hand: 0,
+                carrying_cost: 0,
+                total_units_sold: 0,
+            });
+            inv.units_on_hand = inv.units_on_hand.saturating_add(1);
+            inv.carrying_cost = inv
+                .carrying_cost
+                .checked_add(amount)
+                .ok_or(ERR_IFRS_ZERO_OR_OVERFLOW)?;
+            save_inv_sku(&ref_hash, &inv)?;
+            (ifrs::derive_inventory_purchase(1, amount, true)?, *b"CMOQ")
+        }
+        3 if amount >= ifrs::CAPEX_MIN_COST_UNITS => {
+            let ast_id = storage::get_u64(KEY_ASSET_COUNT);
+            if ast_id >= MAX_FIXED_ASSETS {
+                return Err(ERR_IFRS_SUBLEDGER_FULL);
+            }
+            let b = ifrs::derive_capex_acquisition(
+                ifrs::ASSET_CLASS_MACHINERY,
+                amount,
+                0,
+                10_000,
+                true,
+            )?;
+            save_asset(
+                ast_id,
+                &CapitalAssetRow {
+                    asset_class: ifrs::ASSET_CLASS_MACHINERY,
+                    disposed: false,
+                    cost: amount,
+                    residual: 0,
+                    useful_life_blocks: 10_000,
+                    acquired_block: context::block_number(),
+                    posted_depr: 0,
+                },
+            );
+            storage::set_u64(KEY_ASSET_COUNT, ast_id + 1);
+            (b, *b"CCPX")
+        }
+        2 => {
+            storage::set_u64(KEY_OPEX_RND, storage::get_u64(KEY_OPEX_RND).saturating_add(amount));
+            emit_aux_counters();
+            (ifrs::derive_operating_expense(OPEX_RND, amount, true)?, *b"CRND")
+        }
+        4 => {
+            storage::set_u64(KEY_OPEX_GA, storage::get_u64(KEY_OPEX_GA).saturating_add(amount));
+            emit_aux_counters();
+            (ifrs::derive_operating_expense(OPEX_GENERAL_ADMIN, amount, true)?, *b"CCRT")
+        }
+        5 | 3 => {
+            storage::set_u64(KEY_OPEX_SM, storage::get_u64(KEY_OPEX_SM).saturating_add(amount));
+            emit_aux_counters();
+            (ifrs::derive_operating_expense(OPEX_SALES_MARKETING, amount, true)?, *b"CGRW")
+        }
+        _ => return Err(ERR_INVALID_PRODUCT_PARAMS),
+    };
+
+    let j_id = commit_batch(&mut totals, &batch, &vendor, &memo)?;
+    ret::write_u64_word(j_id);
+    Ok(())
+}
+
+fn handle_crowdfunding_campaign_count(_args: &CalldataReader) -> Result<(), i32> {
+    ret::write_u64_word(storage::get_u64(KEY_CF_COUNT));
+    Ok(())
+}
+
+fn handle_get_crowdfunding_campaign(args: &CalldataReader) -> Result<(), i32> {
+    let idx = args.u64(0).ok_or(-3)?;
+    let mut rec = [0u8; 80];
+    if storage::get_into(cf_row_key(idx).as_slice(), &mut rec) != Some(80) {
+        return Err(ERR_IFRS_SUBLEDGER_NOT_FOUND);
+    }
+    ret::write(&rec);
+    Ok(())
+}
+
+fn handle_is_ratified_crowdfunding_campaign(args: &CalldataReader) -> Result<(), i32> {
+    let cf_hps = args.address(0).ok_or(-3)?;
+    ret::write_bool(storage::get_u64(cf_ratified_key(&cf_hps).as_slice()) == 1);
     Ok(())
 }
 
