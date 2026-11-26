@@ -111,6 +111,7 @@ pub const ERR_ESCROW_SHORTFALL: i32 = -35;
 pub const ERR_BUDGET_TIER_LOCKED: i32 = -40;
 pub const ERR_BUDGET_LINE_EXCEEDED: i32 = -41;
 pub const ERR_INSUFFICIENT_REALIZED_CASH: i32 = -42;
+pub const ERR_ALREADY_CHARGED_NO_USER_CANCEL: i32 = -43;
 pub const ERR_SUBCALL_FAILED: i32 = -50;
 
 const ROLE_CEO: [u8; 32] = keccak256(b"ROLE_CEO");
@@ -201,7 +202,10 @@ hps_entry! {
     "state()"                                                                                             => handle_state,
     "pledgeOnChain(uint64,uint64,bytes32)"                                                                => handle_pledge_onchain,
     "recordOraclePreorderHold(bytes32,uint64,uint64,bytes32)"                                             => handle_record_oracle_hold,
+    "recordOraclePreorderHoldForBacker(address,bytes32,uint64,uint64,bytes32)"                            => handle_record_oracle_hold_for_backer,
+    "cancelPreorderAuthorization(uint64)"                                                                 => handle_cancel_preorder_auth,
     "confirmOracleHoldCaptured(uint64)"                                                                   => handle_confirm_oracle_captured,
+    "grantDiscretionaryRefund(uint64)"                                                                    => handle_grant_discretionary_refund,
     "finalizeCampaign()"                                                                                  => handle_finalize_campaign,
     "claimFullRefund(uint64)"                                                                             => handle_claim_refund,
     "issueBackerVoucher(uint64)"                                                                          => handle_issue_backer_voucher,
@@ -792,6 +796,7 @@ fn evaluate_stretch_tier_unlocks(new_total_committed: u64) {
         if let Ok(mut wire) = load_tier(i) {
             let threshold = get_u64_be(&wire, 0);
             let alloc = get_u64_be(&wire, 8);
+            let spent = get_u64_be(&wire, 16);
             let is_unlocked = get_u64_be(&wire, 32) == 1;
             if !is_unlocked && new_total_committed >= threshold {
                 put_u64(&mut wire, 32, 1);
@@ -808,6 +813,12 @@ fn evaluate_stretch_tier_unlocks(new_total_committed: u64) {
                 put_u64(&mut ev, 8, alloc);
                 put_u64(&mut ev, 16, ifrs_cat);
                 events::emit(&[EV_BUDGET_UNLOCKED, u64_topic(i), code], &ev);
+            } else if is_unlocked && spent == 0 && new_total_committed < threshold {
+                put_u64(&mut wire, 32, 0);
+                put_u64(&mut wire, 40, 0);
+                save_tier(i, &wire);
+                unl_cnt = unl_cnt.saturating_sub(1);
+                tot_bunl = tot_bunl.saturating_sub(alloc);
             }
         }
         i += 1;
@@ -1011,6 +1022,148 @@ fn handle_record_oracle_hold(args: &CalldataReader) -> Result<(), i32> {
         storage::get_u64(KEY_TOT_PREAUTH_ORACLE).saturating_add(amount),
     );
     ret::write_u64_word(pledge_id);
+    Ok(())
+}
+
+/// Off-chain Airwallex credit-authorization hold bound explicitly to the buyer's `Identity` HFS (`backer`),
+/// enabling trustless buyer self-cancellation (`cancelPreorderAuthorization`) anytime prior to card capture!
+fn handle_record_oracle_hold_for_backer(args: &CalldataReader) -> Result<(), i32> {
+    let _ = require_oracle_or_officer()?;
+    let backer = args.address(0).ok_or(ERR_INVALID_PARAMS)?;
+    let ref_hash = args.bytes32(1).ok_or(ERR_INVALID_PARAMS)?;
+    let sku_idx = args.u64(2).ok_or(ERR_INVALID_PARAMS)?;
+    let qty = args.u64(3).ok_or(ERR_INVALID_PARAMS)?;
+    let commitment = args.bytes32(4).ok_or(ERR_INVALID_PARAMS)?;
+    if ref_hash == [0u8; 32] {
+        return Err(ERR_INVALID_PARAMS);
+    }
+    let rk = ref_used_key(&ref_hash);
+    if storage::get_u64(rk.as_slice()) == 1 {
+        return Err(ERR_DUPLICATE_PAYMENT_REF);
+    }
+
+    let (pledge_id, amount) = record_pledge_common(
+        backer,
+        sku_idx,
+        qty,
+        RAIL_ORACLE_PREAUTH_HOLD,
+        PLEDGE_PREAUTH_HOLD_ORACLE,
+        ref_hash,
+        commitment,
+    )?;
+    storage::set_u64(rk.as_slice(), 1);
+    storage::set_u64(
+        KEY_TOT_PREAUTH_ORACLE,
+        storage::get_u64(KEY_TOT_PREAUTH_ORACLE).saturating_add(amount),
+    );
+    ret::write_u64_word(pledge_id);
+    Ok(())
+}
+
+/// Cancels a credit-card authorization hold (`PLEDGE_PREAUTH_HOLD_ORACLE = 2`) **anytime prior to capture**.
+/// - Allowed for the recorded `backer` (`caller == backer`) OR `banking-oracle` / company officer.
+/// - Strictly REVERTS with `ERR_ALREADY_CHARGED_NO_USER_CANCEL = -43` once the card has been charged
+///   (`status == PLEDGE_FINALIZED_CAPTURED = 3`), enforcing that post-charge refunds are at the sole
+///   discretion of the company (`grantDiscretionaryRefund`).
+fn handle_cancel_preorder_auth(args: &CalldataReader) -> Result<(), i32> {
+    require_init()?;
+    let pledge_id = args.u64(0).ok_or(ERR_INVALID_PARAMS)?;
+    let mut p = load_pledge(pledge_id)?;
+    let status = p[57];
+    if status == PLEDGE_FINALIZED_CAPTURED {
+        return Err(ERR_ALREADY_CHARGED_NO_USER_CANCEL);
+    }
+    if status != PLEDGE_PREAUTH_HOLD_ORACLE {
+        return Err(ERR_PLEDGE_NOT_ELIGIBLE);
+    }
+
+    let mut backer = [0u8; 20];
+    backer.copy_from_slice(&p[8..28]);
+    let caller = context::msg_sender();
+    let is_backer_caller = backer != [0u8; 20] && caller == backer;
+    if !is_backer_caller {
+        let _ = require_oracle_or_officer()?;
+    }
+
+    let sku_idx = get_u64_be(&p, 32);
+    let qty = get_u64_be(&p, 40);
+    let amount = get_u64_be(&p, 48);
+
+    if let Ok(mut sku) = load_sku(sku_idx) {
+        let sold = get_u64_be(&sku, 32);
+        put_u64(&mut sku, 32, sold.saturating_sub(qty));
+        save_sku(sku_idx, &sku);
+    }
+
+    let new_committed = storage::get_u64(KEY_TOT_COMMITTED).saturating_sub(amount);
+    storage::set_u64(KEY_TOT_COMMITTED, new_committed);
+    storage::set_u64(
+        KEY_TOT_PREAUTH_ORACLE,
+        storage::get_u64(KEY_TOT_PREAUTH_ORACLE).saturating_sub(amount),
+    );
+    if get_state() == STATE_LIVE {
+        evaluate_stretch_tier_unlocks(new_committed);
+    }
+
+    p[57] = PLEDGE_REFUNDED_OR_VOIDED;
+    save_pledge(pledge_id, &p);
+    storage::set_u64(
+        KEY_TOT_REFUNDED,
+        storage::get_u64(KEY_TOT_REFUNDED).saturating_add(amount),
+    );
+    events::emit(
+        &[
+            EV_PLEDGE_REFUNDED,
+            u64_topic(pledge_id),
+            addr_topic(&backer),
+        ],
+        &amount.to_be_bytes(),
+    );
+    ret::write_u64_word(amount);
+    Ok(())
+}
+
+/// Post-capture case-by-case refund strictly at the sole discretion of the company
+/// (`require_oracle_or_officer()`). Backers cannot invoke this directly.
+fn handle_grant_discretionary_refund(args: &CalldataReader) -> Result<(), i32> {
+    require_init()?;
+    let _ = require_oracle_or_officer()?;
+    let pledge_id = args.u64(0).ok_or(ERR_INVALID_PARAMS)?;
+    let mut p = load_pledge(pledge_id)?;
+    if p[57] != PLEDGE_FINALIZED_CAPTURED {
+        return Err(ERR_PLEDGE_NOT_ELIGIBLE);
+    }
+    let mut backer = [0u8; 20];
+    backer.copy_from_slice(&p[8..28]);
+    let sku_idx = get_u64_be(&p, 32);
+    let qty = get_u64_be(&p, 40);
+    let amount = get_u64_be(&p, 48);
+
+    if let Ok(mut sku) = load_sku(sku_idx) {
+        let sold = get_u64_be(&sku, 32);
+        put_u64(&mut sku, 32, sold.saturating_sub(qty));
+        save_sku(sku_idx, &sku);
+    }
+
+    p[57] = PLEDGE_REFUNDED_OR_VOIDED;
+    save_pledge(pledge_id, &p);
+    storage::set_u64(
+        KEY_TOT_CAPTURED_ORACLE,
+        storage::get_u64(KEY_TOT_CAPTURED_ORACLE).saturating_sub(amount),
+    );
+    storage::set_u64(
+        KEY_TOT_REFUNDED,
+        storage::get_u64(KEY_TOT_REFUNDED).saturating_add(amount),
+    );
+    events::emit(
+        &[
+            EV_PLEDGE_REFUNDED,
+            u64_topic(pledge_id),
+            addr_topic(&backer),
+        ],
+        &amount.to_be_bytes(),
+    );
+    ret::write_u64_word(amount);
     Ok(())
 }
 
@@ -1920,5 +2073,88 @@ mod tests {
             tx(DIRECTOR_1, 92, disb_over.as_slice()),
             ERR_BUDGET_LINE_EXCEEDED
         );
+    }
+
+    #[test]
+    fn preorder_auth_allows_cancel_before_charge_blocks_user_after_charge_and_allows_company_discretion() {
+        mock::reset();
+        install_charter_and_accounting_mocks();
+
+        let sku = pack_sku(1, 198, 500, 2_000, b"Lexicon Dual-RF Dongle");
+        let init_cd = encode_propose_calldata(
+            MODE_SINGLE_ALL_OR_NOTHING,
+            500,
+            400,
+            b"Superlexicon Pre-Orders",
+            &sku,
+            &[],
+        );
+        assert_eq!(tx(DIRECTOR_1, 10, &init_cd), 0);
+        let bind_cd = CallEncoder::<64>::new(selector("bindBoardResolution(address)"))
+            .push_address(&BOARD_AUTH);
+        assert_eq!(tx(DIRECTOR_1, 10, bind_cd.as_slice()), 0);
+        let act_cd =
+            CallEncoder::<64>::new(selector("activateCampaign(address)")).push_address(&BOARD_AUTH);
+        assert_eq!(tx(DIRECTOR_1, 12, act_cd.as_slice()), 0);
+
+        // 1. Oracle records two Airwallex credit-authorization holds for BACKER_A:
+        //    - Pledge #1: 1 unit ($198) -> Backer cancels during credit authorization!
+        //    - Pledge #2: 3 units ($594 >= $500 target) -> Campaign succeeds & card is charged!
+        let rec1 = CallEncoder::<164>::new(selector(
+            "recordOraclePreorderHoldForBacker(address,bytes32,uint64,uint64,bytes32)",
+        ))
+        .push_address(&BACKER_A)
+        .push_bytes32(&[0xA1; 32])
+        .push_u64(0)
+        .push_u64(1)
+        .push_bytes32(&[0xB1; 32]);
+        assert_eq!(tx(ORACLE, 15, rec1.as_slice()), 0);
+
+        let rec2 = CallEncoder::<164>::new(selector(
+            "recordOraclePreorderHoldForBacker(address,bytes32,uint64,uint64,bytes32)",
+        ))
+        .push_address(&BACKER_A)
+        .push_bytes32(&[0xA2; 32])
+        .push_u64(0)
+        .push_u64(3)
+        .push_bytes32(&[0xB2; 32]);
+        assert_eq!(tx(ORACLE, 16, rec2.as_slice()), 0);
+
+        // Backer cancels Pledge #1 while in credit-authorization hold -> SUCCEEDS ($0 charged)!
+        let cancel1 =
+            CallEncoder::<40>::new(selector("cancelPreorderAuthorization(uint64)")).push_u64(1);
+        assert_eq!(tx(BACKER_A, 17, cancel1.as_slice()), 0);
+
+        let sum_mid = mock::transact_as(
+            DIRECTOR_1,
+            SELF_CF,
+            CallEncoder::<16>::new(selector("getCampaignSummary()")).as_slice(),
+        )
+        .unwrap();
+        assert_eq!(get_u64_be(&sum_mid, 48), 594); // totalCommitted reduced from 792 -> 594
+        assert_eq!(get_u64_be(&sum_mid, 64), 594); // totalPreauthOracle == 594
+
+        // 2. Minimum target ($500) met -> Finalize campaign & capture Pledge #2 card charge!
+        let fin_cd = CallEncoder::<16>::new(selector("finalizeCampaign()"));
+        assert_eq!(tx(DIRECTOR_1, 20, fin_cd.as_slice()), 0);
+        let cap2 =
+            CallEncoder::<40>::new(selector("confirmOracleHoldCaptured(uint64)")).push_u64(2);
+        assert_eq!(tx(ORACLE, 21, cap2.as_slice()), 0);
+
+        // 3. Backer attempts to cancel Pledge #2 AFTER card has been charged -> REVERTS (-43)!
+        let cancel2 =
+            CallEncoder::<40>::new(selector("cancelPreorderAuthorization(uint64)")).push_u64(2);
+        assert_eq!(
+            tx(BACKER_A, 22, cancel2.as_slice()),
+            ERR_ALREADY_CHARGED_NO_USER_CANCEL
+        );
+
+        // Backer also cannot call grantDiscretionaryRefund directly -> REVERTS (-12 ERR_UNAUTHORIZED)!
+        let disc2 =
+            CallEncoder::<40>::new(selector("grantDiscretionaryRefund(uint64)")).push_u64(2);
+        assert_eq!(tx(BACKER_A, 23, disc2.as_slice()), ERR_UNAUTHORIZED);
+
+        // 4. Company Officer / Oracle grants discretionary refund on Pledge #2 -> SUCCEEDS!
+        assert_eq!(tx(DIRECTOR_1, 24, disc2.as_slice()), 0);
     }
 }

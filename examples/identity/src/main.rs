@@ -52,6 +52,8 @@ const RECOVERY_CANCELLED: [u8; 32] =
     event_topic("RecoveryCancelled(uint64,address)");
 const RECOVERY_FINALIZED: [u8; 32] =
     event_topic("RecoveryFinalized(uint64,address,uint64)");
+const PROFILE_DETAILS_UPDATED: [u8; 32] =
+    event_topic("ProfileDetailsUpdated(address,bytes32)");
 
 /// Validity states for subroutines in this Identity's Associated HFS Register:
 /// - `0` (`UNLISTED`): Not recorded in this Identity's register.
@@ -80,7 +82,8 @@ pub const REC_STATUS_TIMELOCKED: u8 = 2;
 pub const REC_STATUS_FINALIZED: u8 = 3;
 pub const REC_STATUS_CANCELLED: u8 = 4;
 
-pub const IDENTITY_ABI_VERSION: u64 = 4;
+pub const IDENTITY_ABI_VERSION: u64 = 5;
+const MAX_PROFILE_FIELD_LEN: usize = 1024;
 const MAX_HFS_LABEL_LEN: usize = 64;
 const FIXED_HFS_REC_HDR: usize = 83; // [status:1][addr:20][type_id:32][blk:8][actor:20][lbl_len:2]
 const MAX_HFS_REC_BYTES: usize = FIXED_HFS_REC_HDR + MAX_HFS_LABEL_LEN;
@@ -102,6 +105,9 @@ const KEY_INIT: &[u8] = b"id:init";
 const KEY_OWNER: &[u8] = b"id:owner";
 const KEY_HANDLE: &[u8] = b"id:handle";
 const KEY_NICKNAME: &[u8] = b"id:nick";
+const KEY_FULL_NAME: &[u8] = b"id:fullname";
+const KEY_BILLING_ADDR: &[u8] = b"id:bill_addr";
+const KEY_SHIPPING_ADDR: &[u8] = b"id:ship_addr";
 const KEY_HFS_COUNT: &[u8] = b"id:hfs:cnt";
 const KEY_SECP_PUB64: &[u8] = b"id:enc:secp64";
 const KEY_ED_PUB32: &[u8] = b"id:enc:ed32";
@@ -116,8 +122,14 @@ hps_entry! {
     "initialize(address,string)"                                                      => handle_initialize,
     "initializeWithNickname(address,string,string)"                                   => handle_initialize_with_nickname,
     "initializeWithKeys(address,string,string,bytes,bytes32)"                         => handle_initialize_with_keys,
+    "initializeWithProfile(address,string,string,bytes,bytes32,string,string,string)" => handle_initialize_with_profile,
     "setEncryptionKeys(bytes,bytes32)"                                                => handle_set_encryption_keys,
     "setNickname(string)"                                                             => handle_set_nickname,
+    "setProfile(string,string,string,string)"                                         => handle_set_profile,
+    "setContactDetails(string,string,string)"                                         => handle_set_contact_details,
+    "setFullName(string)"                                                             => handle_set_full_name,
+    "setBillingAddress(string)"                                                       => handle_set_billing_address,
+    "setShippingAddress(string)"                                                      => handle_set_shipping_address,
     "setDelegate(address,bool)"                                                       => handle_set_delegate,
     "transferOwnership(address)"                                                      => handle_transfer_ownership,
     "transferOwnershipWithKeys(address,bytes,bytes32)"                                => handle_transfer_ownership_with_keys,
@@ -186,6 +198,9 @@ hps_entry! {
     "hasApprovedAuth(address)"                                                        => handle_has_approved_auth,
     "handle()"                                                                        => handle_handle,
     "nickname()"                                                                      => handle_nickname,
+    "fullName()"                                                                      => handle_full_name,
+    "billingAddress()"                                                                => handle_billing_address,
+    "shippingAddress()"                                                               => handle_shipping_address,
     "balanceIn(address)"                                                              => handle_balance_in,
     "encryptionKeys()"                                                                => handle_encryption_keys,
     "secp256k1PubKey()"                                                               => handle_secp256k1_pubkey,
@@ -647,6 +662,124 @@ fn handle_set_nickname(args: &CalldataReader) -> Result<(), i32> {
     storage::set(KEY_NICKNAME, nick_str);
     let owner = storage::get_address(KEY_OWNER).unwrap_or([0u8; 20]);
     events::emit(&[NICKNAME_UPDATED, addr_topic(&owner)], nick_str);
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn store_contact_fields_internal(
+    owner: &[u8; 20],
+    full_name: &[u8],
+    billing_addr: &[u8],
+    shipping_addr: &[u8],
+) -> Result<(), i32> {
+    if full_name.len() > MAX_PROFILE_FIELD_LEN
+        || billing_addr.len() > MAX_PROFILE_FIELD_LEN
+        || shipping_addr.len() > MAX_PROFILE_FIELD_LEN
+    {
+        return Err(-23);
+    }
+    storage::set(KEY_FULL_NAME, full_name);
+    storage::set(KEY_BILLING_ADDR, billing_addr);
+    storage::set(KEY_SHIPPING_ADDR, shipping_addr);
+    let mut digest_in = [0u8; 96];
+    digest_in[0..32].copy_from_slice(&hps_sdk::keccak::keccak256(full_name));
+    digest_in[32..64].copy_from_slice(&hps_sdk::keccak::keccak256(billing_addr));
+    digest_in[64..96].copy_from_slice(&hps_sdk::keccak::keccak256(shipping_addr));
+    let commit = hps_sdk::keccak::keccak256(&digest_in);
+    events::emit(&[PROFILE_DETAILS_UPDATED, addr_topic(owner), commit], &[]);
+    Ok(())
+}
+
+fn handle_initialize_with_profile(args: &CalldataReader) -> Result<(), i32> {
+    if storage::get_u64(KEY_INIT) == 1 {
+        return Err(-21);
+    }
+    let owner = args.address(0).ok_or(-3)?;
+    let handle_str = args.dynamic_bytes(1).ok_or(-3)?;
+    let nick_str = args.dynamic_bytes(2).ok_or(-3)?;
+    let secp_pub64 = args.dynamic_bytes(3).ok_or(-3)?;
+    let ed_pub32 = args.bytes32(4).ok_or(-3)?;
+    let full_name = args.dynamic_bytes(5).ok_or(-3)?;
+    let billing_addr = args.dynamic_bytes(6).ok_or(-3)?;
+    let shipping_addr = args.dynamic_bytes(7).ok_or(-3)?;
+    if owner == [0u8; 20]
+        || handle_str.is_empty()
+        || handle_str.len() > 64
+        || nick_str.is_empty()
+        || nick_str.len() > 32
+    {
+        return Err(-23);
+    }
+    store_validated_encryption_keys(&owner, secp_pub64, &ed_pub32)?;
+    storage::set_address(KEY_OWNER, &owner);
+    storage::set(KEY_HANDLE, handle_str);
+    storage::set(KEY_NICKNAME, nick_str);
+    store_contact_fields_internal(&owner, full_name, billing_addr, shipping_addr)?;
+    storage::set_u64(KEY_INIT, 1);
+    let _ = upsert_owner_device_internal(&owner, secp_pub64, b"Primary Device", &[]);
+
+    events::emit(&[IDENTITY_INITIALIZED, addr_topic(&owner)], handle_str);
+    events::emit(&[NICKNAME_UPDATED, addr_topic(&owner)], nick_str);
+    Ok(())
+}
+
+fn handle_set_profile(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let nick_str = args.dynamic_bytes(0).ok_or(-3)?;
+    let full_name = args.dynamic_bytes(1).ok_or(-3)?;
+    let billing_addr = args.dynamic_bytes(2).ok_or(-3)?;
+    let shipping_addr = args.dynamic_bytes(3).ok_or(-3)?;
+    if nick_str.is_empty() || nick_str.len() > 32 {
+        return Err(-23);
+    }
+    let owner = storage::get_address(KEY_OWNER).unwrap_or([0u8; 20]);
+    storage::set(KEY_NICKNAME, nick_str);
+    events::emit(&[NICKNAME_UPDATED, addr_topic(&owner)], nick_str);
+    store_contact_fields_internal(&owner, full_name, billing_addr, shipping_addr)?;
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_set_contact_details(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let full_name = args.dynamic_bytes(0).ok_or(-3)?;
+    let billing_addr = args.dynamic_bytes(1).ok_or(-3)?;
+    let shipping_addr = args.dynamic_bytes(2).ok_or(-3)?;
+    let owner = storage::get_address(KEY_OWNER).unwrap_or([0u8; 20]);
+    store_contact_fields_internal(&owner, full_name, billing_addr, shipping_addr)?;
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_set_full_name(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let full_name = args.dynamic_bytes(0).ok_or(-3)?;
+    if full_name.len() > MAX_PROFILE_FIELD_LEN {
+        return Err(-23);
+    }
+    storage::set(KEY_FULL_NAME, full_name);
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_set_billing_address(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let billing_addr = args.dynamic_bytes(0).ok_or(-3)?;
+    if billing_addr.len() > MAX_PROFILE_FIELD_LEN {
+        return Err(-23);
+    }
+    storage::set(KEY_BILLING_ADDR, billing_addr);
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_set_shipping_address(args: &CalldataReader) -> Result<(), i32> {
+    require_authorized()?;
+    let shipping_addr = args.dynamic_bytes(0).ok_or(-3)?;
+    if shipping_addr.len() > MAX_PROFILE_FIELD_LEN {
+        return Err(-23);
+    }
+    storage::set(KEY_SHIPPING_ADDR, shipping_addr);
     ret::write_bool(true);
     Ok(())
 }
@@ -1833,6 +1966,30 @@ fn handle_nickname(_args: &CalldataReader) -> Result<(), i32> {
         ret::write_abi_bytes(h);
     } else {
         ret::write_abi_bytes(&[]);
+    }
+    Ok(())
+}
+
+fn handle_full_name(_args: &CalldataReader) -> Result<(), i32> {
+    match storage::get_ref(KEY_FULL_NAME) {
+        Some(v) => ret::write_abi_bytes(v),
+        None => ret::write_abi_bytes(&[]),
+    }
+    Ok(())
+}
+
+fn handle_billing_address(_args: &CalldataReader) -> Result<(), i32> {
+    match storage::get_ref(KEY_BILLING_ADDR) {
+        Some(v) => ret::write_abi_bytes(v),
+        None => ret::write_abi_bytes(&[]),
+    }
+    Ok(())
+}
+
+fn handle_shipping_address(_args: &CalldataReader) -> Result<(), i32> {
+    match storage::get_ref(KEY_SHIPPING_ADDR) {
+        Some(v) => ret::write_abi_bytes(v),
+        None => ret::write_abi_bytes(&[]),
     }
     Ok(())
 }
@@ -4200,6 +4357,99 @@ mod tests {
                 &encode_exec(dummy_hps, &[0x11, 0x22, 0x33, 0x44])
             ),
             Err(-21)
+        );
+    }
+
+    #[test]
+    fn identity_profile_fullname_and_addresses_update_anytime() {
+        mock::reset();
+        let alice_eoa = [0x42u8; 20];
+        let alice_id = [0x99u8; 20];
+        mock::register_hps_with_code_hash(alice_id, [0xd1; 32], dispatch_calldata);
+        let secp64 = [0x44u8; 64];
+        let (_sk, ed32) =
+            hps_sdk::vrf::mock_crypto::derive_ed25519_keypair(&[0x12; 32], &alice_id);
+
+        let push_dyn = |dst: &mut Vec<u8>, bytes: &[u8]| {
+            let mut lw = [0u8; 32];
+            lw[24..32].copy_from_slice(&(bytes.len() as u64).to_be_bytes());
+            dst.extend_from_slice(&lw);
+            dst.extend_from_slice(bytes);
+            dst.resize(dst.len() + (32 - bytes.len() % 32) % 32, 0);
+        };
+
+        // 1. Deploy & initialize with optional Full Name + Billing + Shipping Addresses
+        let mut init_cd = Vec::new();
+        init_cd.extend_from_slice(&selector(
+            "initializeWithProfile(address,string,string,bytes,bytes32,string,string,string)",
+        ));
+        let mut head = Vec::new();
+        let mut tail = Vec::new();
+        let head_len = 8 * 32u64;
+
+        let mut w_addr = [0u8; 32];
+        w_addr[12..32].copy_from_slice(&alice_eoa);
+        head.extend_from_slice(&w_addr);
+
+        for dyn_arg in [b"mano.4242".as_slice(), b"Mano".as_slice(), &secp64[..]] {
+            let mut off = [0u8; 32];
+            off[24..32].copy_from_slice(&(head_len + tail.len() as u64).to_be_bytes());
+            head.extend_from_slice(&off);
+            push_dyn(&mut tail, dyn_arg);
+        }
+        head.extend_from_slice(&ed32);
+        for dyn_arg in [
+            b"enc1:Mano FullName".as_slice(),
+            b"enc1:10 Marina Blvd, Singapore 018983".as_slice(),
+            b"enc1:80 Changi Rd, Singapore 419715".as_slice(),
+        ] {
+            let mut off = [0u8; 32];
+            off[24..32].copy_from_slice(&(head_len + tail.len() as u64).to_be_bytes());
+            head.extend_from_slice(&off);
+            push_dyn(&mut tail, dyn_arg);
+        }
+        init_cd.extend_from_slice(&head);
+        init_cd.extend_from_slice(&tail);
+
+        mock::transact_as(alice_eoa, alice_id, &init_cd).unwrap();
+
+        let ver = mock::transact_as(alice_eoa, alice_id, &selector("identityVersion()")).unwrap();
+        assert_eq!(u64::from_be_bytes(ver[24..32].try_into().unwrap()), 5);
+
+        let fn_out = mock::transact_as(alice_eoa, alice_id, &selector("fullName()")).unwrap();
+        let fn_len = u64::from_be_bytes(fn_out[56..64].try_into().unwrap()) as usize;
+        assert_eq!(&fn_out[64..64 + fn_len], b"enc1:Mano FullName");
+
+        // 2. Update Nickname, Full Name, Billing & Shipping Addresses anytime via `setProfile`
+        let mut upd_cd = Vec::new();
+        upd_cd.extend_from_slice(&selector("setProfile(string,string,string,string)"));
+        let mut u_head = Vec::new();
+        let mut u_tail = Vec::new();
+        for dyn_arg in [
+            b"AdmiralMano".as_slice(),
+            b"enc1:Mano Updated Card Name".as_slice(),
+            b"enc1:1 Raffles Place, Singapore 048616".as_slice(),
+            b"enc1:1 Raffles Place, Singapore 048616".as_slice(),
+        ] {
+            let mut off = [0u8; 32];
+            off[24..32].copy_from_slice(&(4 * 32 + u_tail.len() as u64).to_be_bytes());
+            u_head.extend_from_slice(&off);
+            push_dyn(&mut u_tail, dyn_arg);
+        }
+        upd_cd.extend_from_slice(&u_head);
+        upd_cd.extend_from_slice(&u_tail);
+        mock::transact_as(alice_eoa, alice_id, &upd_cd).unwrap();
+
+        let nick_out = mock::transact_as(alice_eoa, alice_id, &selector("nickname()")).unwrap();
+        let nick_len = u64::from_be_bytes(nick_out[56..64].try_into().unwrap()) as usize;
+        assert_eq!(&nick_out[64..64 + nick_len], b"AdmiralMano");
+
+        let ship_out =
+            mock::transact_as(alice_eoa, alice_id, &selector("shippingAddress()")).unwrap();
+        let ship_len = u64::from_be_bytes(ship_out[56..64].try_into().unwrap()) as usize;
+        assert_eq!(
+            &ship_out[64..64 + ship_len],
+            b"enc1:1 Raffles Place, Singapore 048616"
         );
     }
 }
