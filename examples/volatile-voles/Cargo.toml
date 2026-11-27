@@ -1,0 +1,13 @@
+[package]
+name = "volatile-voles"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Volatile Voles: Chaotic Burrow Sabotage & Squeak-No! Counter-Stack — Haltproof Subroutine (HPS #22)"
+
+[[bin]]
+name = "volatile-voles"
+path = "src/main.rs"
+
+[dependencies]
+hps-sdk = { path = "../../crates/hps-sdk" }
