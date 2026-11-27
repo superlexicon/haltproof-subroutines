@@ -1,0 +1,13 @@
+[package]
+name = "webrtc-signal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Serverless WebRTC Voice, Video & Mesh Conference Signaling Registry (HPS #28) — Identity-authenticated DTLS-SRTP fingerprint pinning, secp256k1 ECDH SDP/ICE envelopes, and real-time event-driven call setup with zero cloud signaling servers"
+
+[[bin]]
+name = "webrtc_signal"
+path = "src/main.rs"
+
+[dependencies]
+hps-sdk = { path = "../../crates/hps-sdk" }

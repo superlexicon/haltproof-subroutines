@@ -31,6 +31,7 @@ members = [
     "examples/reward-voucher",
     "examples/crowdfunding",
     "examples/app-store",
+    "examples/webrtc-signal",
 ]
 
 [workspace.package]
