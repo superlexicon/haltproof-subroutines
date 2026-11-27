@@ -31,7 +31,7 @@ use hps_sdk::call::{self, CallEncoder};
 use hps_sdk::storage::KeyBuilder;
 use hps_sdk::{context, event_topic, events, hps_entry, ret, selector, storage};
 
-pub const WEBRTC_SIGNAL_ABI_VERSION: u64 = 1;
+pub const WEBRTC_SIGNAL_ABI_VERSION: u64 = 2;
 
 pub const AVAIL_OFFLINE: u8 = 0;
 pub const AVAIL_ONLINE: u8 = 1;
@@ -55,6 +55,44 @@ pub const RENEG_ANSWERED: u8 = 3;
 
 pub const ROOM_STATUS_OPEN: u8 = 1;
 pub const ROOM_STATUS_CLOSED: u8 = 2;
+
+// Persistent Discord-style Voice/Video Channels
+pub const CHANNEL_STATUS_OPEN: u8 = 1;
+pub const CHANNEL_STATUS_ARCHIVED: u8 = 2;
+pub const CHANNEL_KIND_VOICE: u8 = 1;
+pub const CHANNEL_KIND_VIDEO: u8 = 2;
+pub const CHANNEL_KIND_STAGE_LOUNGE: u8 = 3;
+
+pub const MAX_CHANNEL_NAME_LEN: usize = 48;
+pub const MAX_CHANNEL_TOPIC_LEN: usize = 80;
+pub const MAX_CHANNEL_PEERS: usize = 8;
+pub const MAX_CHANNELS_SLICE: u64 = 32;
+/// `[identity:20][dtls_fp:32][media_flags:1][reserved:1][joined_blk:8]` = 62 B
+pub const CHANNEL_PEER_LEN: usize = 62;
+/// `[channel_id:8][creator:20][guild_addr:20][status:1][kind:1][peer_cnt:1][reserved:1][created_blk:8][updated_blk:8][name_len:2][topic_len:2][reserved2:4]` = 76 B
+pub const CHANNEL_HDR_LEN: usize = 76;
+pub const MAX_CHANNEL_REC_BYTES: usize =
+    CHANNEL_HDR_LEN + MAX_CHANNEL_NAME_LEN + MAX_CHANNEL_TOPIC_LEN + MAX_CHANNEL_PEERS * CHANNEL_PEER_LEN;
+
+// Serverless K-ary P2P Fanout-Tree Live Broadcasts & Stage Channels
+pub const BCAST_STATUS_LIVE: u8 = 1;
+pub const BCAST_STATUS_ENDED: u8 = 2;
+pub const BCAST_ROLE_VIEWER: u8 = 0;
+pub const BCAST_ROLE_HOST: u8 = 1;
+pub const BCAST_ROLE_SPEAKER: u8 = 2;
+pub const BCAST_ROLE_HAND_RAISED: u8 = 3;
+pub const DEFAULT_FANOUT_K: u8 = 4;
+pub const MAX_BROADCAST_TITLE_LEN: usize = 64;
+pub const MAX_BROADCAST_NODES: usize = 64;
+pub const MAX_BROADCASTS_SLICE: u64 = 24;
+/// `[stream_id:8][host:20][guild_addr:20][status:1][media_kind:1][fanout_k:1][active_count:1][total_slots:2][peak_viewers:2][created_blk:8][updated_blk:8][title_len:2][reserved:2]` = 76 B
+pub const BCAST_HDR_LEN: usize = 76;
+pub const MAX_BCAST_META_BYTES: usize = BCAST_HDR_LEN + MAX_BROADCAST_TITLE_LEN;
+/// `[slot_idx:2][parent_slot:2][active:1][role:1][tier_depth:1][active_children:1][identity:20][parent_identity:20][dtls_fp:32][joined_blk:8]` = 88 B
+pub const BCAST_NODE_LEN: usize = 88;
+pub const PARENT_NONE_SLOT: u16 = 0xFFFF;
+/// `[seq:8][sig_type:1][updated_blk:8][sender_dtls_fp:32][env_len:2]` = 51 B
+pub const PINNED_SIGNAL_HDR_LEN: usize = 51;
 
 pub const MAX_DISPLAY_LABEL_LEN: usize = 48;
 pub const MAX_STUN_HINT_LEN: usize = 96;
@@ -99,12 +137,22 @@ pub const ERR_ROOM_NOT_FOUND: i32 = -30;
 pub const ERR_ROOM_CLOSED: i32 = -31;
 pub const ERR_ROOM_FULL: i32 = -32;
 pub const ERR_NOT_IN_ROOM: i32 = -33;
+pub const ERR_CHANNEL_NOT_FOUND: i32 = -40;
+pub const ERR_CHANNEL_ARCHIVED: i32 = -41;
+pub const ERR_CHANNEL_FULL: i32 = -42;
+pub const ERR_NOT_IN_CHANNEL: i32 = -43;
+pub const ERR_BROADCAST_NOT_FOUND: i32 = -50;
+pub const ERR_BROADCAST_ENDED: i32 = -51;
+pub const ERR_BROADCAST_FULL: i32 = -52;
+pub const ERR_NOT_IN_BROADCAST: i32 = -53;
 
 const KEY_INIT: &[u8] = b"rtc:init";
 const KEY_ADMIN: &[u8] = b"rtc:admin";
 const KEY_TOTAL_PROFILES: &[u8] = b"rtc:tot_prof";
 const KEY_TOTAL_CALLS: &[u8] = b"rtc:tot_calls";
 const KEY_TOTAL_ROOMS: &[u8] = b"rtc:tot_rooms";
+const KEY_TOTAL_CHANNELS: &[u8] = b"rtc:tot_ch";
+const KEY_TOTAL_BROADCASTS: &[u8] = b"rtc:tot_bc";
 
 const SEL_ID_OWNER: [u8; 4] = selector("owner()");
 const SEL_ID_IS_DEVICE: [u8; 4] = selector("isOwnerDevice(address)");
@@ -122,6 +170,22 @@ const EV_ROOM_PEER_JOINED: [u8; 32] = event_topic("RoomPeerJoined(uint64,address
 const EV_ROOM_PEER_LEFT: [u8; 32] = event_topic("RoomPeerLeft(uint64,address,uint64)");
 const EV_ROOM_SIGNAL_POSTED: [u8; 32] =
     event_topic("RoomSignalPosted(uint64,address,address)");
+
+const EV_CHANNEL_CREATED: [u8; 32] = event_topic("ChannelCreated(uint64,address,address,uint64)");
+const EV_CHANNEL_PEER_UPDATED: [u8; 32] =
+    event_topic("ChannelPeerUpdated(uint64,address,uint64,uint64)");
+const EV_CHANNEL_SIGNAL_POSTED: [u8; 32] =
+    event_topic("ChannelSignalPosted(uint64,address,address)");
+
+const EV_BROADCAST_STARTED: [u8; 32] =
+    event_topic("BroadcastStarted(uint64,address,address,uint64)");
+const EV_BROADCAST_VIEWER_UPDATED: [u8; 32] =
+    event_topic("BroadcastViewerUpdated(uint64,address,address,uint64)");
+const EV_BROADCAST_ROLE_UPDATED: [u8; 32] =
+    event_topic("BroadcastRoleUpdated(uint64,address,uint64)");
+const EV_BROADCAST_ENDED: [u8; 32] = event_topic("BroadcastEnded(uint64,address)");
+const EV_BROADCAST_SIGNAL_POSTED: [u8; 32] =
+    event_topic("BroadcastSignalPosted(uint64,address,address)");
 
 const OUT_SCRATCH_CAP: usize = 65_536;
 static mut OUT_SCRATCH: [u8; OUT_SCRATCH_CAP] = [0u8; OUT_SCRATCH_CAP];
@@ -149,6 +213,27 @@ hps_entry! {
     "getRoomState(uint64)"                                                      => handle_get_room_state,
     "getRoomsSlice(uint64,uint64)"                                              => handle_get_rooms_slice,
     "getPairSignal(uint64,address,address)"                                     => handle_get_pair_signal,
+    // v2: Discord-style Persistent Voice/Video Channels
+    "createChannel(address,address,uint64,string,string)"                       => handle_create_channel,
+    "joinChannel(uint64,address,bytes32,uint64)"                                => handle_join_channel,
+    "updateChannelMedia(uint64,address,uint64)"                                 => handle_update_channel_media,
+    "leaveChannel(uint64,address)"                                              => handle_leave_channel,
+    "postChannelSignal(uint64,address,address,uint64,bytes32,bytes)"            => handle_post_channel_signal,
+    "getChannelState(uint64)"                                                   => handle_get_channel_state,
+    "getChannelsSlice(uint64,uint64)"                                           => handle_get_channels_slice,
+    "getChannelPairSignal(uint64,address,address)"                              => handle_get_channel_pair_signal,
+    // v2: Serverless K-ary P2P Fanout-Tree Live Broadcasts & Stage Channels
+    "createBroadcast(address,address,uint64,uint64,bytes32,string)"             => handle_create_broadcast,
+    "joinBroadcast(uint64,address,bytes32)"                                     => handle_join_broadcast,
+    "reparentViewer(uint64,address)"                                            => handle_reparent_viewer,
+    "leaveBroadcast(uint64,address)"                                            => handle_leave_broadcast,
+    "endBroadcast(uint64,address)"                                              => handle_end_broadcast,
+    "setHandRaised(uint64,address,bool)"                                        => handle_set_hand_raised,
+    "setStageRole(uint64,address,address,uint64)"                               => handle_set_stage_role,
+    "postBroadcastSignal(uint64,address,address,uint64,bytes32,bytes)"          => handle_post_broadcast_signal,
+    "getBroadcastState(uint64)"                                                 => handle_get_broadcast_state,
+    "getBroadcastsSlice(uint64,uint64)"                                         => handle_get_broadcasts_slice,
+    "getBroadcastPairSignal(uint64,address,address)"                            => handle_get_broadcast_pair_signal,
 }
 
 fn addr_topic(addr: &[u8; 20]) -> [u8; 32] {
@@ -434,13 +519,15 @@ fn handle_admin(_r: &CalldataReader) -> Result<(), i32> {
 }
 
 fn handle_get_hub_overview(_r: &CalldataReader) -> Result<(), i32> {
-    let mut out = [0u8; 48];
+    let mut out = [0u8; 64];
     out[0..8].copy_from_slice(&WEBRTC_SIGNAL_ABI_VERSION.to_be_bytes());
     out[8..16].copy_from_slice(&storage::get_u64(KEY_TOTAL_PROFILES).to_be_bytes());
     out[16..24].copy_from_slice(&storage::get_u64(KEY_TOTAL_CALLS).to_be_bytes());
     out[24..32].copy_from_slice(&storage::get_u64(KEY_TOTAL_ROOMS).to_be_bytes());
     out[32..40].copy_from_slice(&context::block_number().to_be_bytes());
     out[40..48].copy_from_slice(&(MAX_ROOM_PEERS as u64).to_be_bytes());
+    out[48..56].copy_from_slice(&storage::get_u64(KEY_TOTAL_CHANNELS).to_be_bytes());
+    out[56..64].copy_from_slice(&storage::get_u64(KEY_TOTAL_BROADCASTS).to_be_bytes());
     ret::write_abi_bytes(&out);
     Ok(())
 }
@@ -1489,6 +1576,1354 @@ fn handle_get_pair_signal(r: &CalldataReader) -> Result<(), i32> {
 }
 
 // ============================================================================
+// Persistent Discord-Style Voice / Video / Screen-Share Channels (`ch:`)
+// ============================================================================
+
+fn chan_rec_key(channel_id: u64) -> KeyBuilder<32> {
+    KeyBuilder::<32>::new().push(b"ch:").push_u64_be(channel_id)
+}
+
+fn chan_sig_key(channel_id: u64, from_id: &[u8; 20], to_id: &[u8; 20]) -> KeyBuilder<64> {
+    KeyBuilder::<64>::new()
+        .push(b"cs:")
+        .push_u64_be(channel_id)
+        .push(from_id)
+        .push(to_id)
+}
+
+#[derive(Clone, Copy)]
+struct ChannelPeer {
+    identity: [u8; 20],
+    dtls_fp: [u8; 32],
+    media_flags: u8,
+    joined_blk: u64,
+}
+
+struct ChannelRecord {
+    channel_id: u64,
+    creator: [u8; 20],
+    guild_addr: [u8; 20],
+    status: u8,
+    channel_kind: u8,
+    created_blk: u64,
+    updated_blk: u64,
+    name: [u8; MAX_CHANNEL_NAME_LEN],
+    name_len: usize,
+    topic: [u8; MAX_CHANNEL_TOPIC_LEN],
+    topic_len: usize,
+    peers: [ChannelPeer; MAX_CHANNEL_PEERS],
+    peer_count: usize,
+}
+
+impl ChannelRecord {
+    fn encode_into(&self, out: &mut [u8; MAX_CHANNEL_REC_BYTES]) -> usize {
+        *out = [0u8; MAX_CHANNEL_REC_BYTES];
+        out[0..8].copy_from_slice(&self.channel_id.to_be_bytes());
+        out[8..28].copy_from_slice(&self.creator);
+        out[28..48].copy_from_slice(&self.guild_addr);
+        out[48] = self.status;
+        out[49] = self.channel_kind;
+        out[50] = self.peer_count as u8;
+        out[52..60].copy_from_slice(&self.created_blk.to_be_bytes());
+        out[60..68].copy_from_slice(&self.updated_blk.to_be_bytes());
+        let nlen = self.name_len.min(MAX_CHANNEL_NAME_LEN);
+        let tlen = self.topic_len.min(MAX_CHANNEL_TOPIC_LEN);
+        out[68..70].copy_from_slice(&(nlen as u16).to_be_bytes());
+        out[70..72].copy_from_slice(&(tlen as u16).to_be_bytes());
+
+        let mut pos = CHANNEL_HDR_LEN;
+        out[pos..pos + nlen].copy_from_slice(&self.name[..nlen]);
+        pos += nlen;
+        out[pos..pos + tlen].copy_from_slice(&self.topic[..tlen]);
+        pos += tlen;
+
+        let mut i = 0;
+        while i < MAX_CHANNEL_PEERS {
+            if i >= self.peer_count {
+                break;
+            }
+            out[pos..pos + 20].copy_from_slice(&self.peers[i].identity);
+            out[pos + 20..pos + 52].copy_from_slice(&self.peers[i].dtls_fp);
+            out[pos + 52] = self.peers[i].media_flags;
+            out[pos + 54..pos + 62].copy_from_slice(&self.peers[i].joined_blk.to_be_bytes());
+            pos += CHANNEL_PEER_LEN;
+            i += 1;
+        }
+        pos
+    }
+
+    fn decode(raw: &[u8]) -> Option<Self> {
+        if raw.len() < CHANNEL_HDR_LEN {
+            return None;
+        }
+        let mut b8 = [0u8; 8];
+        let mut b2 = [0u8; 2];
+
+        b8.copy_from_slice(&raw[0..8]);
+        let channel_id = u64::from_be_bytes(b8);
+        let mut creator = [0u8; 20];
+        creator.copy_from_slice(&raw[8..28]);
+        let mut guild_addr = [0u8; 20];
+        guild_addr.copy_from_slice(&raw[28..48]);
+        let status = raw[48];
+        let channel_kind = raw[49];
+        let peer_count = (raw[50] as usize).min(MAX_CHANNEL_PEERS);
+
+        b8.copy_from_slice(&raw[52..60]);
+        let created_blk = u64::from_be_bytes(b8);
+        b8.copy_from_slice(&raw[60..68]);
+        let updated_blk = u64::from_be_bytes(b8);
+
+        b2.copy_from_slice(&raw[68..70]);
+        let name_len = (u16::from_be_bytes(b2) as usize).min(MAX_CHANNEL_NAME_LEN);
+        b2.copy_from_slice(&raw[70..72]);
+        let topic_len = (u16::from_be_bytes(b2) as usize).min(MAX_CHANNEL_TOPIC_LEN);
+
+        let expected = CHANNEL_HDR_LEN + name_len + topic_len + peer_count * CHANNEL_PEER_LEN;
+        if raw.len() < expected {
+            return None;
+        }
+
+        let mut name = [0u8; MAX_CHANNEL_NAME_LEN];
+        name[..name_len].copy_from_slice(&raw[CHANNEL_HDR_LEN..CHANNEL_HDR_LEN + name_len]);
+        let mut topic = [0u8; MAX_CHANNEL_TOPIC_LEN];
+        let t_off = CHANNEL_HDR_LEN + name_len;
+        topic[..topic_len].copy_from_slice(&raw[t_off..t_off + topic_len]);
+
+        let mut peers = [ChannelPeer {
+            identity: [0u8; 20],
+            dtls_fp: [0u8; 32],
+            media_flags: 0,
+            joined_blk: 0,
+        }; MAX_CHANNEL_PEERS];
+
+        let mut pos = t_off + topic_len;
+        let mut i = 0;
+        while i < MAX_CHANNEL_PEERS {
+            if i >= peer_count {
+                break;
+            }
+            peers[i].identity.copy_from_slice(&raw[pos..pos + 20]);
+            peers[i].dtls_fp.copy_from_slice(&raw[pos + 20..pos + 52]);
+            peers[i].media_flags = raw[pos + 52];
+            b8.copy_from_slice(&raw[pos + 54..pos + 62]);
+            peers[i].joined_blk = u64::from_be_bytes(b8);
+            pos += CHANNEL_PEER_LEN;
+            i += 1;
+        }
+
+        Some(Self {
+            channel_id,
+            creator,
+            guild_addr,
+            status,
+            channel_kind,
+            created_blk,
+            updated_blk,
+            name,
+            name_len,
+            topic,
+            topic_len,
+            peers,
+            peer_count,
+        })
+    }
+}
+
+fn read_channel(channel_id: u64) -> Option<ChannelRecord> {
+    if channel_id == 0 {
+        return None;
+    }
+    let mut buf = [0u8; MAX_CHANNEL_REC_BYTES];
+    let n = storage::get_into(chan_rec_key(channel_id).as_slice(), &mut buf)?;
+    ChannelRecord::decode(&buf[..n.min(MAX_CHANNEL_REC_BYTES)])
+}
+
+fn write_channel(ch: &ChannelRecord) {
+    let mut buf = [0u8; MAX_CHANNEL_REC_BYTES];
+    let n = ch.encode_into(&mut buf);
+    storage::set(chan_rec_key(ch.channel_id).as_slice(), &buf[..n]);
+}
+
+fn channel_contains_peer(ch: &ChannelRecord, identity: &[u8; 20]) -> Option<usize> {
+    let mut i = 0;
+    while i < MAX_CHANNEL_PEERS {
+        if i >= ch.peer_count {
+            break;
+        }
+        if &ch.peers[i].identity == identity {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn normalize_channel_kind(k: u64) -> u8 {
+    match k {
+        1 => CHANNEL_KIND_VOICE,
+        3 => CHANNEL_KIND_STAGE_LOUNGE,
+        _ => CHANNEL_KIND_VIDEO,
+    }
+}
+
+fn write_pinned_pair_signal(
+    key: &[u8],
+    signal_type: u64,
+    sender_dtls_fp: &[u8; 32],
+    env: &[u8],
+) -> u64 {
+    let mut prev_hdr = [0u8; 8];
+    let prev_seq = match storage::get_into(key, &mut prev_hdr) {
+        Some(n) if n >= 8 => u64::from_be_bytes(prev_hdr),
+        _ => 0,
+    };
+    let seq = prev_seq.saturating_add(1);
+    let blk = context::block_number();
+    let scratch = unsafe { &mut *core::ptr::addr_of_mut!(OUT_SCRATCH) };
+    scratch[0..8].copy_from_slice(&seq.to_be_bytes());
+    scratch[8] = (signal_type.min(255)) as u8;
+    scratch[9..17].copy_from_slice(&blk.to_be_bytes());
+    scratch[17..49].copy_from_slice(sender_dtls_fp);
+    scratch[49..51].copy_from_slice(&(env.len() as u16).to_be_bytes());
+    scratch[PINNED_SIGNAL_HDR_LEN..PINNED_SIGNAL_HDR_LEN + env.len()].copy_from_slice(env);
+    storage::set(key, &scratch[..PINNED_SIGNAL_HDR_LEN + env.len()]);
+    seq
+}
+
+fn handle_create_channel(r: &CalldataReader) -> Result<(), i32> {
+    let creator = r.address(0).ok_or(ERR_BAD_ARGS)?;
+    let guild_addr = r.address(1).ok_or(ERR_BAD_ARGS)?;
+    let kind_arg = r.u64(2).ok_or(ERR_BAD_ARGS)?;
+    let name_bytes = r.dynamic_bytes(3).ok_or(ERR_BAD_ARGS)?;
+    let topic_bytes = r.dynamic_bytes(4).ok_or(ERR_BAD_ARGS)?;
+
+    if name_bytes.is_empty() {
+        return Err(ERR_BAD_ARGS);
+    }
+
+    let caller = context::msg_sender();
+    if !is_authorized_for_identity(&caller, &creator) {
+        return Err(ERR_UNAUTHORIZED_IDENTITY);
+    }
+
+    let channel_id = storage::get_u64(KEY_TOTAL_CHANNELS).saturating_add(1);
+    storage::set_u64(KEY_TOTAL_CHANNELS, channel_id);
+
+    let blk = context::block_number();
+    let nlen = name_bytes.len().min(MAX_CHANNEL_NAME_LEN);
+    let tlen = topic_bytes.len().min(MAX_CHANNEL_TOPIC_LEN);
+    let mut name = [0u8; MAX_CHANNEL_NAME_LEN];
+    name[..nlen].copy_from_slice(&name_bytes[..nlen]);
+    let mut topic = [0u8; MAX_CHANNEL_TOPIC_LEN];
+    topic[..tlen].copy_from_slice(&topic_bytes[..tlen]);
+
+    let kind = normalize_channel_kind(kind_arg);
+    let ch = ChannelRecord {
+        channel_id,
+        creator,
+        guild_addr,
+        status: CHANNEL_STATUS_OPEN,
+        channel_kind: kind,
+        created_blk: blk,
+        updated_blk: blk,
+        name,
+        name_len: nlen,
+        topic,
+        topic_len: tlen,
+        peers: [ChannelPeer {
+            identity: [0u8; 20],
+            dtls_fp: [0u8; 32],
+            media_flags: 0,
+            joined_blk: 0,
+        }; MAX_CHANNEL_PEERS],
+        peer_count: 0,
+    };
+    write_channel(&ch);
+
+    events::emit(
+        &[
+            EV_CHANNEL_CREATED,
+            u64_topic(channel_id),
+            addr_topic(&creator),
+            addr_topic(&guild_addr),
+        ],
+        &u64_word(kind as u64),
+    );
+
+    ret::write_u64_word(channel_id);
+    Ok(())
+}
+
+fn handle_join_channel(r: &CalldataReader) -> Result<(), i32> {
+    let channel_id = r.u64(0).ok_or(ERR_BAD_ARGS)?;
+    let peer_identity = r.address(1).ok_or(ERR_BAD_ARGS)?;
+    let dtls_fp = r.bytes32(2).ok_or(ERR_BAD_ARGS)?;
+    let media_flags = (r.u64(3).unwrap_or(0) & 0xFF) as u8;
+
+    let caller = context::msg_sender();
+    if !is_authorized_for_identity(&caller, &peer_identity) {
+        return Err(ERR_UNAUTHORIZED_IDENTITY);
+    }
+
+    let mut ch = read_channel(channel_id).ok_or(ERR_CHANNEL_NOT_FOUND)?;
+    if ch.status != CHANNEL_STATUS_OPEN {
+        return Err(ERR_CHANNEL_ARCHIVED);
+    }
+
+    let blk = context::block_number();
+    if let Some(idx) = channel_contains_peer(&ch, &peer_identity) {
+        if dtls_fp != [0u8; 32] {
+            ch.peers[idx].dtls_fp = dtls_fp;
+        }
+        ch.peers[idx].media_flags = media_flags;
+        ch.peers[idx].joined_blk = blk;
+    } else {
+        if ch.peer_count >= MAX_CHANNEL_PEERS {
+            return Err(ERR_CHANNEL_FULL);
+        }
+        ch.peers[ch.peer_count] = ChannelPeer {
+            identity: peer_identity,
+            dtls_fp,
+            media_flags,
+            joined_blk: blk,
+        };
+        ch.peer_count += 1;
+    }
+    ch.updated_blk = blk;
+    write_channel(&ch);
+
+    events::emit(
+        &[
+            EV_CHANNEL_PEER_UPDATED,
+            u64_topic(channel_id),
+            addr_topic(&peer_identity),
+            u64_topic(ch.peer_count as u64),
+        ],
+        &u64_word(media_flags as u64),
+    );
+
+    ret::write_u64_word(ch.peer_count as u64);
+    Ok(())
+}
+
+fn handle_update_channel_media(r: &CalldataReader) -> Result<(), i32> {
+    let channel_id = r.u64(0).ok_or(ERR_BAD_ARGS)?;
+    let peer_identity = r.address(1).ok_or(ERR_BAD_ARGS)?;
+    let media_flags = (r.u64(2).ok_or(ERR_BAD_ARGS)? & 0xFF) as u8;
+
+    let caller = context::msg_sender();
+    if !is_authorized_for_identity(&caller, &peer_identity) {
+        return Err(ERR_UNAUTHORIZED_IDENTITY);
+    }
+
+    let mut ch = read_channel(channel_id).ok_or(ERR_CHANNEL_NOT_FOUND)?;
+    let idx = channel_contains_peer(&ch, &peer_identity).ok_or(ERR_NOT_IN_CHANNEL)?;
+    ch.peers[idx].media_flags = media_flags;
+    ch.updated_blk = context::block_number();
+    write_channel(&ch);
+
+    events::emit(
+        &[
+            EV_CHANNEL_PEER_UPDATED,
+            u64_topic(channel_id),
+            addr_topic(&peer_identity),
+            u64_topic(ch.peer_count as u64),
+        ],
+        &u64_word(media_flags as u64),
+    );
+
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_leave_channel(r: &CalldataReader) -> Result<(), i32> {
+    let channel_id = r.u64(0).ok_or(ERR_BAD_ARGS)?;
+    let peer_identity = r.address(1).ok_or(ERR_BAD_ARGS)?;
+
+    let mut ch = read_channel(channel_id).ok_or(ERR_CHANNEL_NOT_FOUND)?;
+    let caller = context::msg_sender();
+    if !is_authorized_for_identity(&caller, &peer_identity)
+        && !is_authorized_for_identity(&caller, &ch.creator)
+    {
+        return Err(ERR_UNAUTHORIZED_IDENTITY);
+    }
+
+    if let Some(idx) = channel_contains_peer(&ch, &peer_identity) {
+        let mut j = idx;
+        while j + 1 < MAX_CHANNEL_PEERS {
+            if j + 1 >= ch.peer_count {
+                break;
+            }
+            ch.peers[j] = ch.peers[j + 1];
+            j += 1;
+        }
+        ch.peer_count = ch.peer_count.saturating_sub(1);
+        // Persistent Discord channels remain OPEN (`CHANNEL_STATUS_OPEN`) even when `peer_count == 0`!
+        ch.updated_blk = context::block_number();
+        write_channel(&ch);
+
+        events::emit(
+            &[
+                EV_CHANNEL_PEER_UPDATED,
+                u64_topic(channel_id),
+                addr_topic(&peer_identity),
+                u64_topic(ch.peer_count as u64),
+            ],
+            &u64_word(0),
+        );
+    }
+
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_post_channel_signal(r: &CalldataReader) -> Result<(), i32> {
+    let channel_id = r.u64(0).ok_or(ERR_BAD_ARGS)?;
+    let from_identity = r.address(1).ok_or(ERR_BAD_ARGS)?;
+    let to_identity = r.address(2).ok_or(ERR_BAD_ARGS)?;
+    let signal_type = r.u64(3).ok_or(ERR_BAD_ARGS)?;
+    let sender_dtls_fp = r.bytes32(4).ok_or(ERR_BAD_ARGS)?;
+    let env = r.dynamic_bytes(5).ok_or(ERR_BAD_ARGS)?;
+
+    if from_identity == to_identity || env.is_empty() {
+        return Err(ERR_BAD_ARGS);
+    }
+    if env.len() > MAX_SDP_ENVELOPE_BYTES {
+        return Err(ERR_ENVELOPE_TOO_LARGE);
+    }
+
+    let caller = context::msg_sender();
+    if !is_authorized_for_identity(&caller, &from_identity) {
+        return Err(ERR_UNAUTHORIZED_IDENTITY);
+    }
+
+    let ch = read_channel(channel_id).ok_or(ERR_CHANNEL_NOT_FOUND)?;
+    if ch.status != CHANNEL_STATUS_OPEN {
+        return Err(ERR_CHANNEL_ARCHIVED);
+    }
+    if channel_contains_peer(&ch, &from_identity).is_none()
+        || channel_contains_peer(&ch, &to_identity).is_none()
+    {
+        return Err(ERR_NOT_IN_CHANNEL);
+    }
+
+    let skey = chan_sig_key(channel_id, &from_identity, &to_identity);
+    let seq = write_pinned_pair_signal(skey.as_slice(), signal_type, &sender_dtls_fp, env);
+
+    let mut ev_data = [0u8; 64];
+    ev_data[0..32].copy_from_slice(&u64_word(seq));
+    ev_data[32..64].copy_from_slice(&sender_dtls_fp);
+    events::emit(
+        &[
+            EV_CHANNEL_SIGNAL_POSTED,
+            u64_topic(channel_id),
+            addr_topic(&from_identity),
+            addr_topic(&to_identity),
+        ],
+        &ev_data,
+    );
+
+    ret::write_u64_word(seq);
+    Ok(())
+}
+
+fn handle_get_channel_state(r: &CalldataReader) -> Result<(), i32> {
+    let channel_id = r.u64(0).ok_or(ERR_BAD_ARGS)?;
+    let mut buf = [0u8; MAX_CHANNEL_REC_BYTES];
+    match storage::get_into(chan_rec_key(channel_id).as_slice(), &mut buf) {
+        Some(n) if n >= CHANNEL_HDR_LEN && n <= MAX_CHANNEL_REC_BYTES => {
+            ret::write_abi_bytes(&buf[..n]);
+        }
+        _ => ret::write_abi_bytes(&[]),
+    }
+    Ok(())
+}
+
+fn handle_get_channels_slice(r: &CalldataReader) -> Result<(), i32> {
+    let start = r.u64(0).ok_or(ERR_BAD_ARGS)?;
+    let req_limit = r.u64(1).ok_or(ERR_BAD_ARGS)?;
+    let limit = req_limit.min(MAX_CHANNELS_SLICE);
+
+    let total = storage::get_u64(KEY_TOTAL_CHANNELS);
+    let scratch = unsafe { &mut *core::ptr::addr_of_mut!(OUT_SCRATCH) };
+    scratch[0..8].copy_from_slice(&total.to_be_bytes());
+    let mut count: u64 = 0;
+    let mut pos: usize = 16;
+
+    let mut step: u64 = 0;
+    while step < MAX_CHANNELS_SLICE {
+        if step >= limit {
+            break;
+        }
+        let cid = start.saturating_add(step).saturating_add(1);
+        if cid > total {
+            break;
+        }
+        let mut cbuf = [0u8; MAX_CHANNEL_REC_BYTES];
+        if let Some(clen) = storage::get_into(chan_rec_key(cid).as_slice(), &mut cbuf) {
+            if clen >= CHANNEL_HDR_LEN
+                && clen <= MAX_CHANNEL_REC_BYTES
+                && pos + clen <= OUT_SCRATCH_CAP
+            {
+                scratch[pos..pos + clen].copy_from_slice(&cbuf[..clen]);
+                pos += clen;
+                count += 1;
+            }
+        }
+        step += 1;
+    }
+
+    scratch[8..16].copy_from_slice(&count.to_be_bytes());
+    ret::write_abi_bytes(&scratch[..pos]);
+    Ok(())
+}
+
+fn handle_get_channel_pair_signal(r: &CalldataReader) -> Result<(), i32> {
+    let channel_id = r.u64(0).ok_or(ERR_BAD_ARGS)?;
+    let from_identity = r.address(1).ok_or(ERR_BAD_ARGS)?;
+    let to_identity = r.address(2).ok_or(ERR_BAD_ARGS)?;
+
+    let skey = chan_sig_key(channel_id, &from_identity, &to_identity);
+    let scratch = unsafe { &mut *core::ptr::addr_of_mut!(OUT_SCRATCH) };
+    match storage::get_into(
+        skey.as_slice(),
+        &mut scratch[..PINNED_SIGNAL_HDR_LEN + MAX_SDP_ENVELOPE_BYTES],
+    ) {
+        Some(n)
+            if n >= PINNED_SIGNAL_HDR_LEN && n <= PINNED_SIGNAL_HDR_LEN + MAX_SDP_ENVELOPE_BYTES =>
+        {
+            ret::write_abi_bytes(&scratch[..n]);
+        }
+        _ => ret::write_abi_bytes(&[]),
+    }
+    Ok(())
+}
+
+// ============================================================================
+// Serverless K-ary P2P Fanout-Tree Live Broadcasts & Stage Channels (`bc:`)
+// ============================================================================
+
+fn bcast_meta_key(stream_id: u64) -> KeyBuilder<32> {
+    KeyBuilder::<32>::new().push(b"bcm:").push_u64_be(stream_id)
+}
+
+fn bcast_node_key(stream_id: u64, slot_idx: u16) -> KeyBuilder<48> {
+    KeyBuilder::<48>::new()
+        .push(b"bcn:")
+        .push_u64_be(stream_id)
+        .push(&(slot_idx as u64).to_be_bytes())
+}
+
+fn bcast_id_slot_key(stream_id: u64, identity: &[u8; 20]) -> KeyBuilder<56> {
+    KeyBuilder::<56>::new()
+        .push(b"bci:")
+        .push_u64_be(stream_id)
+        .push(identity)
+}
+
+fn bcast_sig_key(stream_id: u64, from_id: &[u8; 20], to_id: &[u8; 20]) -> KeyBuilder<64> {
+    KeyBuilder::<64>::new()
+        .push(b"bcs:")
+        .push_u64_be(stream_id)
+        .push(from_id)
+        .push(to_id)
+}
+
+struct BroadcastMeta {
+    stream_id: u64,
+    host: [u8; 20],
+    guild_addr: [u8; 20],
+    status: u8,
+    media_kind: u8,
+    fanout_k: u8,
+    active_count: u8,
+    total_slots: u16,
+    peak_viewers: u16,
+    created_blk: u64,
+    updated_blk: u64,
+    title: [u8; MAX_BROADCAST_TITLE_LEN],
+    title_len: usize,
+}
+
+impl BroadcastMeta {
+    fn encode_into(&self, out: &mut [u8; MAX_BCAST_META_BYTES]) -> usize {
+        *out = [0u8; MAX_BCAST_META_BYTES];
+        out[0..8].copy_from_slice(&self.stream_id.to_be_bytes());
+        out[8..28].copy_from_slice(&self.host);
+        out[28..48].copy_from_slice(&self.guild_addr);
+        out[48] = self.status;
+        out[49] = self.media_kind;
+        out[50] = self.fanout_k;
+        out[51] = self.active_count;
+        out[52..54].copy_from_slice(&self.total_slots.to_be_bytes());
+        out[54..56].copy_from_slice(&self.peak_viewers.to_be_bytes());
+        out[56..64].copy_from_slice(&self.created_blk.to_be_bytes());
+        out[64..72].copy_from_slice(&self.updated_blk.to_be_bytes());
+        let tlen = self.title_len.min(MAX_BROADCAST_TITLE_LEN);
+        out[72..74].copy_from_slice(&(tlen as u16).to_be_bytes());
+        out[BCAST_HDR_LEN..BCAST_HDR_LEN + tlen].copy_from_slice(&self.title[..tlen]);
+        BCAST_HDR_LEN + tlen
+    }
+
+    fn decode(raw: &[u8]) -> Option<Self> {
+        if raw.len() < BCAST_HDR_LEN {
+            return None;
+        }
+        let mut b8 = [0u8; 8];
+        let mut b2 = [0u8; 2];
+
+        b8.copy_from_slice(&raw[0..8]);
+        let stream_id = u64::from_be_bytes(b8);
+        let mut host = [0u8; 20];
+        host.copy_from_slice(&raw[8..28]);
+        let mut guild_addr = [0u8; 20];
+        guild_addr.copy_from_slice(&raw[28..48]);
+        let status = raw[48];
+        let media_kind = raw[49];
+        let fanout_k = raw[50];
+        let active_count = raw[51];
+
+        b2.copy_from_slice(&raw[52..54]);
+        let total_slots = u16::from_be_bytes(b2);
+        b2.copy_from_slice(&raw[54..56]);
+        let peak_viewers = u16::from_be_bytes(b2);
+
+        b8.copy_from_slice(&raw[56..64]);
+        let created_blk = u64::from_be_bytes(b8);
+        b8.copy_from_slice(&raw[64..72]);
+        let updated_blk = u64::from_be_bytes(b8);
+        b2.copy_from_slice(&raw[72..74]);
+        let title_len = (u16::from_be_bytes(b2) as usize).min(MAX_BROADCAST_TITLE_LEN);
+
+        if raw.len() < BCAST_HDR_LEN + title_len {
+            return None;
+        }
+        let mut title = [0u8; MAX_BROADCAST_TITLE_LEN];
+        title[..title_len].copy_from_slice(&raw[BCAST_HDR_LEN..BCAST_HDR_LEN + title_len]);
+
+        Some(Self {
+            stream_id,
+            host,
+            guild_addr,
+            status,
+            media_kind,
+            fanout_k,
+            active_count,
+            total_slots,
+            peak_viewers,
+            created_blk,
+            updated_blk,
+            title,
+            title_len,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BroadcastNode {
+    slot_idx: u16,
+    parent_slot: u16,
+    active: u8,
+    role: u8,
+    tier_depth: u8,
+    active_children: u8,
+    identity: [u8; 20],
+    parent_identity: [u8; 20],
+    dtls_fp: [u8; 32],
+    joined_blk: u64,
+}
+
+impl BroadcastNode {
+    fn encode(&self) -> [u8; BCAST_NODE_LEN] {
+        let mut b = [0u8; BCAST_NODE_LEN];
+        b[0..2].copy_from_slice(&self.slot_idx.to_be_bytes());
+        b[2..4].copy_from_slice(&self.parent_slot.to_be_bytes());
+        b[4] = self.active;
+        b[5] = self.role;
+        b[6] = self.tier_depth;
+        b[7] = self.active_children;
+        b[8..28].copy_from_slice(&self.identity);
+        b[28..48].copy_from_slice(&self.parent_identity);
+        b[48..80].copy_from_slice(&self.dtls_fp);
+        b[80..88].copy_from_slice(&self.joined_blk.to_be_bytes());
+        b
+    }
+
+    fn decode(raw: &[u8]) -> Option<Self> {
+        if raw.len() < BCAST_NODE_LEN {
+            return None;
+        }
+        let mut b2 = [0u8; 2];
+        let mut b8 = [0u8; 8];
+        b2.copy_from_slice(&raw[0..2]);
+        let slot_idx = u16::from_be_bytes(b2);
+        b2.copy_from_slice(&raw[2..4]);
+        let parent_slot = u16::from_be_bytes(b2);
+        let active = raw[4];
+        let role = raw[5];
+        let tier_depth = raw[6];
+        let active_children = raw[7];
+        let mut identity = [0u8; 20];
+        identity.copy_from_slice(&raw[8..28]);
+        let mut parent_identity = [0u8; 20];
+        parent_identity.copy_from_slice(&raw[28..48]);
+        let mut dtls_fp = [0u8; 32];
+        dtls_fp.copy_from_slice(&raw[48..80]);
+        b8.copy_from_slice(&raw[80..88]);
+        let joined_blk = u64::from_be_bytes(b8);
+        Some(Self {
+            slot_idx,
+            parent_slot,
+            active,
+            role,
+            tier_depth,
+            active_children,
+            identity,
+            parent_identity,
+            dtls_fp,
+            joined_blk,
+        })
+    }
+}
+
+fn read_bcast_meta(stream_id: u64) -> Option<BroadcastMeta> {
+    if stream_id == 0 {
+        return None;
+    }
+    let mut buf = [0u8; MAX_BCAST_META_BYTES];
+    let n = storage::get_into(bcast_meta_key(stream_id).as_slice(), &mut buf)?;
+    BroadcastMeta::decode(&buf[..n.min(MAX_BCAST_META_BYTES)])
+}
+
+fn write_bcast_meta(m: &BroadcastMeta) {
+    let mut buf = [0u8; MAX_BCAST_META_BYTES];
+    let n = m.encode_into(&mut buf);
+    storage::set(bcast_meta_key(m.stream_id).as_slice(), &buf[..n]);
+}
+
+fn read_bcast_node(stream_id: u64, slot_idx: u16) -> Option<BroadcastNode> {
+    let mut buf = [0u8; BCAST_NODE_LEN];
+    let n = storage::get_into(bcast_node_key(stream_id, slot_idx).as_slice(), &mut buf)?;
+    if n < BCAST_NODE_LEN {
+        return None;
+    }
+    BroadcastNode::decode(&buf)
+}
+
+fn write_bcast_node(stream_id: u64, node: &BroadcastNode) {
+    let enc = node.encode();
+    storage::set(bcast_node_key(stream_id, node.slot_idx).as_slice(), &enc);
+}
+
+/// Finds the shallowest active upstream tree node (`slot < child_slot`) with `active_children < fanout_k`.
+/// Strictly enforcing `slot < child_slot` guarantees a 100% cycle-free tree across joins and reparents.
+fn select_upstream_tree_parent(
+    stream_id: u64,
+    child_slot: u16,
+    fanout_k: u8,
+    avoid_slot: u16,
+) -> BroadcastNode {
+    let bound = (child_slot as usize).min(MAX_BROADCAST_NODES);
+    let mut s: usize = 0;
+    while s < MAX_BROADCAST_NODES {
+        if s >= bound {
+            break;
+        }
+        if (s as u16) != avoid_slot {
+            if let Some(cand) = read_bcast_node(stream_id, s as u16) {
+                if cand.active == 1 && cand.active_children < fanout_k {
+                    return cand;
+                }
+            }
+        }
+        s += 1;
+    }
+    // Fallback to Host root (`slot 0`) if all intermediate slots are saturated
+    read_bcast_node(stream_id, 0).unwrap_or(BroadcastNode {
+        slot_idx: 0,
+        parent_slot: PARENT_NONE_SLOT,
+        active: 1,
+        role: BCAST_ROLE_HOST,
+        tier_depth: 0,
+        active_children: 0,
+        identity: [0u8; 20],
+        parent_identity: [0u8; 20],
+        dtls_fp: [0u8; 32],
+        joined_blk: 0,
+    })
+}
+
+fn handle_create_broadcast(r: &CalldataReader) -> Result<(), i32> {
+    let host_identity = r.address(0).ok_or(ERR_BAD_ARGS)?;
+    let guild_addr = r.address(1).ok_or(ERR_BAD_ARGS)?;
+    let media_arg = r.u64(2).ok_or(ERR_BAD_ARGS)?;
+    let fanout_arg = r.u64(3).unwrap_or(DEFAULT_FANOUT_K as u64);
+    let host_dtls_fp = r.bytes32(4).ok_or(ERR_BAD_ARGS)?;
+    let title_bytes = r.dynamic_bytes(5).ok_or(ERR_BAD_ARGS)?;
+
+    if title_bytes.is_empty() {
+        return Err(ERR_BAD_ARGS);
+    }
+
+    let caller = context::msg_sender();
+    if !is_authorized_for_identity(&caller, &host_identity) {
+        return Err(ERR_UNAUTHORIZED_IDENTITY);
+    }
+
+    let stream_id = storage::get_u64(KEY_TOTAL_BROADCASTS).saturating_add(1);
+    storage::set_u64(KEY_TOTAL_BROADCASTS, stream_id);
+
+    let blk = context::block_number();
+    let media_kind = normalize_media(media_arg);
+    let fanout_k = (fanout_arg.clamp(2, 6)) as u8;
+    let tlen = title_bytes.len().min(MAX_BROADCAST_TITLE_LEN);
+    let mut title = [0u8; MAX_BROADCAST_TITLE_LEN];
+    title[..tlen].copy_from_slice(&title_bytes[..tlen]);
+
+    let meta = BroadcastMeta {
+        stream_id,
+        host: host_identity,
+        guild_addr,
+        status: BCAST_STATUS_LIVE,
+        media_kind,
+        fanout_k,
+        active_count: 1,
+        total_slots: 1,
+        peak_viewers: 1,
+        created_blk: blk,
+        updated_blk: blk,
+        title,
+        title_len: tlen,
+    };
+    write_bcast_meta(&meta);
+
+    let host_node = BroadcastNode {
+        slot_idx: 0,
+        parent_slot: PARENT_NONE_SLOT,
+        active: 1,
+        role: BCAST_ROLE_HOST,
+        tier_depth: 0,
+        active_children: 0,
+        identity: host_identity,
+        parent_identity: [0u8; 20],
+        dtls_fp: host_dtls_fp,
+        joined_blk: blk,
+    };
+    write_bcast_node(stream_id, &host_node);
+    storage::set_u64(bcast_id_slot_key(stream_id, &host_identity).as_slice(), 1);
+
+    let mut ev_data = [0u8; 64];
+    ev_data[0..32].copy_from_slice(&u64_word(fanout_k as u64));
+    ev_data[32..64].copy_from_slice(&host_dtls_fp);
+    events::emit(
+        &[
+            EV_BROADCAST_STARTED,
+            u64_topic(stream_id),
+            addr_topic(&host_identity),
+            addr_topic(&guild_addr),
+        ],
+        &ev_data,
+    );
+
+    ret::write_u64_word(stream_id);
+    Ok(())
+}
+
+fn handle_join_broadcast(r: &CalldataReader) -> Result<(), i32> {
+    let stream_id = r.u64(0).ok_or(ERR_BAD_ARGS)?;
+    let viewer_identity = r.address(1).ok_or(ERR_BAD_ARGS)?;
+    let viewer_dtls_fp = r.bytes32(2).ok_or(ERR_BAD_ARGS)?;
+
+    let caller = context::msg_sender();
+    if !is_authorized_for_identity(&caller, &viewer_identity) {
+        return Err(ERR_UNAUTHORIZED_IDENTITY);
+    }
+
+    let mut meta = read_bcast_meta(stream_id).ok_or(ERR_BROADCAST_NOT_FOUND)?;
+    if meta.status != BCAST_STATUS_LIVE {
+        return Err(ERR_BROADCAST_ENDED);
+    }
+
+    let blk = context::block_number();
+    let slot_plus_one = storage::get_u64(bcast_id_slot_key(stream_id, &viewer_identity).as_slice());
+
+    if slot_plus_one > 0 {
+        let my_slot = (slot_plus_one - 1) as u16;
+        if let Some(mut existing) = read_bcast_node(stream_id, my_slot) {
+            if viewer_dtls_fp != [0u8; 32] {
+                existing.dtls_fp = viewer_dtls_fp;
+            }
+            existing.joined_blk = blk;
+            if my_slot == 0 {
+                existing.active = 1;
+                write_bcast_node(stream_id, &existing);
+                ret::write_u64_word(PARENT_NONE_SLOT as u64);
+                return Ok(());
+            }
+            if existing.active == 0 {
+                let mut parent =
+                    select_upstream_tree_parent(stream_id, my_slot, meta.fanout_k, PARENT_NONE_SLOT);
+                parent.active_children = parent.active_children.saturating_add(1);
+                write_bcast_node(stream_id, &parent);
+
+                existing.active = 1;
+                existing.parent_slot = parent.slot_idx;
+                existing.parent_identity = parent.identity;
+                existing.tier_depth = parent.tier_depth.saturating_add(1);
+                meta.active_count = meta.active_count.saturating_add(1);
+                if (meta.active_count as u16) > meta.peak_viewers {
+                    meta.peak_viewers = meta.active_count as u16;
+                }
+            }
+            write_bcast_node(stream_id, &existing);
+            meta.updated_blk = blk;
+            write_bcast_meta(&meta);
+
+            events::emit(
+                &[
+                    EV_BROADCAST_VIEWER_UPDATED,
+                    u64_topic(stream_id),
+                    addr_topic(&viewer_identity),
+                    addr_topic(&existing.parent_identity),
+                ],
+                &u64_word(existing.slot_idx as u64),
+            );
+            ret::write_u64_word(existing.parent_slot as u64);
+            return Ok(());
+        }
+    }
+
+    if (meta.total_slots as usize) >= MAX_BROADCAST_NODES {
+        return Err(ERR_BROADCAST_FULL);
+    }
+
+    let my_slot = meta.total_slots;
+    let mut parent =
+        select_upstream_tree_parent(stream_id, my_slot, meta.fanout_k, PARENT_NONE_SLOT);
+    parent.active_children = parent.active_children.saturating_add(1);
+    write_bcast_node(stream_id, &parent);
+
+    let viewer_node = BroadcastNode {
+        slot_idx: my_slot,
+        parent_slot: parent.slot_idx,
+        active: 1,
+        role: BCAST_ROLE_VIEWER,
+        tier_depth: parent.tier_depth.saturating_add(1),
+        active_children: 0,
+        identity: viewer_identity,
+        parent_identity: parent.identity,
+        dtls_fp: viewer_dtls_fp,
+        joined_blk: blk,
+    };
+    write_bcast_node(stream_id, &viewer_node);
+    storage::set_u64(
+        bcast_id_slot_key(stream_id, &viewer_identity).as_slice(),
+        (my_slot as u64) + 1,
+    );
+
+    meta.total_slots = meta.total_slots.saturating_add(1);
+    meta.active_count = meta.active_count.saturating_add(1);
+    if (meta.active_count as u16) > meta.peak_viewers {
+        meta.peak_viewers = meta.active_count as u16;
+    }
+    meta.updated_blk = blk;
+    write_bcast_meta(&meta);
+
+    events::emit(
+        &[
+            EV_BROADCAST_VIEWER_UPDATED,
+            u64_topic(stream_id),
+            addr_topic(&viewer_identity),
+            addr_topic(&parent.identity),
+        ],
+        &u64_word(my_slot as u64),
+    );
+
+    ret::write_u64_word(parent.slot_idx as u64);
+    Ok(())
+}
+
+fn handle_reparent_viewer(r: &CalldataReader) -> Result<(), i32> {
+    let stream_id = r.u64(0).ok_or(ERR_BAD_ARGS)?;
+    let viewer_identity = r.address(1).ok_or(ERR_BAD_ARGS)?;
+
+    let caller = context::msg_sender();
+    if !is_authorized_for_identity(&caller, &viewer_identity) {
+        return Err(ERR_UNAUTHORIZED_IDENTITY);
+    }
+
+    let mut meta = read_bcast_meta(stream_id).ok_or(ERR_BROADCAST_NOT_FOUND)?;
+    if meta.status != BCAST_STATUS_LIVE {
+        return Err(ERR_BROADCAST_ENDED);
+    }
+
+    let slot_plus_one = storage::get_u64(bcast_id_slot_key(stream_id, &viewer_identity).as_slice());
+    if slot_plus_one <= 1 {
+        return Err(ERR_NOT_IN_BROADCAST);
+    }
+    let my_slot = (slot_plus_one - 1) as u16;
+    let mut node = read_bcast_node(stream_id, my_slot).ok_or(ERR_NOT_IN_BROADCAST)?;
+    let old_parent_slot = node.parent_slot;
+
+    if old_parent_slot < my_slot {
+        if let Some(mut old_p) = read_bcast_node(stream_id, old_parent_slot) {
+            old_p.active_children = old_p.active_children.saturating_sub(1);
+            write_bcast_node(stream_id, &old_p);
+        }
+    }
+
+    let mut new_parent =
+        select_upstream_tree_parent(stream_id, my_slot, meta.fanout_k, old_parent_slot);
+    new_parent.active_children = new_parent.active_children.saturating_add(1);
+    write_bcast_node(stream_id, &new_parent);
+
+    node.active = 1;
+    node.parent_slot = new_parent.slot_idx;
+    node.parent_identity = new_parent.identity;
+    node.tier_depth = new_parent.tier_depth.saturating_add(1);
+    node.joined_blk = context::block_number();
+    write_bcast_node(stream_id, &node);
+
+    meta.updated_blk = context::block_number();
+    write_bcast_meta(&meta);
+
+    events::emit(
+        &[
+            EV_BROADCAST_VIEWER_UPDATED,
+            u64_topic(stream_id),
+            addr_topic(&viewer_identity),
+            addr_topic(&new_parent.identity),
+        ],
+        &u64_word(my_slot as u64),
+    );
+
+    ret::write_u64_word(new_parent.slot_idx as u64);
+    Ok(())
+}
+
+fn handle_leave_broadcast(r: &CalldataReader) -> Result<(), i32> {
+    let stream_id = r.u64(0).ok_or(ERR_BAD_ARGS)?;
+    let peer_identity = r.address(1).ok_or(ERR_BAD_ARGS)?;
+
+    let mut meta = read_bcast_meta(stream_id).ok_or(ERR_BROADCAST_NOT_FOUND)?;
+    let caller = context::msg_sender();
+    if !is_authorized_for_identity(&caller, &peer_identity)
+        && !is_authorized_for_identity(&caller, &meta.host)
+    {
+        return Err(ERR_UNAUTHORIZED_IDENTITY);
+    }
+
+    if peer_identity == meta.host {
+        meta.status = BCAST_STATUS_ENDED;
+        meta.updated_blk = context::block_number();
+        write_bcast_meta(&meta);
+        events::emit(
+            &[EV_BROADCAST_ENDED, u64_topic(stream_id), addr_topic(&meta.host)],
+            &[],
+        );
+        ret::write_bool(true);
+        return Ok(());
+    }
+
+    let slot_plus_one = storage::get_u64(bcast_id_slot_key(stream_id, &peer_identity).as_slice());
+    if slot_plus_one > 1 {
+        let my_slot = (slot_plus_one - 1) as u16;
+        if let Some(mut node) = read_bcast_node(stream_id, my_slot) {
+            if node.active == 1 {
+                node.active = 0;
+                node.active_children = 0;
+                write_bcast_node(stream_id, &node);
+                if node.parent_slot < my_slot {
+                    if let Some(mut p) = read_bcast_node(stream_id, node.parent_slot) {
+                        p.active_children = p.active_children.saturating_sub(1);
+                        write_bcast_node(stream_id, &p);
+                    }
+                }
+                meta.active_count = meta.active_count.saturating_sub(1);
+                meta.updated_blk = context::block_number();
+                write_bcast_meta(&meta);
+
+                events::emit(
+                    &[
+                        EV_BROADCAST_VIEWER_UPDATED,
+                        u64_topic(stream_id),
+                        addr_topic(&peer_identity),
+                        addr_topic(&[0u8; 20]),
+                    ],
+                    &u64_word(my_slot as u64),
+                );
+            }
+        }
+    }
+
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_end_broadcast(r: &CalldataReader) -> Result<(), i32> {
+    let stream_id = r.u64(0).ok_or(ERR_BAD_ARGS)?;
+    let host_identity = r.address(1).ok_or(ERR_BAD_ARGS)?;
+
+    let mut meta = read_bcast_meta(stream_id).ok_or(ERR_BROADCAST_NOT_FOUND)?;
+    if host_identity != meta.host {
+        return Err(ERR_UNAUTHORIZED_IDENTITY);
+    }
+    let caller = context::msg_sender();
+    if !is_authorized_for_identity(&caller, &host_identity) {
+        return Err(ERR_UNAUTHORIZED_IDENTITY);
+    }
+
+    meta.status = BCAST_STATUS_ENDED;
+    meta.updated_blk = context::block_number();
+    write_bcast_meta(&meta);
+
+    events::emit(
+        &[EV_BROADCAST_ENDED, u64_topic(stream_id), addr_topic(&host_identity)],
+        &[],
+    );
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_set_hand_raised(r: &CalldataReader) -> Result<(), i32> {
+    let stream_id = r.u64(0).ok_or(ERR_BAD_ARGS)?;
+    let viewer_identity = r.address(1).ok_or(ERR_BAD_ARGS)?;
+    let raised = r.bool(2).ok_or(ERR_BAD_ARGS)?;
+
+    let caller = context::msg_sender();
+    if !is_authorized_for_identity(&caller, &viewer_identity) {
+        return Err(ERR_UNAUTHORIZED_IDENTITY);
+    }
+
+    let mut meta = read_bcast_meta(stream_id).ok_or(ERR_BROADCAST_NOT_FOUND)?;
+    if meta.status != BCAST_STATUS_LIVE {
+        return Err(ERR_BROADCAST_ENDED);
+    }
+
+    let slot_plus_one = storage::get_u64(bcast_id_slot_key(stream_id, &viewer_identity).as_slice());
+    if slot_plus_one == 0 {
+        return Err(ERR_NOT_IN_BROADCAST);
+    }
+    let my_slot = (slot_plus_one - 1) as u16;
+    let mut node = read_bcast_node(stream_id, my_slot).ok_or(ERR_NOT_IN_BROADCAST)?;
+    if node.role != BCAST_ROLE_HOST && node.role != BCAST_ROLE_SPEAKER {
+        node.role = if raised {
+            BCAST_ROLE_HAND_RAISED
+        } else {
+            BCAST_ROLE_VIEWER
+        };
+        write_bcast_node(stream_id, &node);
+        meta.updated_blk = context::block_number();
+        write_bcast_meta(&meta);
+
+        events::emit(
+            &[
+                EV_BROADCAST_ROLE_UPDATED,
+                u64_topic(stream_id),
+                addr_topic(&viewer_identity),
+                u64_topic(node.role as u64),
+            ],
+            &[],
+        );
+    }
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_set_stage_role(r: &CalldataReader) -> Result<(), i32> {
+    let stream_id = r.u64(0).ok_or(ERR_BAD_ARGS)?;
+    let host_identity = r.address(1).ok_or(ERR_BAD_ARGS)?;
+    let target_identity = r.address(2).ok_or(ERR_BAD_ARGS)?;
+    let role_arg = r.u64(3).ok_or(ERR_BAD_ARGS)?;
+
+    let mut meta = read_bcast_meta(stream_id).ok_or(ERR_BROADCAST_NOT_FOUND)?;
+    if host_identity != meta.host {
+        return Err(ERR_UNAUTHORIZED_IDENTITY);
+    }
+    let caller = context::msg_sender();
+    if !is_authorized_for_identity(&caller, &host_identity) {
+        return Err(ERR_UNAUTHORIZED_IDENTITY);
+    }
+
+    let slot_plus_one = storage::get_u64(bcast_id_slot_key(stream_id, &target_identity).as_slice());
+    if slot_plus_one <= 1 {
+        return Err(ERR_NOT_IN_BROADCAST);
+    }
+    let target_slot = (slot_plus_one - 1) as u16;
+    let mut node = read_bcast_node(stream_id, target_slot).ok_or(ERR_NOT_IN_BROADCAST)?;
+    node.role = if role_arg == (BCAST_ROLE_SPEAKER as u64) {
+        BCAST_ROLE_SPEAKER
+    } else {
+        BCAST_ROLE_VIEWER
+    };
+    write_bcast_node(stream_id, &node);
+
+    meta.updated_blk = context::block_number();
+    write_bcast_meta(&meta);
+
+    events::emit(
+        &[
+            EV_BROADCAST_ROLE_UPDATED,
+            u64_topic(stream_id),
+            addr_topic(&target_identity),
+            u64_topic(node.role as u64),
+        ],
+        &[],
+    );
+    ret::write_bool(true);
+    Ok(())
+}
+
+fn handle_post_broadcast_signal(r: &CalldataReader) -> Result<(), i32> {
+    let stream_id = r.u64(0).ok_or(ERR_BAD_ARGS)?;
+    let from_identity = r.address(1).ok_or(ERR_BAD_ARGS)?;
+    let to_identity = r.address(2).ok_or(ERR_BAD_ARGS)?;
+    let signal_type = r.u64(3).ok_or(ERR_BAD_ARGS)?;
+    let sender_dtls_fp = r.bytes32(4).ok_or(ERR_BAD_ARGS)?;
+    let env = r.dynamic_bytes(5).ok_or(ERR_BAD_ARGS)?;
+
+    if from_identity == to_identity || env.is_empty() {
+        return Err(ERR_BAD_ARGS);
+    }
+    if env.len() > MAX_SDP_ENVELOPE_BYTES {
+        return Err(ERR_ENVELOPE_TOO_LARGE);
+    }
+
+    let caller = context::msg_sender();
+    if !is_authorized_for_identity(&caller, &from_identity) {
+        return Err(ERR_UNAUTHORIZED_IDENTITY);
+    }
+
+    let meta = read_bcast_meta(stream_id).ok_or(ERR_BROADCAST_NOT_FOUND)?;
+    if meta.status != BCAST_STATUS_LIVE {
+        return Err(ERR_BROADCAST_ENDED);
+    }
+    if storage::get_u64(bcast_id_slot_key(stream_id, &from_identity).as_slice()) == 0
+        || storage::get_u64(bcast_id_slot_key(stream_id, &to_identity).as_slice()) == 0
+    {
+        return Err(ERR_NOT_IN_BROADCAST);
+    }
+
+    let skey = bcast_sig_key(stream_id, &from_identity, &to_identity);
+    let seq = write_pinned_pair_signal(skey.as_slice(), signal_type, &sender_dtls_fp, env);
+
+    let mut ev_data = [0u8; 64];
+    ev_data[0..32].copy_from_slice(&u64_word(seq));
+    ev_data[32..64].copy_from_slice(&sender_dtls_fp);
+    events::emit(
+        &[
+            EV_BROADCAST_SIGNAL_POSTED,
+            u64_topic(stream_id),
+            addr_topic(&from_identity),
+            addr_topic(&to_identity),
+        ],
+        &ev_data,
+    );
+
+    ret::write_u64_word(seq);
+    Ok(())
+}
+
+fn handle_get_broadcast_state(r: &CalldataReader) -> Result<(), i32> {
+    let stream_id = r.u64(0).ok_or(ERR_BAD_ARGS)?;
+    let Some(meta) = read_bcast_meta(stream_id) else {
+        ret::write_abi_bytes(&[]);
+        return Ok(());
+    };
+
+    let scratch = unsafe { &mut *core::ptr::addr_of_mut!(OUT_SCRATCH) };
+    let mut m_buf = [0u8; MAX_BCAST_META_BYTES];
+    let m_len = meta.encode_into(&mut m_buf);
+    scratch[0..m_len].copy_from_slice(&m_buf[..m_len]);
+
+    let count_pos = m_len;
+    let mut pos = m_len + 2;
+    let mut written_nodes: u16 = 0;
+    let bound = (meta.total_slots as usize).min(MAX_BROADCAST_NODES);
+
+    let mut s: usize = 0;
+    while s < MAX_BROADCAST_NODES {
+        if s >= bound {
+            break;
+        }
+        if let Some(node) = read_bcast_node(stream_id, s as u16) {
+            if pos + BCAST_NODE_LEN <= OUT_SCRATCH_CAP {
+                scratch[pos..pos + BCAST_NODE_LEN].copy_from_slice(&node.encode());
+                pos += BCAST_NODE_LEN;
+                written_nodes += 1;
+            }
+        }
+        s += 1;
+    }
+
+    scratch[count_pos..count_pos + 2].copy_from_slice(&written_nodes.to_be_bytes());
+    ret::write_abi_bytes(&scratch[..pos]);
+    Ok(())
+}
+
+fn handle_get_broadcasts_slice(r: &CalldataReader) -> Result<(), i32> {
+    let start = r.u64(0).ok_or(ERR_BAD_ARGS)?;
+    let req_limit = r.u64(1).ok_or(ERR_BAD_ARGS)?;
+    let limit = req_limit.min(MAX_BROADCASTS_SLICE);
+
+    let total = storage::get_u64(KEY_TOTAL_BROADCASTS);
+    let scratch = unsafe { &mut *core::ptr::addr_of_mut!(OUT_SCRATCH) };
+    scratch[0..8].copy_from_slice(&total.to_be_bytes());
+    let mut count: u64 = 0;
+    let mut pos: usize = 16;
+
+    let mut step: u64 = 0;
+    while step < MAX_BROADCASTS_SLICE {
+        if step >= limit {
+            break;
+        }
+        let offset = start.saturating_add(step);
+        if offset >= total {
+            break;
+        }
+        let sid = total - offset;
+        let mut mbuf = [0u8; MAX_BCAST_META_BYTES];
+        if let Some(mlen) = storage::get_into(bcast_meta_key(sid).as_slice(), &mut mbuf) {
+            if mlen >= BCAST_HDR_LEN
+                && mlen <= MAX_BCAST_META_BYTES
+                && pos + mlen <= OUT_SCRATCH_CAP
+            {
+                scratch[pos..pos + mlen].copy_from_slice(&mbuf[..mlen]);
+                pos += mlen;
+                count += 1;
+            }
+        }
+        step += 1;
+    }
+
+    scratch[8..16].copy_from_slice(&count.to_be_bytes());
+    ret::write_abi_bytes(&scratch[..pos]);
+    Ok(())
+}
+
+fn handle_get_broadcast_pair_signal(r: &CalldataReader) -> Result<(), i32> {
+    let stream_id = r.u64(0).ok_or(ERR_BAD_ARGS)?;
+    let from_identity = r.address(1).ok_or(ERR_BAD_ARGS)?;
+    let to_identity = r.address(2).ok_or(ERR_BAD_ARGS)?;
+
+    let skey = bcast_sig_key(stream_id, &from_identity, &to_identity);
+    let scratch = unsafe { &mut *core::ptr::addr_of_mut!(OUT_SCRATCH) };
+    match storage::get_into(
+        skey.as_slice(),
+        &mut scratch[..PINNED_SIGNAL_HDR_LEN + MAX_SDP_ENVELOPE_BYTES],
+    ) {
+        Some(n)
+            if n >= PINNED_SIGNAL_HDR_LEN && n <= PINNED_SIGNAL_HDR_LEN + MAX_SDP_ENVELOPE_BYTES =>
+        {
+            ret::write_abi_bytes(&scratch[..n]);
+        }
+        _ => ret::write_abi_bytes(&[]),
+    }
+    Ok(())
+}
+
+// ============================================================================
 // Native Unit Tests (`cargo test -p webrtc-signal`)
 // ============================================================================
 
@@ -1786,5 +3221,174 @@ mod tests {
         assert_eq!(pair_bytes[8], 4);
         let env_len = u16::from_be_bytes([pair_bytes[17], pair_bytes[18]]) as usize;
         assert_eq!(&pair_bytes[19..19 + env_len], b"BOB_TO_ALICE_MESH_OFFER");
+    }
+
+    #[test]
+    fn test_persistent_discord_channels_stay_open_when_empty() {
+        setup_env();
+
+        let guild = [0x44u8; 20];
+        let mut create_ch = Vec::new();
+        create_ch.extend_from_slice(&selector(
+            "createChannel(address,address,uint64,string,string)",
+        ));
+        let name_tail = pad32(b"general-voice");
+        let topic_tail = pad32(b"24/7 Subnet 1 Drop-In Lounge");
+        let head_len = 5 * 32;
+        let head = CallEncoder::<256>::new([0; 4])
+            .push_address(&ALICE_ID)
+            .push_address(&guild)
+            .push_u64(CHANNEL_KIND_VOICE as u64)
+            .push_u64(head_len as u64)
+            .push_u64((head_len + name_tail.len()) as u64);
+        create_ch.extend_from_slice(&head.as_slice()[4..]);
+        create_ch.extend_from_slice(&name_tail);
+        create_ch.extend_from_slice(&topic_tail);
+
+        let cid = decode_u64(&mock::transact_as(ALICE_EOA, HUB_ADDR, &create_ch).unwrap());
+        assert_eq!(cid, 1);
+
+        // Alice & Bob drop in
+        let join_a = CallEncoder::<192>::new(selector(
+            "joinChannel(uint64,address,bytes32,uint64)",
+        ))
+        .push_u64(cid)
+        .push_address(&ALICE_ID)
+        .push_bytes32(&[0xA5; 32])
+        .push_u64(0x04); // VIDEO_ON
+        assert_eq!(
+            decode_u64(&mock::transact_as(ALICE_EOA, HUB_ADDR, join_a.as_slice()).unwrap()),
+            1
+        );
+
+        let join_b = CallEncoder::<192>::new(selector(
+            "joinChannel(uint64,address,bytes32,uint64)",
+        ))
+        .push_u64(cid)
+        .push_address(&BOB_ID)
+        .push_bytes32(&[0xB5; 32])
+        .push_u64(0x01); // MIC_MUTED
+        assert_eq!(
+            decode_u64(&mock::transact_as(BOB_EOA, HUB_ADDR, join_b.as_slice()).unwrap()),
+            2
+        );
+
+        // Pairwise DTLS-pinned signal
+        let mut sig = Vec::new();
+        sig.extend_from_slice(&selector(
+            "postChannelSignal(uint64,address,address,uint64,bytes32,bytes)",
+        ));
+        let sh = CallEncoder::<256>::new([0; 4])
+            .push_u64(cid)
+            .push_address(&ALICE_ID)
+            .push_address(&BOB_ID)
+            .push_u64(4)
+            .push_bytes32(&[0xAA; 32])
+            .push_u64((6 * 32) as u64);
+        sig.extend_from_slice(&sh.as_slice()[4..]);
+        sig.extend_from_slice(&pad32(b"CH_OFFER_V2"));
+        assert_eq!(
+            decode_u64(&mock::transact_as(ALICE_EOA, HUB_ADDR, &sig).unwrap()),
+            1
+        );
+
+        // Both leave — channel MUST remain OPEN (`CHANNEL_STATUS_OPEN = 1`) with `peer_count == 0`!
+        let lv_a = CallEncoder::<96>::new(selector("leaveChannel(uint64,address)"))
+            .push_u64(cid)
+            .push_address(&ALICE_ID);
+        let lv_b = CallEncoder::<96>::new(selector("leaveChannel(uint64,address)"))
+            .push_u64(cid)
+            .push_address(&BOB_ID);
+        mock::transact_as(ALICE_EOA, HUB_ADDR, lv_a.as_slice()).unwrap();
+        mock::transact_as(BOB_EOA, HUB_ADDR, lv_b.as_slice()).unwrap();
+
+        let st_cd = CallEncoder::<64>::new(selector("getChannelState(uint64)")).push_u64(cid);
+        let st_bytes = decode_abi_bytes(&mock::transact_as(ALICE_EOA, HUB_ADDR, st_cd.as_slice()).unwrap());
+        let decoded = ChannelRecord::decode(&st_bytes).unwrap();
+        assert_eq!(decoded.status, CHANNEL_STATUS_OPEN);
+        assert_eq!(decoded.peer_count, 0);
+    }
+
+    #[test]
+    fn test_broadcast_fanout_tree_reparent_and_stage_roles() {
+        setup_env();
+
+        // Create live video broadcast with fanout K = 2 so tree tiers form immediately!
+        let mut create_bc = Vec::new();
+        create_bc.extend_from_slice(&selector(
+            "createBroadcast(address,address,uint64,uint64,bytes32,string)",
+        ));
+        let title_tail = pad32(b"Townhall Live Stage");
+        let bh = CallEncoder::<256>::new([0; 4])
+            .push_address(&ALICE_ID)
+            .push_address(&[0u8; 20])
+            .push_u64(MEDIA_VIDEO as u64)
+            .push_u64(2) // fanout_k = 2
+            .push_bytes32(&[0xA0; 32])
+            .push_u64((6 * 32) as u64);
+        create_bc.extend_from_slice(&bh.as_slice()[4..]);
+        create_bc.extend_from_slice(&title_tail);
+
+        let sid = decode_u64(&mock::transact_as(ALICE_EOA, HUB_ADDR, &create_bc).unwrap());
+        assert_eq!(sid, 1);
+
+        // Viewers v1..v5 join using direct EOA==identity auth
+        let v1 = [0x11u8; 20];
+        let v2 = [0x12u8; 20];
+        let v3 = [0x13u8; 20];
+        let v4 = [0x14u8; 20];
+        let v5 = [0x15u8; 20];
+
+        let join_fn = |v: [u8; 20]| -> u64 {
+            let cd = CallEncoder::<128>::new(selector("joinBroadcast(uint64,address,bytes32)"))
+                .push_u64(sid)
+                .push_address(&v)
+                .push_bytes32(&[v[0]; 32]);
+            decode_u64(&mock::transact_as(v, HUB_ADDR, cd.as_slice()).unwrap())
+        };
+
+        // K=2: v1 (slot 1) & v2 (slot 2) attach to Host (slot 0);
+        //      v3 (slot 3) & v4 (slot 4) attach to v1 (slot 1);
+        //      v5 (slot 5) attaches to v2 (slot 2)!
+        assert_eq!(join_fn(v1), 0);
+        assert_eq!(join_fn(v2), 0);
+        assert_eq!(join_fn(v3), 1);
+        assert_eq!(join_fn(v4), 1);
+        assert_eq!(join_fn(v5), 2);
+
+        // Now v1 (slot 1) disconnects -> v3 calls reparentViewer and attaches to v2 (slot 2, which has 1/2 children)!
+        let lv1 = CallEncoder::<96>::new(selector("leaveBroadcast(uint64,address)"))
+            .push_u64(sid)
+            .push_address(&v1);
+        mock::transact_as(v1, HUB_ADDR, lv1.as_slice()).unwrap();
+
+        let rep3 = CallEncoder::<96>::new(selector("reparentViewer(uint64,address)"))
+            .push_u64(sid)
+            .push_address(&v3);
+        let new_parent = decode_u64(&mock::transact_as(v3, HUB_ADDR, rep3.as_slice()).unwrap());
+        // Host slot 0 had 2 children before v1 left -> after v1 left, slot 0 has 1/2 children, so v3 gets promoted right up to Tier-1 (slot 0)!
+        assert_eq!(new_parent, 0);
+
+        // v4 raises hand, Alice promotes v4 to Stage Speaker (`BCAST_ROLE_SPEAKER = 2`)
+        let hand_cd = CallEncoder::<128>::new(selector("setHandRaised(uint64,address,bool)"))
+            .push_u64(sid)
+            .push_address(&v4)
+            .push_bool(true);
+        mock::transact_as(v4, HUB_ADDR, hand_cd.as_slice()).unwrap();
+
+        let prom_cd = CallEncoder::<160>::new(selector(
+            "setStageRole(uint64,address,address,uint64)",
+        ))
+        .push_u64(sid)
+        .push_address(&ALICE_ID)
+        .push_address(&v4)
+        .push_u64(BCAST_ROLE_SPEAKER as u64);
+        mock::transact_as(ALICE_EOA, HUB_ADDR, prom_cd.as_slice()).unwrap();
+
+        let st_cd = CallEncoder::<64>::new(selector("getBroadcastState(uint64)")).push_u64(sid);
+        let st_raw = decode_abi_bytes(&mock::transact_as(ALICE_EOA, HUB_ADDR, st_cd.as_slice()).unwrap());
+        let meta = BroadcastMeta::decode(&st_raw).unwrap();
+        assert_eq!(meta.active_count, 5); // Host + v2 + v3 + v4 + v5
+        assert_eq!(meta.peak_viewers, 6);
     }
 }
