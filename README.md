@@ -40,7 +40,13 @@ for pkg in identity identity-registry corporate-charter share-capital authorizat
   cargo run --quiet -p cargo-hps -- build -p "$pkg" --out-dir dist
 done
 
-# 3. Run full live Wasmtime E2E suites against isolated `lexicon-node --localtestnet`
+# 3. Package a zero-server App Store release (.wasm + deterministic .html.gz + .manifest.json)
+cargo run --quiet -p cargo-hps -- new my-app --with-ui
+./scripts/build-app-bundle.sh ./my-app
+# -> Produces my-app/dist/my-app.html.gz + my-app/dist/my_app.wasm + my-app/dist/my-app.manifest.json
+#    Upload directly in the SuperLexicon Decentralized App Store (/apps.html?create=1)!
+
+# 4. Run full live Wasmtime E2E suites against isolated `lexicon-node --localtestnet`
 cargo test -p hps-client --test live_governance_e2e -- --ignored --test-threads=1 --nocapture
 cargo test -p hps-client --test superlexicon_pe_e2e -- --ignored --test-threads=1 --nocapture
 ```

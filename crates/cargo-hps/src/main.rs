@@ -1,3 +1,4 @@
+mod bundler;
 mod wasm_opt;
 
 use std::env;
@@ -6,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};
+use bundler::{AppConfigFile, BundleOptions};
 use clap::{Parser, Subcommand};
 use hps_client::abi::{
     encode_call_from_strings, keccak256, try_decode_abi_bytes, try_decode_u256,
@@ -15,14 +17,14 @@ use hps_client::{
 };
 use serde_json::json;
 
-const MAX_LEXICON_BYTECODE_BYTES: usize = 100_000;
+const MAX_LEXICON_BYTECODE_BYTES: usize = 110_000;
 
 #[derive(Parser)]
 #[command(
     name = "cargo-hps",
     bin_name = "cargo hps",
     version,
-    about = "Build, validate, deploy, and invoke Lexicon Wasmtime Haltproof Subroutines (HPS)"
+    about = "Build, bundle (.html.gz + .wasm), validate, deploy, and invoke SuperLexicon Halt-Free Subroutines (HFS/HPS)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -31,13 +33,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Scaffold a new Lexicon WASM Haltproof Subroutine (HPS) project
+    /// Scaffold a new Lexicon WASM Halt-Free Subroutine (HFS) project (optionally with a `ui/` frontend)
     New {
         /// Project / crate name (e.g. my-counter)
         name: String,
         /// Target directory (defaults to ./<name>)
         #[arg(long)]
         path: Option<PathBuf>,
+        /// Also scaffold `ui/` (`index.html`, `styles.css`, `app.js`) + `app.json` for App Store `.html.gz` bundling
+        #[arg(long)]
+        with_ui: bool,
     },
 
     /// Compile an HPS crate to wasm32-unknown-unknown, strip zero-data segments, and validate ABI
@@ -54,6 +59,52 @@ enum Commands {
         /// Keep custom WASM debug/name sections
         #[arg(long)]
         keep_custom_sections: bool,
+    },
+
+    /// Package an App Store release: inline local CSS/JS/assets, audit RF-offline readiness, emit deterministic `<slug>.html.gz` + `<slug>.manifest.json` (and compile `.wasm` unless `--no-wasm`)
+    Bundle {
+        /// Path to `app.json` metadata config (defaults to `./app.json` if present)
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Path to UI HTML entry file (defaults to `app.json` `ui_entry` or `./ui/index.html`)
+        #[arg(long)]
+        ui: Option<PathBuf>,
+        /// Path to Cargo.toml when compiling an accompanying HFS `.wasm`
+        #[arg(long)]
+        manifest_path: Option<PathBuf>,
+        /// Specific Cargo package when building inside a workspace
+        #[arg(short, long)]
+        package: Option<String>,
+        /// Skip compiling a Rust `.wasm` crate (for apps composing existing shared HFS contracts)
+        #[arg(long)]
+        no_wasm: bool,
+        /// Attach an already-compiled `.wasm` file instead of running `cargo build`
+        #[arg(long)]
+        wasm: Option<PathBuf>,
+        /// Output directory for `.html.gz`, `.wasm`, and `.manifest.json`
+        #[arg(short, long, default_value = "dist")]
+        out_dir: PathBuf,
+        /// App Store unique slug (overrides `app.json`)
+        #[arg(long)]
+        slug: Option<String>,
+        /// App Store display title (overrides `app.json`)
+        #[arg(long)]
+        title: Option<String>,
+        /// Semantic version string, e.g. `1.0.0` (overrides `app.json`)
+        #[arg(long)]
+        app_version: Option<String>,
+        /// Directory category ID `1..=6` (`1`=Markets, `2`=Gov/IFRS, `3`=Commerce, `4`=Social/Comms, `5`=Games/VRF, `6`=Utilities)
+        #[arg(long)]
+        category: Option<u16>,
+        /// App emoji or short glyph icon (overrides `app.json`)
+        #[arg(long)]
+        icon: Option<String>,
+        /// Plain-English summary (`<= 240` chars, overrides `app.json`)
+        #[arg(long)]
+        summary: Option<String>,
+        /// Allow external `http(s)://` script/stylesheet/image URLs (not recommended; breaks offline Sub-GHz RF mode)
+        #[arg(long)]
+        allow_external_urls: bool,
     },
 
     /// Execute Lexicon's 2-step HPS deployment (store_bytecode + instantiate) in a single command
@@ -138,13 +189,48 @@ async fn main() -> Result<()> {
     let cli = Cli::parse_from(raw_args);
 
     match cli.command {
-        Commands::New { name, path } => cmd_new(&name, path),
+        Commands::New {
+            name,
+            path,
+            with_ui,
+        } => cmd_new(&name, path, with_ui),
         Commands::Build {
             manifest_path,
             package,
             out_dir,
             keep_custom_sections,
-        } => cmd_build(manifest_path, package, &out_dir, !keep_custom_sections),
+        } => cmd_build(manifest_path, package, &out_dir, !keep_custom_sections).map(|_| ()),
+        Commands::Bundle {
+            config,
+            ui,
+            manifest_path,
+            package,
+            no_wasm,
+            wasm,
+            out_dir,
+            slug,
+            title,
+            app_version,
+            category,
+            icon,
+            summary,
+            allow_external_urls,
+        } => cmd_bundle(
+            config,
+            ui,
+            manifest_path,
+            package,
+            no_wasm,
+            wasm,
+            &out_dir,
+            slug,
+            title,
+            app_version,
+            category,
+            icon,
+            summary,
+            allow_external_urls,
+        ),
         Commands::Deploy {
             wasm_path,
             rpc,
@@ -173,7 +259,7 @@ async fn main() -> Result<()> {
     }
 }
 
-fn cmd_new(name: &str, path: Option<PathBuf>) -> Result<()> {
+fn cmd_new(name: &str, path: Option<PathBuf>, with_ui: bool) -> Result<()> {
     let target_dir = path.unwrap_or_else(|| PathBuf::from(name));
     if target_dir.exists() {
         bail!("target directory '{}' already exists", target_dir.display());
@@ -296,13 +382,30 @@ mod tests {
     fs::write(target_dir.join(".cargo/config.toml"), cargo_config)?;
     fs::write(target_dir.join("src/main.rs"), starter_src)?;
 
-    println!("Scaffolded new Haltproof Subroutine (HPS) at {}", target_dir.display());
+    if with_ui {
+        bundler::scaffold_ui_files(&target_dir, name)?;
+    }
+
+    println!("Scaffolded new Halt-Free Subroutine (HFS) at {}", target_dir.display());
     println!("Next steps:");
     println!("  cd {}", target_dir.display());
     println!("  cargo test                                  # fast native unit tests");
-    println!("  cargo hps build                             # compile & strip WASM");
-    println!("  cargo hps deploy dist/{bin_name}.wasm       # deploy to --localtestnet");
+    if with_ui {
+        let slug = bundler::sanitize_slug(name);
+        println!("  cargo hps bundle                            # compile .wasm + package dist/{slug}.html.gz");
+        println!("  # Upload dist/{slug}.html.gz (+ dist/{bin_name}.wasm) in the SuperLexicon App Store!");
+    } else {
+        println!("  cargo hps build                             # compile & strip WASM");
+        println!("  cargo hps deploy dist/{bin_name}.wasm       # deploy to --localtestnet");
+    }
     Ok(())
+}
+
+struct BuiltWasmArtifact {
+    pkg_name: String,
+    wasm_path: PathBuf,
+    code_hash: String,
+    wasm_bytes_len: usize,
 }
 
 fn cmd_build(
@@ -310,7 +413,7 @@ fn cmd_build(
     package: Option<String>,
     out_dir: &Path,
     strip_custom_sections: bool,
-) -> Result<()> {
+) -> Result<BuiltWasmArtifact> {
     let manifest = manifest_path.unwrap_or_else(|| PathBuf::from("Cargo.toml"));
     if !manifest.exists() {
         bail!("Cargo manifest not found at '{}'", manifest.display());
@@ -373,10 +476,13 @@ fn cmd_build(
         .as_str()
         .ok_or_else(|| anyhow!("missing target name"))?;
     let artifact_stem = raw_target_name.replace('-', "_");
+    let pkg_name_str = selected_pkg["name"]
+        .as_str()
+        .unwrap_or(&artifact_stem)
+        .to_string();
 
     println!(
-        "Compiling HPS `{}` for wasm32-unknown-unknown (release, 2 MiB linear memory)...",
-        selected_pkg["name"].as_str().unwrap_or(&artifact_stem)
+        "Compiling HPS `{pkg_name_str}` for wasm32-unknown-unknown (release, 2 MiB linear memory)..."
     );
 
     let mut build_cmd = Command::new("cargo");
@@ -456,6 +562,148 @@ fn cmd_build(
     );
     println!("  Code Hash  : {code_hash}");
     println!("  Metadata   : {}", out_meta.display());
+    Ok(BuiltWasmArtifact {
+        pkg_name: pkg_name_str,
+        wasm_path: out_wasm,
+        code_hash,
+        wasm_bytes_len: report.optimized_size,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_bundle(
+    config_path: Option<PathBuf>,
+    ui_override: Option<PathBuf>,
+    manifest_path: Option<PathBuf>,
+    package: Option<String>,
+    no_wasm: bool,
+    wasm_override: Option<PathBuf>,
+    out_dir: &Path,
+    slug_override: Option<String>,
+    title_override: Option<String>,
+    version_override: Option<String>,
+    category_override: Option<u16>,
+    icon_override: Option<String>,
+    summary_override: Option<String>,
+    allow_external_urls: bool,
+) -> Result<()> {
+    let cfg_file = config_path.unwrap_or_else(|| PathBuf::from("app.json"));
+    let cfg: AppConfigFile = if cfg_file.exists() {
+        let raw = fs::read_to_string(&cfg_file)
+            .with_context(|| format!("failed to read '{}'", cfg_file.display()))?;
+        serde_json::from_str(&raw)
+            .with_context(|| format!("invalid JSON in '{}'", cfg_file.display()))?
+    } else {
+        AppConfigFile::default()
+    };
+    let cfg_base = cfg_file.parent().unwrap_or_else(|| Path::new("."));
+
+    // 1. Resolve or compile optional `.wasm` HFS artifact
+    let (wasm_artifact, wasm_code_hash, wasm_bytes_len, inferred_name) = if no_wasm {
+        (None, None, None, None)
+    } else if let Some(wasm_file) = wasm_override {
+        let bytes = fs::read(&wasm_file)
+            .with_context(|| format!("cannot read `--wasm` file '{}'", wasm_file.display()))?;
+        let (_, report) = wasm_opt::optimize_and_validate_wasm(&bytes, false)
+            .context("WASM validation failed on `--wasm` artifact")?;
+        let hash = format!("0x{}", hex::encode(keccak256(&bytes)));
+        let stem = wasm_file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string());
+        (Some(wasm_file), Some(hash), Some(report.raw_size), stem)
+    } else {
+        let default_cargo = PathBuf::from("Cargo.toml");
+        if manifest_path.is_some() || default_cargo.exists() {
+            let built = cmd_build(manifest_path, package, out_dir, true)?;
+            (
+                Some(built.wasm_path),
+                Some(built.code_hash),
+                Some(built.wasm_bytes_len),
+                Some(built.pkg_name),
+            )
+        } else {
+            (None, None, None, None)
+        }
+    };
+
+    // 2. Resolve UI entry HTML path
+    let ui_entry = if let Some(u) = ui_override {
+        u
+    } else if let Some(rel) = cfg.ui_entry {
+        cfg_base.join(rel)
+    } else {
+        PathBuf::from("ui/index.html")
+    };
+    if !ui_entry.exists() {
+        bail!(
+            "UI entry HTML not found at '{}'. Pass `--ui <path/to/index.html>` or scaffold with `cargo hps new <name> --with-ui`.",
+            ui_entry.display()
+        );
+    }
+
+    let fallback_slug = inferred_name
+        .or_else(|| {
+            ui_entry
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str())
+                .filter(|s| *s != "ui")
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "my-hfs-app".to_string());
+
+    let slug = slug_override
+        .or(cfg.slug)
+        .unwrap_or_else(|| bundler::sanitize_slug(&fallback_slug));
+    let title = title_override
+        .or(cfg.title)
+        .unwrap_or_else(|| slug.replace('-', " "));
+    let version = version_override
+        .or(cfg.version)
+        .unwrap_or_else(|| "1.0.0".to_string());
+    let category = category_override.or(cfg.category).unwrap_or(6);
+    let icon = icon_override
+        .or(cfg.icon)
+        .unwrap_or_else(|| "⚡".to_string());
+    let summary = summary_override.or(cfg.summary).unwrap_or_else(|| {
+        "Zero-server SuperLexicon application packaged with deterministic .html.gz UI.".to_string()
+    });
+
+    let out = bundler::create_app_bundle(&BundleOptions {
+        ui_entry,
+        out_dir: out_dir.to_path_buf(),
+        slug,
+        title,
+        version,
+        category,
+        icon,
+        summary,
+        wasm_artifact,
+        wasm_code_hash,
+        wasm_bytes_len,
+        allow_external_urls,
+    })?;
+
+    println!("\nApp Store Bundle Ready:");
+    println!("  App Slug     : {} (v{})", out.slug, out.version);
+    println!("  UI Archive   : {} ({:.1} KiB gzip from {:.1} KiB HTML, {} chunk{})",
+        out.ui_archive,
+        out.compressed_bytes as f64 / 1024.0,
+        out.uncompressed_bytes as f64 / 1024.0,
+        out.chunk_count,
+        if out.chunk_count == 1 { "" } else { "s" }
+    );
+    println!("  uiHash       : {}", out.ui_hash);
+    println!("  RF Offline   : {}", if out.rf_offline_ready { "YES (0 external runtime URLs)" } else { "WARN (external URLs allowed)" });
+    if let Some(ref w) = out.wasm_artifact {
+        println!("  HFS WASM     : {} ({:.1} KiB)", w, out.wasm_bytes as f64 / 1024.0);
+        println!("  wasmCodeHash : {}", out.wasm_code_hash);
+    }
+    println!(
+        "  Manifest     : {}",
+        out_dir.join(format!("{}.manifest.json", out.slug)).display()
+    );
     Ok(())
 }
 

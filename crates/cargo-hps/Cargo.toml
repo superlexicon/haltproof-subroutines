@@ -13,6 +13,7 @@ path = "src/main.rs"
 anyhow = "1.0"
 clap = { version = "4.4", features = ["derive", "env"] }
 ethereum-types = "0.14"
+flate2 = "1.0"
 hex = "0.4"
 hps-client = { path = "../hps-client" }
 serde = { version = "1.0", features = ["derive"] }
