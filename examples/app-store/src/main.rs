@@ -1,29 +1,14 @@
-//! On-Chain HFS App Store & Content-Addressed UI Bundle Registry (`app-store`, HPS #27).
+//! On-Chain HFS App Store & Hash-Pointer Catalog (`app-store`, HPS #27).
 //!
-//! Enables developers and users to publish complete `(HFS .wasm + Compressed HTML/CSS/JS UI)`
-//! applications on Subnet 1 and run them from a single Host Shell (`/apps.html` or thin host stubs)
-//! without redeploying the web client:
-//!
-//! 1. **Content-Addressed UI Bundle Store (`uiHash = keccak256(compressedPayload)`)**:
-//!    - Accepts `1..=8` chunks of up to `32,768` bytes (`256 KiB` compressed ≈ `1.2+ MB` raw UI).
-//!    - Upon receiving the final chunk, reassembles the payload in linear memory and enforces
-//!      `keccak256(payload) == expectedUiHash` (`ERR_BUNDLE_HASH_MISMATCH = -34`).
-//!    - Once sealed, a `uiHash` bundle is immutable forever and deduplicated across any number of
-//!      HFS instances or app versions, and retrievable in a single `eth_call` (`getBundle(bytes32)`).
-//!
-//! 2. **Identity-Verified Permissionless App Catalog & Version History**:
-//!    - Anyone can publish a new `slugId` (`bytes32`) bound to their `Identity` HFS (verified via
-//!      `msg_sender == publisherIdentity` or `Identity.owner() / isOwnerDevice()`).
-//!    - Subsequent updates to an existing `slugId` are restricted strictly to its owning publisher,
-//!      incrementing `releaseCount` while preserving immutable `uiHash` content addressing.
-//!    - Security invariant: Third-party publishers default to `EXEC_MODE_SANDBOX_IFRAME (0)`
-//!      (opaque-origin `<iframe sandbox="allow-scripts allow-forms">`); only `admin()` can mark
-//!      an app as `EXEC_MODE_VERIFIED_HOST (1)`.
-//!
-//! 3. **Instance-to-UI Resolution (`resolveInstance(address)`)**:
-//!    - Maps deployed HFS instance addresses (`defaultHfsAddr` or user-spawned instances via
-//!      `registerAppInstance`) back to `(appId, uiHash, wasmCodeHash, execMode)` so any `0x…` HFS
-//!      address resolves its exact matching UI automatically.
+//! Mirrors Lexicon's content-addressed Haltproof Subroutine deployment architecture:
+//! - Compiled `.wasm` subroutines live in L1 `BYTECODE_STORE_ADDRESS` (`0x000...0100`) and are
+//!   fetched via `slx_getBytecode(codeHash)`.
+//! - Compressed `.html.gz` UI bundles live in L1 `UI_BUNDLE_STORE_ADDRESS` (`0x000...0101`) and are
+//!   fetched via `slx_getUiBundle(uiHash)` — ZERO UI bundle code is ever stored inside smart-contract
+//!   `StorageTree` slots!
+//! - `app_store.wasm` stores **strictly 32-byte hash pointers** (`uiHash`, `wasmCodeHash`) +
+//!   compact app metadata, verifying via host lookup against `0x0101` that `uiHash` is sealed in
+//!   `ConsensusStorage` before accepting `publishApp` or `bindInstanceUi`.
 
 #![cfg_attr(target_arch = "wasm32", no_std)]
 #![cfg_attr(target_arch = "wasm32", no_main)]
@@ -31,11 +16,10 @@
 use hps_sdk::abi::CalldataReader;
 use hps_sdk::call::{self, CallEncoder};
 use hps_sdk::governance::SUBGROUP_DEVELOPERS;
-use hps_sdk::keccak::keccak256;
 use hps_sdk::storage::KeyBuilder;
 use hps_sdk::{context, event_topic, events, hps_entry, ret, selector, storage};
 
-pub const APP_STORE_ABI_VERSION: u64 = 2;
+pub const APP_STORE_ABI_VERSION: u64 = 3;
 
 pub const STATUS_ACTIVE: u8 = 1;
 pub const STATUS_ARCHIVED: u8 = 2;
@@ -43,12 +27,14 @@ pub const STATUS_ARCHIVED: u8 = 2;
 pub const EXEC_MODE_SANDBOX_IFRAME: u8 = 0;
 pub const EXEC_MODE_VERIFIED_HOST: u8 = 1;
 
-pub const ENCODING_RAW_UTF8: u64 = 0;
-pub const ENCODING_GZIP: u64 = 1;
-
-pub const MAX_CHUNK_BYTES: usize = 32_768;
-pub const MAX_CHUNKS_PER_BUNDLE: u64 = 8;
-pub const MAX_BUNDLE_BYTES: usize = MAX_CHUNK_BYTES * (MAX_CHUNKS_PER_BUNDLE as usize); // 262,144 B
+/// L1 native content-addressed `.wasm` bytecode store (`0x0000000000000000000000000000000000000100`).
+pub const BYTECODE_STORE_ADDR: [u8; 20] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
+];
+/// L1 native content-addressed `.html.gz` UI bundle store (`0x0000000000000000000000000000000000000101`).
+pub const UI_BUNDLE_STORE_ADDR: [u8; 20] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1,
+];
 
 pub const MAX_TITLE_LEN: usize = 64;
 pub const MAX_SUMMARY_LEN: usize = 240;
@@ -77,8 +63,6 @@ pub const ERR_NOT_ADMIN: i32 = -12;
 pub const ERR_UNAUTHORIZED_PUBLISHER: i32 = -14;
 pub const ERR_SLUG_OWNED_BY_OTHER: i32 = -15;
 pub const ERR_NOT_AUTHORIZED_DEVELOPER: i32 = -16;
-pub const ERR_INVALID_CHUNK_PARAMS: i32 = -33;
-pub const ERR_BUNDLE_HASH_MISMATCH: i32 = -34;
 pub const ERR_BUNDLE_NOT_SEALED: i32 = -35;
 pub const ERR_WASM_HASH_MISMATCH: i32 = -36;
 pub const ERR_APP_NOT_FOUND: i32 = -37;
@@ -98,15 +82,12 @@ const SEL_CHR_IS_DEV_ACTOR: [u8; 4] = selector("isSubgroupAuthorizedActor(bytes3
 const EV_INITIALIZED: [u8; 32] = event_topic("AppStoreInitialized(address)");
 const EV_DEV_GATE_UPDATED: [u8; 32] =
     event_topic("AuthorizedPublisherGroupUpdated(address,bytes32)");
-const EV_BUNDLE_SEALED: [u8; 32] =
-    event_topic("UiBundleSealed(bytes32,address,uint64,uint64,uint64)");
 const EV_APP_PUBLISHED: [u8; 32] =
     event_topic("AppPublished(uint64,bytes32,address,bytes32,uint64)");
 const EV_INSTANCE_REGISTERED: [u8; 32] =
     event_topic("AppInstanceRegistered(uint64,address,address)");
 
 const SLICE_OUT_CAP: usize = 16 + (MAX_SLICE_APPS as usize) * MAX_APP_REC_BYTES;
-static mut BUNDLE_SCRATCH: [u8; MAX_BUNDLE_BYTES] = [0u8; MAX_BUNDLE_BYTES];
 static mut SLICE_OUT_SCRATCH: [u8; SLICE_OUT_CAP] = [0u8; SLICE_OUT_CAP];
 
 hps_entry! {
@@ -118,11 +99,8 @@ hps_entry! {
     "abiVersion()"                                                                                             => handle_abi_version,
     "admin()"                                                                                                  => handle_admin,
     "rotateAdmin(address)"                                                                                     => handle_rotate_admin,
-    "uploadBundleChunk(bytes32,uint64,uint64,uint64,uint64,bytes)"                                             => handle_upload_bundle_chunk,
     "hasBundle(bytes32)"                                                                                       => handle_has_bundle,
-    "getBundleInfo(bytes32)"                                                                                   => handle_get_bundle_info,
-    "getBundleChunk(bytes32,uint64)"                                                                           => handle_get_bundle_chunk,
-    "getBundle(bytes32)"                                                                                       => handle_get_bundle,
+    "getBundleSize(bytes32)"                                                                                   => handle_get_bundle_size,
     "publishApp(bytes32,address,bytes32,address,bytes32,uint64,uint64,string,string,string,string)"            => handle_publish_app,
     "setAppStatus(uint64,uint64,uint64)"                                                                       => handle_set_app_status,
     "registerAppInstance(uint64,address,address,string)"                                                       => handle_register_app_instance,
@@ -213,20 +191,8 @@ fn can_actor_publish(actor: &[u8; 20]) -> bool {
     matches!(call::call_bool(&dev_chr, mem_cd.as_slice()), Ok(true))
 }
 
-fn bundle_meta_key(ui_hash: &[u8; 32]) -> KeyBuilder<64> {
-    KeyBuilder::<64>::new().push(b"bm:").push(ui_hash)
-}
-
-fn bundle_mask_key(ui_hash: &[u8; 32]) -> KeyBuilder<64> {
-    KeyBuilder::<64>::new().push(b"bk:").push(ui_hash)
-}
-
-fn bundle_chunk_key(ui_hash: &[u8; 32], idx: u64) -> KeyBuilder<72> {
-    KeyBuilder::<72>::new()
-        .push(b"bc:")
-        .push(ui_hash)
-        .push(b":")
-        .push_u64_be(idx)
+fn seen_ui_key(ui_hash: &[u8; 32]) -> KeyBuilder<64> {
+    KeyBuilder::<64>::new().push(b"sui:").push(ui_hash)
 }
 
 fn app_rec_key(app_id: u64) -> KeyBuilder<32> {
@@ -253,58 +219,29 @@ fn app_inst_item_key(app_id: u64, idx: u64) -> KeyBuilder<48> {
         .push_u64_be(idx)
 }
 
-/// Bundle metadata layout (`61 bytes`):
-/// `[sealed:1][total_chunks:8][compressed_len:8][uncompressed_len:8][encoding:8][uploader:20][sealed_blk:8]`
-struct BundleMeta {
-    sealed: u8,
-    total_chunks: u64,
-    compressed_len: u64,
-    uncompressed_len: u64,
-    encoding: u64,
-    uploader: [u8; 20],
-    sealed_blk: u64,
-}
-
-fn read_bundle_meta(ui_hash: &[u8; 32]) -> Option<BundleMeta> {
-    let mut buf = [0u8; 61];
-    let n = storage::get_into(bundle_meta_key(ui_hash).as_slice(), &mut buf)?;
-    if n < 61 {
-        return None;
+/// Queries the L1 `UI_BUNDLE_STORE_ADDR` (`0x000...0101`) sentinel for the byte size of `ui_hash`.
+/// Returns `0` if `ui_hash` has not been verified and stored in `ConsensusStorage`.
+fn query_ui_bundle_size(ui_hash: &[u8; 32]) -> u64 {
+    if *ui_hash == [0u8; 32] {
+        return 0;
     }
-    let mut b8 = [0u8; 8];
-    b8.copy_from_slice(&buf[1..9]);
-    let total_chunks = u64::from_be_bytes(b8);
-    b8.copy_from_slice(&buf[9..17]);
-    let compressed_len = u64::from_be_bytes(b8);
-    b8.copy_from_slice(&buf[17..25]);
-    let uncompressed_len = u64::from_be_bytes(b8);
-    b8.copy_from_slice(&buf[25..33]);
-    let encoding = u64::from_be_bytes(b8);
-    let mut uploader = [0u8; 20];
-    uploader.copy_from_slice(&buf[33..53]);
-    b8.copy_from_slice(&buf[53..61]);
-    let sealed_blk = u64::from_be_bytes(b8);
-    Some(BundleMeta {
-        sealed: buf[0],
-        total_chunks,
-        compressed_len,
-        uncompressed_len,
-        encoding,
-        uploader,
-        sealed_blk,
-    })
+    if let Ok(raw) = call::call_raw(&UI_BUNDLE_STORE_ADDR, ui_hash) {
+        if raw.len() >= 32 {
+            let mut b8 = [0u8; 8];
+            b8.copy_from_slice(&raw[24..32]);
+            return u64::from_be_bytes(b8);
+        }
+    }
+    0
 }
 
-fn write_bundle_meta(ui_hash: &[u8; 32], m: &BundleMeta) {
-    let mut buf = [0u8; 61];
-    buf[0] = m.sealed;
-    buf[1..9].copy_from_slice(&m.total_chunks.to_be_bytes());
-    buf[9..17].copy_from_slice(&m.compressed_len.to_be_bytes());
-    buf[17..25].copy_from_slice(&m.uncompressed_len.to_be_bytes());
-    buf[25..33].copy_from_slice(&m.encoding.to_be_bytes());
-    buf[33..53].copy_from_slice(&m.uploader);
-    buf[53..61].copy_from_slice(&m.sealed_blk.to_be_bytes());
-    storage::set(bundle_meta_key(ui_hash).as_slice(), &buf);
+fn record_referenced_ui_hash(ui_hash: &[u8; 32]) {
+    let k = seen_ui_key(ui_hash);
+    if storage::get_u64(k.as_slice()) == 0 {
+        storage::set_u64(k.as_slice(), 1);
+        let cnt = storage::get_u64(KEY_TOTAL_BUNDLES) + 1;
+        storage::set_u64(KEY_TOTAL_BUNDLES, cnt);
+    }
 }
 
 fn handle_initialize(r: &CalldataReader) -> Result<(), i32> {
@@ -402,169 +339,15 @@ fn handle_rotate_admin(r: &CalldataReader) -> Result<(), i32> {
     Ok(())
 }
 
-fn handle_upload_bundle_chunk(r: &CalldataReader) -> Result<(), i32> {
-    let caller = context::msg_sender();
-    if !can_actor_publish(&caller) {
-        return Err(ERR_NOT_AUTHORIZED_DEVELOPER);
-    }
-    let ui_hash = r.bytes32(0).ok_or(ERR_BAD_ARGS)?;
-    let chunk_idx = r.u64(1).ok_or(ERR_BAD_ARGS)?;
-    let total_chunks = r.u64(2).ok_or(ERR_BAD_ARGS)?;
-    let encoding = r.u64(3).ok_or(ERR_BAD_ARGS)?;
-    let uncompressed_len = r.u64(4).ok_or(ERR_BAD_ARGS)?;
-    let chunk_data = r.dynamic_bytes(5).ok_or(ERR_BAD_ARGS)?;
-
-    if ui_hash == [0u8; 32]
-        || total_chunks == 0
-        || total_chunks > MAX_CHUNKS_PER_BUNDLE
-        || chunk_idx >= total_chunks
-        || chunk_data.is_empty()
-        || chunk_data.len() > MAX_CHUNK_BYTES
-    {
-        return Err(ERR_INVALID_CHUNK_PARAMS);
-    }
-
-    if let Some(existing) = read_bundle_meta(&ui_hash) {
-        if existing.sealed == 1 {
-            // Already verified & sealed — idempotent success!
-            ret::write_bool(true);
-            return Ok(());
-        }
-        if existing.total_chunks != total_chunks {
-            return Err(ERR_INVALID_CHUNK_PARAMS);
-        }
-    } else {
-        write_bundle_meta(
-            &ui_hash,
-            &BundleMeta {
-                sealed: 0,
-                total_chunks,
-                compressed_len: 0,
-                uncompressed_len,
-                encoding,
-                uploader: context::msg_sender(),
-                sealed_blk: 0,
-            },
-        );
-    }
-
-    storage::set(bundle_chunk_key(&ui_hash, chunk_idx).as_slice(), chunk_data);
-
-    let prev_mask = storage::get_u64(bundle_mask_key(&ui_hash).as_slice());
-    let next_mask = prev_mask | (1u64 << chunk_idx);
-    storage::set_u64(bundle_mask_key(&ui_hash).as_slice(), next_mask);
-
-    let full_mask = (1u64 << total_chunks) - 1;
-    if next_mask == full_mask {
-        // Reassemble all chunks in BUNDLE_SCRATCH and verify keccak256 == ui_hash!
-        let total_len = unsafe {
-            let mut pos = 0usize;
-            let mut i = 0u64;
-            while i < total_chunks {
-                let ck = bundle_chunk_key(&ui_hash, i);
-                let avail = MAX_BUNDLE_BYTES.saturating_sub(pos);
-                let n = storage::get_into(ck.as_slice(), &mut BUNDLE_SCRATCH[pos..pos + avail])
-                    .ok_or(ERR_INVALID_CHUNK_PARAMS)?;
-                if pos + n > MAX_BUNDLE_BYTES {
-                    return Err(ERR_INVALID_CHUNK_PARAMS);
-                }
-                pos += n;
-                i += 1;
-            }
-            let actual_hash = keccak256(&BUNDLE_SCRATCH[..pos]);
-            if actual_hash != ui_hash {
-                return Err(ERR_BUNDLE_HASH_MISMATCH);
-            }
-            pos as u64
-        };
-
-        let caller = context::msg_sender();
-        let blk = context::block_number();
-        write_bundle_meta(
-            &ui_hash,
-            &BundleMeta {
-                sealed: 1,
-                total_chunks,
-                compressed_len: total_len,
-                uncompressed_len: if uncompressed_len > 0 {
-                    uncompressed_len
-                } else {
-                    total_len
-                },
-                encoding,
-                uploader: caller,
-                sealed_blk: blk,
-            },
-        );
-        let cnt = storage::get_u64(KEY_TOTAL_BUNDLES) + 1;
-        storage::set_u64(KEY_TOTAL_BUNDLES, cnt);
-
-        let mut ev_data = [0u8; 96];
-        ev_data[24..32].copy_from_slice(&total_len.to_be_bytes());
-        ev_data[56..64].copy_from_slice(&total_chunks.to_be_bytes());
-        ev_data[88..96].copy_from_slice(&encoding.to_be_bytes());
-        events::emit(&[EV_BUNDLE_SEALED, ui_hash, addr_topic(&caller)], &ev_data);
-    }
-
-    ret::write_bool(true);
-    Ok(())
-}
-
 fn handle_has_bundle(r: &CalldataReader) -> Result<(), i32> {
     let ui_hash = r.bytes32(0).ok_or(ERR_BAD_ARGS)?;
-    let sealed = read_bundle_meta(&ui_hash).map(|m| m.sealed == 1).unwrap_or(false);
-    ret::write_bool(sealed);
+    ret::write_bool(query_ui_bundle_size(&ui_hash) > 0);
     Ok(())
 }
 
-fn handle_get_bundle_info(r: &CalldataReader) -> Result<(), i32> {
+fn handle_get_bundle_size(r: &CalldataReader) -> Result<(), i32> {
     let ui_hash = r.bytes32(0).ok_or(ERR_BAD_ARGS)?;
-    let mut out = [0u8; 192];
-    if let Some(m) = read_bundle_meta(&ui_hash) {
-        out[24..32].copy_from_slice(&(m.sealed as u64).to_be_bytes());
-        out[56..64].copy_from_slice(&m.total_chunks.to_be_bytes());
-        out[88..96].copy_from_slice(&m.compressed_len.to_be_bytes());
-        out[120..128].copy_from_slice(&m.uncompressed_len.to_be_bytes());
-        out[152..160].copy_from_slice(&m.encoding.to_be_bytes());
-        out[172..192].copy_from_slice(&m.uploader);
-    }
-    ret::write(&out);
-    Ok(())
-}
-
-fn handle_get_bundle_chunk(r: &CalldataReader) -> Result<(), i32> {
-    let ui_hash = r.bytes32(0).ok_or(ERR_BAD_ARGS)?;
-    let chunk_idx = r.u64(1).ok_or(ERR_BAD_ARGS)?;
-    if let Some(slice) = storage::get_ref(bundle_chunk_key(&ui_hash, chunk_idx).as_slice()) {
-        ret::write(slice);
-    } else {
-        ret::write(&[]);
-    }
-    Ok(())
-}
-
-fn handle_get_bundle(r: &CalldataReader) -> Result<(), i32> {
-    let ui_hash = r.bytes32(0).ok_or(ERR_BAD_ARGS)?;
-    let meta = match read_bundle_meta(&ui_hash) {
-        Some(m) if m.sealed == 1 => m,
-        _ => {
-            ret::write(&[]);
-            return Ok(());
-        }
-    };
-    unsafe {
-        let mut pos = 0usize;
-        let mut i = 0u64;
-        while i < meta.total_chunks {
-            let ck = bundle_chunk_key(&ui_hash, i);
-            let avail = MAX_BUNDLE_BYTES.saturating_sub(pos);
-            let n = storage::get_into(ck.as_slice(), &mut BUNDLE_SCRATCH[pos..pos + avail])
-                .unwrap_or(0);
-            pos += n;
-            i += 1;
-        }
-        ret::write(&BUNDLE_SCRATCH[..pos]);
-    }
+    ret::write_u64_word(query_ui_bundle_size(&ui_hash));
     Ok(())
 }
 
@@ -597,9 +380,8 @@ fn handle_publish_app(r: &CalldataReader) -> Result<(), i32> {
         return Err(ERR_BAD_ARGS);
     }
 
-    // UI bundle MUST already be uploaded & keccak256-sealed on-chain!
-    let bmeta = read_bundle_meta(&ui_hash).ok_or(ERR_BUNDLE_NOT_SEALED)?;
-    if bmeta.sealed != 1 {
+    // UI bundle MUST already be stored & keccak256-verified at L1 UI_BUNDLE_STORE_ADDR (0x0101)!
+    if query_ui_bundle_size(&ui_hash) == 0 {
         return Err(ERR_BUNDLE_NOT_SEALED);
     }
 
@@ -695,6 +477,7 @@ fn handle_publish_app(r: &CalldataReader) -> Result<(), i32> {
     pos += v_len;
 
     storage::set(app_rec_key(app_id).as_slice(), &rec[..pos]);
+    record_referenced_ui_hash(&ui_hash);
     bind_instance_internal(&default_hfs_addr, app_id, &ui_hash, &wasm_code_hash, exec_mode);
 
     let mut ev_data = [0u8; 64];
@@ -829,10 +612,10 @@ fn handle_bind_instance_ui(r: &CalldataReader) -> Result<(), i32> {
     if inst_addr == [0u8; 20] {
         return Err(ERR_BAD_ARGS);
     }
-    let bmeta = read_bundle_meta(&ui_hash).ok_or(ERR_BUNDLE_NOT_SEALED)?;
-    if bmeta.sealed != 1 {
+    if query_ui_bundle_size(&ui_hash) == 0 {
         return Err(ERR_BUNDLE_NOT_SEALED);
     }
+    record_referenced_ui_hash(&ui_hash);
     let mut app_rec = [0u8; MAX_APP_REC_BYTES];
     let n = storage::get_into(app_rec_key(app_id).as_slice(), &mut app_rec).ok_or(ERR_APP_NOT_FOUND)?;
     if n < APP_REC_HDR {
@@ -960,38 +743,8 @@ fn handle_resolve_instance(r: &CalldataReader) -> Result<(), i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hps_sdk::keccak::keccak256;
     use hps_sdk::mock;
-
-    fn encode_upload_chunk(
-        ui_hash: [u8; 32],
-        chunk_idx: u64,
-        total_chunks: u64,
-        encoding: u64,
-        uncompressed_len: u64,
-        data: &[u8],
-    ) -> Vec<u8> {
-        let mut cd = Vec::new();
-        cd.extend_from_slice(&selector(
-            "uploadBundleChunk(bytes32,uint64,uint64,uint64,uint64,bytes)",
-        ));
-        cd.extend_from_slice(&ui_hash);
-        let push_u64 = |v: &mut Vec<u8>, n: u64| {
-            let mut w = [0u8; 32];
-            w[24..32].copy_from_slice(&n.to_be_bytes());
-            v.extend_from_slice(&w);
-        };
-        push_u64(&mut cd, chunk_idx);
-        push_u64(&mut cd, total_chunks);
-        push_u64(&mut cd, encoding);
-        push_u64(&mut cd, uncompressed_len);
-        push_u64(&mut cd, 6 * 32); // dynamic offset
-        push_u64(&mut cd, data.len() as u64);
-        cd.extend_from_slice(data);
-        while cd.len() % 32 != 4 {
-            cd.push(0);
-        }
-        cd
-    }
 
     fn encode_publish_app(
         slug_id: [u8; 32],
@@ -1052,7 +805,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_chunk_bundle_keccak_verification_and_app_lifecycle() {
+    fn hash_pointer_bundle_verification_and_app_lifecycle() {
         mock::reset();
         let store_addr = [0xAA; 20];
         let admin = [0x01; 20];
@@ -1061,39 +814,58 @@ mod tests {
         let hfs_inst = [0x77; 20];
         let wasm_hash = [0x55; 32];
 
+        const FULL_UI: &[u8] =
+            b"<!DOCTYPE html><html><body><h1>Mesh Poll v1</h1><script>window.slx</script></body></html>";
+        const EXPECTED_HASH: [u8; 32] = keccak256(FULL_UI);
+        let expected_hash = EXPECTED_HASH;
+        let unstored_hash = [0x99; 32];
+        let expected_len = FULL_UI.len() as u64;
+
         mock::register_hps(store_addr, dispatch_calldata);
+        mock::register_hps(UI_BUNDLE_STORE_ADDR, |raw| {
+            if raw.len() == 32 && raw == EXPECTED_HASH {
+                ret::write_u64_word(FULL_UI.len() as u64);
+            } else {
+                ret::write_u64_word(0);
+            }
+            0
+        });
         mock::set_code_hash(hfs_inst, wasm_hash);
         mock::set_block_number(420);
 
         let init_cd = CallEncoder::<64>::new(selector("initialize(address)")).push_address(&admin);
         mock::transact_as(admin, store_addr, init_cd.as_slice()).expect("init");
 
-        // Build 2-chunk UI bundle and verify wrong hash reverts
-        let full_ui = b"<!DOCTYPE html><html><body><h1>Mesh Poll v1</h1><script>window.slx</script></body></html>";
-        let expected_hash = keccak256(full_ui);
-        let wrong_hash = [0x99; 32];
-
-        let bad_cd = encode_upload_chunk(wrong_hash, 0, 1, ENCODING_GZIP, 256, full_ui);
+        // Publishing with an unstored ui_hash reverts with ERR_BUNDLE_NOT_SEALED (-35)
+        let slug = keccak256(b"mesh-poll");
+        let bad_pub_cd = encode_publish_app(
+            slug,
+            [0u8; 20],
+            wasm_hash,
+            hfs_inst,
+            unstored_hash,
+            2,
+            1,
+            "Mesh Poll",
+            "Off-grid community governance poll",
+            "🗳️",
+            "1.0.0",
+        );
         assert_eq!(
-            mock::transact_as(alice, store_addr, &bad_cd),
-            Err(ERR_BUNDLE_HASH_MISMATCH)
+            mock::transact_as(alice, store_addr, &bad_pub_cd),
+            Err(ERR_BUNDLE_NOT_SEALED)
         );
 
-        // Upload as 2 valid chunks (out of order: chunk 1 then chunk 0!)
-        let mid = full_ui.len() / 2;
-        let c1 = encode_upload_chunk(expected_hash, 1, 2, ENCODING_GZIP, 256, &full_ui[mid..]);
-        let c0 = encode_upload_chunk(expected_hash, 0, 2, ENCODING_GZIP, 256, &full_ui[..mid]);
-        mock::transact_as(alice, store_addr, &c1).expect("chunk 1");
-        mock::transact_as(alice, store_addr, &c0).expect("chunk 0 seals bundle");
+        // hasBundle & getBundleSize reflect L1 UI_BUNDLE_STORE_ADDR (0x0101)
+        let hb_cd = CallEncoder::<64>::new(selector("hasBundle(bytes32)")).push_bytes32(&expected_hash);
+        assert_eq!(mock::transact_as(alice, store_addr, hb_cd.as_slice()).unwrap()[31], 1);
+        let sz_cd = CallEncoder::<64>::new(selector("getBundleSize(bytes32)")).push_bytes32(&expected_hash);
+        assert_eq!(
+            mock::transact_as(alice, store_addr, sz_cd.as_slice()).unwrap()[31],
+            expected_len as u8
+        );
 
-        // Single-call getBundle returns exact bytes
-        let gb_cd =
-            CallEncoder::<64>::new(selector("getBundle(bytes32)")).push_bytes32(&expected_hash);
-        let fetched = mock::transact_as(alice, store_addr, gb_cd.as_slice()).expect("getBundle");
-        assert_eq!(fetched.as_slice(), full_ui);
-
-        // Alice publishes app (requests exec_mode=1, downgraded to 0 SANDBOX_IFRAME since Alice != admin)
-        let slug = keccak256(b"mesh-poll");
+        // Alice publishes app referencing expected_hash (downgraded to SANDBOX_IFRAME since Alice != admin)
         let pub_cd = encode_publish_app(
             slug,
             [0u8; 20],
@@ -1127,7 +899,7 @@ mod tests {
     }
 
     #[test]
-    fn enforces_superlexicon_developers_social_subgroup_gate_on_bundle_upload_and_publish() {
+    fn enforces_superlexicon_developers_social_subgroup_gate_on_publish() {
         mock::reset();
         let store_addr = [0xAA; 20];
         let slx_charter = [0x51; 20];
@@ -1137,7 +909,15 @@ mod tests {
         let hfs_inst = [0x77; 20];
         let wasm_hash = [0x55; 32];
 
+        const DEV_UI: &[u8] = b"<html><body>SLX Approved Dev App</body></html>";
+        const DEV_UI_HASH: [u8; 32] = keccak256(DEV_UI);
+        let ui_hash = DEV_UI_HASH;
+
         mock::register_hps(store_addr, dispatch_calldata);
+        mock::register_hps(UI_BUNDLE_STORE_ADDR, |raw| {
+            ret::write_u64_word(if raw == DEV_UI_HASH { DEV_UI.len() as u64 } else { 0 });
+            0
+        });
         mock::set_code_hash(hfs_inst, wasm_hash);
 
         mock::register_hps(slx_charter, |raw| {
@@ -1164,32 +944,6 @@ mod tests {
         .push_bytes32(&SUBGROUP_DEVELOPERS);
         mock::transact_as(admin, store_addr, init_cd.as_slice()).expect("init gated store");
 
-        // Verify canPublish(stranger) == false, canPublish(approved_dev) == true
-        let q_stranger =
-            CallEncoder::<64>::new(selector("canPublish(address)")).push_address(&stranger);
-        assert_eq!(
-            mock::transact_as(stranger, store_addr, q_stranger.as_slice()).unwrap()[31],
-            0
-        );
-        let q_dev =
-            CallEncoder::<64>::new(selector("canPublish(address)")).push_address(&approved_dev);
-        assert_eq!(
-            mock::transact_as(approved_dev, store_addr, q_dev.as_slice()).unwrap()[31],
-            1
-        );
-
-        let ui = b"<html><body>SLX Approved Dev App</body></html>";
-        let ui_hash = keccak256(ui);
-        let up_cd = encode_upload_chunk(ui_hash, 0, 1, ENCODING_GZIP, 128, ui);
-
-        // Stranger outside Superlexicon · Developers is blocked (-16)
-        assert_eq!(
-            mock::transact_as(stranger, store_addr, &up_cd),
-            Err(ERR_NOT_AUTHORIZED_DEVELOPER)
-        );
-
-        // Approved Superlexicon · Developers member uploads & publishes cleanly
-        mock::transact_as(approved_dev, store_addr, &up_cd).expect("dev bundle upload");
         let slug = keccak256(b"slx-dev-tool");
         let pub_cd = encode_publish_app(
             slug,

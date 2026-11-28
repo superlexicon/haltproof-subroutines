@@ -30,6 +30,15 @@ pub const BYTECODE_STORE_ADDRESS: H160 = H160([
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
 ]);
 
+/// Sentinel address (`0x0000000000000000000000000000000000000101`) where compressed
+/// `.html.gz` UI bundles are stored natively in `ConsensusStorage` by `ui_hash = keccak256(gz)`.
+pub const UI_BUNDLE_STORE_ADDRESS: H160 = H160([
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1,
+]);
+
+pub const UI_BUNDLE_MULTIPART_MAGIC: [u8; 6] = *b"SLXUI\x01";
+pub const UI_BUNDLE_RADIO_SAFE_PART_BYTES: usize = 40_960;
+
 /// Compute deterministic Haltproof Subroutine (HPS) address from `(sender, nonce)`.
 pub fn compute_hps_address(sender: H160, nonce: u64) -> H160 {
     let mut stream = RlpStream::new();
@@ -178,6 +187,52 @@ impl HpsSigner {
         let gas = U256::from(8_000_000u64);
         let raw = self.sign_raw_tx(nonce, Some(BYTECODE_STORE_ADDRESS), U256::zero(), &data, Some(gas))?;
         Ok((H256::from(code_hash_bytes), raw))
+    }
+
+    /// Build signed transaction(s) to upload a `.html.gz` UI bundle to `UI_BUNDLE_STORE_ADDRESS` (`0x0101`).
+    /// Uses 1 transaction when `gz_bytes.len() <= 40 KiB`, or radio-burst-safe `SLXUI\x01` parts for larger archives.
+    pub fn build_store_ui_bundle_txs(
+        &self,
+        starting_nonce: u64,
+        gz_bytes: &[u8],
+    ) -> Result<(H256, Vec<String>)> {
+        let ui_hash_bytes = abi::keccak256(gz_bytes);
+        let ui_hash = H256::from(ui_hash_bytes);
+        let gas = U256::from(8_000_000u64);
+        if gz_bytes.len() <= UI_BUNDLE_RADIO_SAFE_PART_BYTES {
+            let mut data = Vec::with_capacity(32 + gz_bytes.len());
+            data.extend_from_slice(&ui_hash_bytes);
+            data.extend_from_slice(gz_bytes);
+            let raw = self.sign_raw_tx(
+                starting_nonce,
+                Some(UI_BUNDLE_STORE_ADDRESS),
+                U256::zero(),
+                &data,
+                Some(gas),
+            )?;
+            return Ok((ui_hash, vec![raw]));
+        }
+
+        let chunks: Vec<&[u8]> = gz_bytes.chunks(UI_BUNDLE_RADIO_SAFE_PART_BYTES).collect();
+        let total = chunks.len() as u16;
+        let mut raws = Vec::with_capacity(chunks.len());
+        for (idx, part) in chunks.iter().enumerate() {
+            let mut data = Vec::with_capacity(42 + part.len());
+            data.extend_from_slice(&UI_BUNDLE_MULTIPART_MAGIC);
+            data.extend_from_slice(&ui_hash_bytes);
+            data.extend_from_slice(&(idx as u16).to_be_bytes());
+            data.extend_from_slice(&total.to_be_bytes());
+            data.extend_from_slice(part);
+            let raw = self.sign_raw_tx(
+                starting_nonce + (idx as u64),
+                Some(UI_BUNDLE_STORE_ADDRESS),
+                U256::zero(),
+                &data,
+                Some(gas),
+            )?;
+            raws.push(raw);
+        }
+        Ok((ui_hash, raws))
     }
 
     /// Build Step 2 of 2-step HPS instantiation (`to = None`, `data = code_hash || init_args`).
@@ -555,6 +610,84 @@ impl HpsClient {
             json!([target_subnet_hex, raw_tx_hex]),
         )
         .await
+    }
+
+    /// Store a `.html.gz` UI bundle in Lexicon's content-addressed `UI_BUNDLE_STORE_ADDRESS` (`0x000...0101`),
+    /// skipping upload if `slx_getUiBundle` reports it is already stored.
+    pub async fn store_ui_bundle(
+        &self,
+        signer: &HpsSigner,
+        gz_bytes: &[u8],
+    ) -> Result<H256> {
+        let ui_hash = H256::from(abi::keccak256(gz_bytes));
+        let hash_hex = format!("0x{}", hex::encode(ui_hash.as_bytes()));
+        if let Ok(existing) = self.get_ui_bundle(&hash_hex).await {
+            if !existing.is_empty() {
+                return Ok(ui_hash);
+            }
+        }
+        if gz_bytes.len() <= UI_BUNDLE_RADIO_SAFE_PART_BYTES {
+            let nonce = self.get_nonce(signer.address()).await?;
+            let (_, raws) = signer.build_store_ui_bundle_txs(nonce, gz_bytes)?;
+            let tx_hash = self.send_raw_transaction(&raws[0]).await?;
+            let rcpt = self.wait_for_receipt(&tx_hash).await?;
+            if !rcpt.status {
+                bail!("store_ui_bundle transaction {tx_hash} failed: {}", rcpt.raw);
+            }
+            return Ok(ui_hash);
+        }
+        let chunks: Vec<&[u8]> = gz_bytes.chunks(UI_BUNDLE_RADIO_SAFE_PART_BYTES).collect();
+        let total = chunks.len() as u16;
+        let gas = U256::from(8_000_000u64);
+        for (idx, part) in chunks.iter().enumerate() {
+            let nonce = self.get_nonce(signer.address()).await?;
+            let mut data = Vec::with_capacity(42 + part.len());
+            data.extend_from_slice(&UI_BUNDLE_MULTIPART_MAGIC);
+            data.extend_from_slice(ui_hash.as_bytes());
+            data.extend_from_slice(&(idx as u16).to_be_bytes());
+            data.extend_from_slice(&total.to_be_bytes());
+            data.extend_from_slice(part);
+            let raw = signer.sign_raw_tx(
+                nonce,
+                Some(UI_BUNDLE_STORE_ADDRESS),
+                U256::zero(),
+                &data,
+                Some(gas),
+            )?;
+            let tx_hash = self.send_raw_transaction(&raw).await?;
+            let rcpt = self.wait_for_receipt(&tx_hash).await?;
+            if !rcpt.status {
+                bail!(
+                    "store_ui_bundle part {}/{} transaction {tx_hash} failed: {}",
+                    idx + 1,
+                    total,
+                    rcpt.raw
+                );
+            }
+        }
+        Ok(ui_hash)
+    }
+
+    /// Retrieve stored `.wasm` bytecode by `code_hash` via `slx_getBytecode`.
+    pub async fn get_bytecode(&self, code_hash_hex: &str) -> Result<Vec<u8>> {
+        let v = self.rpc_call("slx_getBytecode", json!([code_hash_hex])).await?;
+        let hex_str = v["bytecode"].as_str().unwrap_or("0x");
+        let clean = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+        if clean.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(hex::decode(clean)?)
+    }
+
+    /// Retrieve stored `.html.gz` UI bundle by `ui_hash` via `slx_getUiBundle`.
+    pub async fn get_ui_bundle(&self, ui_hash_hex: &str) -> Result<Vec<u8>> {
+        let v = self.rpc_call("slx_getUiBundle", json!([ui_hash_hex])).await?;
+        let hex_str = v["data"].as_str().unwrap_or("0x");
+        let clean = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+        if clean.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(hex::decode(clean)?)
     }
 }
 

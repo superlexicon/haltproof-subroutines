@@ -240,22 +240,81 @@ impl KeccakHasher {
         }
     }
 
+    #[inline(always)]
+    fn xor_block_136(st: &mut [u64; 25], blk: &[u8]) {
+        unsafe {
+            let p = blk.as_ptr() as *const u64;
+            st[0] ^= u64::from_le(p.add(0).read_unaligned());
+            st[1] ^= u64::from_le(p.add(1).read_unaligned());
+            st[2] ^= u64::from_le(p.add(2).read_unaligned());
+            st[3] ^= u64::from_le(p.add(3).read_unaligned());
+            st[4] ^= u64::from_le(p.add(4).read_unaligned());
+            st[5] ^= u64::from_le(p.add(5).read_unaligned());
+            st[6] ^= u64::from_le(p.add(6).read_unaligned());
+            st[7] ^= u64::from_le(p.add(7).read_unaligned());
+            st[8] ^= u64::from_le(p.add(8).read_unaligned());
+            st[9] ^= u64::from_le(p.add(9).read_unaligned());
+            st[10] ^= u64::from_le(p.add(10).read_unaligned());
+            st[11] ^= u64::from_le(p.add(11).read_unaligned());
+            st[12] ^= u64::from_le(p.add(12).read_unaligned());
+            st[13] ^= u64::from_le(p.add(13).read_unaligned());
+            st[14] ^= u64::from_le(p.add(14).read_unaligned());
+            st[15] ^= u64::from_le(p.add(15).read_unaligned());
+            st[16] ^= u64::from_le(p.add(16).read_unaligned());
+        }
+    }
+
+    pub fn to_bytes(&self) -> [u8; 344] {
+        let mut out = [0u8; 344];
+        let mut i = 0usize;
+        while i < 25 {
+            out[i * 8..(i + 1) * 8].copy_from_slice(&self.state[i].to_le_bytes());
+            i += 1;
+        }
+        out[200..336].copy_from_slice(&self.buf);
+        out[336..344].copy_from_slice(&(self.pos as u64).to_le_bytes());
+        out
+    }
+
+    pub fn from_bytes(raw: &[u8; 344]) -> Self {
+        let mut state = [0u64; 25];
+        let mut i = 0usize;
+        while i < 25 {
+            let mut b8 = [0u8; 8];
+            b8.copy_from_slice(&raw[i * 8..(i + 1) * 8]);
+            state[i] = u64::from_le_bytes(b8);
+            i += 1;
+        }
+        let mut buf = [0u8; 136];
+        buf.copy_from_slice(&raw[200..336]);
+        let mut p8 = [0u8; 8];
+        p8.copy_from_slice(&raw[336..344]);
+        let pos = (u64::from_le_bytes(p8) as usize).min(135);
+        Self { state, buf, pos }
+    }
+
     pub fn update(&mut self, data: &[u8]) {
         let mut idx = 0usize;
-        while idx < data.len() {
-            let take = (136 - self.pos).min(data.len() - idx);
-            self.buf[self.pos..self.pos + take].copy_from_slice(&data[idx..idx + take]);
+        if self.pos > 0 {
+            let take = (136 - self.pos).min(data.len());
+            self.buf[self.pos..self.pos + take].copy_from_slice(&data[..take]);
             self.pos += take;
             idx += take;
             if self.pos == 136 {
-                let mut lane = 0;
-                while lane < 17 {
-                    self.state[lane] ^= load_u64_le(&self.buf, lane * 8);
-                    lane += 1;
-                }
+                Self::xor_block_136(&mut self.state, &self.buf);
                 keccak_f1600_mut(&mut self.state);
                 self.pos = 0;
             }
+        }
+        while idx + 136 <= data.len() {
+            Self::xor_block_136(&mut self.state, &data[idx..idx + 136]);
+            keccak_f1600_mut(&mut self.state);
+            idx += 136;
+        }
+        if idx < data.len() {
+            let rem = data.len() - idx;
+            self.buf[..rem].copy_from_slice(&data[idx..]);
+            self.pos = rem;
         }
     }
 

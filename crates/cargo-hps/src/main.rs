@@ -107,6 +107,21 @@ enum Commands {
         allow_external_urls: bool,
     },
 
+    /// Upload a content-addressed `.html.gz` UI bundle to `UI_BUNDLE_STORE_ADDRESS` (`0x0101`)
+    StoreBundle {
+        /// Path to the built `.html.gz` UI bundle (e.g. `dist/<slug>.html.gz`)
+        bundle_path: PathBuf,
+        /// JSON-RPC endpoint URL
+        #[arg(long, env = "LEXICON_RPC_URL", default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+        /// Secp256k1 private key hex (defaults to localtestnet dev key)
+        #[arg(long, env = "LEXICON_PRIVATE_KEY", default_value = DEFAULT_DEV_PRIVATE_KEY)]
+        private_key: String,
+        /// Chain ID
+        #[arg(long, env = "LEXICON_CHAIN_ID", default_value_t = DEFAULT_CHAIN_ID)]
+        chain_id: u64,
+    },
+
     /// Execute Lexicon's 2-step HPS deployment (store_bytecode + instantiate) in a single command
     Deploy {
         /// Path to the compiled .wasm artifact (e.g. dist/messaging.wasm)
@@ -231,6 +246,12 @@ async fn main() -> Result<()> {
             summary,
             allow_external_urls,
         ),
+        Commands::StoreBundle {
+            bundle_path,
+            rpc,
+            private_key,
+            chain_id,
+        } => cmd_store_bundle(&bundle_path, &rpc, &private_key, chain_id).await,
         Commands::Deploy {
             wasm_path,
             rpc,
@@ -704,6 +725,33 @@ fn cmd_bundle(
         "  Manifest     : {}",
         out_dir.join(format!("{}.manifest.json", out.slug)).display()
     );
+    Ok(())
+}
+
+async fn cmd_store_bundle(
+    bundle_path: &Path,
+    rpc: &str,
+    private_key: &str,
+    chain_id: u64,
+) -> Result<()> {
+    let gz_bytes = fs::read(bundle_path)
+        .with_context(|| format!("cannot read '{}'", bundle_path.display()))?;
+    if gz_bytes.is_empty() {
+        bail!("UI bundle file '{}' is empty", bundle_path.display());
+    }
+    let signer = HpsSigner::from_hex(private_key, chain_id)?;
+    let client = HpsClient::new(rpc);
+    println!(
+        "Uploading UI bundle {} ({} bytes) to UI_BUNDLE_STORE (0x0101) via {}...",
+        bundle_path.display(),
+        gz_bytes.len(),
+        rpc
+    );
+    println!("  Uploader   : {}", signer.address_hex());
+    let ui_hash = client.store_ui_bundle(&signer, &gz_bytes).await?;
+    println!("UI bundle sealed in ConsensusStorage:");
+    println!("  UI Hash    : 0x{}", hex::encode(ui_hash.as_bytes()));
+    println!("  Retrieve   : slx_getUiBundle(\"0x{}\")", hex::encode(ui_hash.as_bytes()));
     Ok(())
 }
 
