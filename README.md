@@ -49,6 +49,11 @@ cargo run --quiet -p cargo-hps -- new my-app --with-ui
 # 4. Run full live Wasmtime E2E suites against isolated `lexicon-node --localtestnet`
 cargo test -p hps-client --test live_governance_e2e -- --ignored --test-threads=1 --nocapture
 cargo test -p hps-client --test superlexicon_pe_e2e -- --ignored --test-threads=1 --nocapture
+
+# 5. Launch the Full-Stack HFS Studio IDE (`http://127.0.0.1:4770` + auto-discovered by `/hfs-ide.html`)
+cargo run --release -p cargo-hps -- studio
+# Or stateless hosted sandbox mode for LAN / web portal servers:
+cargo run --release -p cargo-hps -- studio --sandbox --bind 0.0.0.0:4770
 ```
 
 ---

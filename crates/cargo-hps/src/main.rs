@@ -1,4 +1,5 @@
 mod bundler;
+mod studio;
 mod wasm_opt;
 
 use std::env;
@@ -191,6 +192,22 @@ enum Commands {
         #[arg(long, env = "LEXICON_RPC_URL", default_value = "http://127.0.0.1:8545")]
         rpc: String,
     },
+
+    /// Launch the HFS Full-Stack Studio compiler & Web IDE daemon (`http://127.0.0.1:4770`)
+    Studio {
+        /// Bind address (`127.0.0.1:4770` for local dev, or `0.0.0.0:4770` with `--sandbox` for LAN/hosted)
+        #[arg(long, env = "HPS_STUDIO_BIND", default_value = "127.0.0.1:4770")]
+        bind: String,
+        /// Stateless single-file `#![no_std]` sandbox mode (disables host file macros & native test execution)
+        #[arg(long, env = "HPS_STUDIO_SANDBOX")]
+        sandbox: bool,
+        /// Path to `haltproof-subroutines` workspace root (auto-detected if omitted)
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Optional path to standalone `hfs-ide.html.gz` or `.html` UI bundle
+        #[arg(long)]
+        ui_bundle: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -277,6 +294,20 @@ async fn main() -> Result<()> {
         } => cmd_call(&hps, &signature, &args, &rpc).await,
         Commands::Keygen { dev } => cmd_keygen(dev),
         Commands::Status { rpc } => cmd_status(&rpc).await,
+        Commands::Studio {
+            bind,
+            sandbox,
+            workspace,
+            ui_bundle,
+        } => {
+            studio::run_studio_server(studio::StudioOptions {
+                bind,
+                sandbox,
+                workspace_root: workspace.unwrap_or_else(studio::resolve_default_workspace_root),
+                ui_bundle_path: ui_bundle,
+            })
+            .await
+        }
     }
 }
 

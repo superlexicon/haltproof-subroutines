@@ -4,4 +4,5 @@
 *.db-flatkv
 *.log
 /dist
+/studio-projects
 node_modules/
