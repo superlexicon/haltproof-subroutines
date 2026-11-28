@@ -33,6 +33,7 @@ members = [
     "examples/app-store",
     "examples/webrtc-signal",
     "examples/volatile-voles",
+    "examples/ride-exchange",
 ]
 
 [workspace.package]

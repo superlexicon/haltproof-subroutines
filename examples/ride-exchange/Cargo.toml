@@ -1,0 +1,13 @@
+[package]
+name = "ride-exchange"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Multi-Regime Discrete-Time All-Or-Nothing (AON) Ride Service Futures Exchange Haltproof Subroutine (HPS)"
+
+[[bin]]
+name = "ride_exchange"
+path = "src/main.rs"
+
+[dependencies]
+hps-sdk = { path = "../../crates/hps-sdk" }
