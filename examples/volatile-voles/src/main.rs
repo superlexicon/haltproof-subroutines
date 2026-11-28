@@ -29,9 +29,10 @@
 #![cfg_attr(target_arch = "wasm32", no_main)]
 
 use hps_sdk::abi::CalldataReader;
+use hps_sdk::call::{self, CallEncoder};
 use hps_sdk::keccak::{keccak256, KeccakHasher};
 use hps_sdk::storage::KeyBuilder;
-use hps_sdk::{context, event_topic, events, hps_entry, ret, storage};
+use hps_sdk::{context, event_topic, events, hps_entry, ret, selector, storage};
 
 // ---------------------------------------------------------------------------
 // Bounded Protocol Constants
@@ -1762,6 +1763,30 @@ fn synthetic_bot_eoa(tid: &[u8; 32], seat_idx: u8) -> [u8; 20] {
     out
 }
 
+const SEL_ID_OWNER: [u8; 4] = selector("owner()");
+const SEL_ID_IS_DEVICE: [u8; 4] = selector("isOwnerDevice(address)");
+
+/// Verify `identity_addr` is a real deployed Identity HFS owned/authorized by `caller` (never 0x0 or an EOA!).
+fn is_authorized_for_identity(caller: &[u8; 20], identity_addr: &[u8; 20]) -> bool {
+    if *identity_addr == [0u8; 20] {
+        return false;
+    }
+    if caller == identity_addr && context::code_hash_of(identity_addr).is_some() {
+        return true;
+    }
+    let owner_cd = CallEncoder::<16>::new(SEL_ID_OWNER);
+    if let Ok(raw) = call::call_raw(identity_addr, owner_cd.as_slice()) {
+        if raw.len() >= 32 && raw[0..12] == [0u8; 12] && &raw[12..32] == caller {
+            return true;
+        }
+    }
+    let dev_cd = CallEncoder::<64>::new(SEL_ID_IS_DEVICE).push_address(caller);
+    if let Ok(true) = call::call_bool(identity_addr, dev_cd.as_slice()) {
+        return true;
+    }
+    false
+}
+
 /// 1-Click Instant Start: Creates (or resets) `tableId`, seats `msg_sender` at Seat 0, adds `1..=4`
 /// tactical AI Bot rivals, deals `1` Baby Vole + `5` cards per player, and begins Turn 1!
 fn handle_quick_start_solo(args: &CalldataReader) -> Result<i32, i32> {
@@ -1776,6 +1801,9 @@ fn handle_quick_start_solo(args: &CalldataReader) -> Result<i32, i32> {
     };
 
     let caller = context::msg_sender();
+    if !is_authorized_for_identity(&caller, &identity) {
+        return Err(-40); // Deployed Identity HFS required!
+    }
     let prev_wins = load_table(&tid)
         .and_then(|old| old.find_seat_by_eoa(&caller).map(|idx| old.seats[idx].wins))
         .unwrap_or(0);
@@ -1825,6 +1853,9 @@ fn handle_create_table(args: &CalldataReader) -> Result<i32, i32> {
     }
 
     let caller = context::msg_sender();
+    if !is_authorized_for_identity(&caller, &identity) {
+        return Err(-40);
+    }
     let mut st = TableState::new_lobby(target_voles, keccak256(&tid));
     st.mix_player_entropy(&caller, &identity);
     st.seats[0].eoa = caller;
@@ -1847,6 +1878,9 @@ fn handle_join_table(args: &CalldataReader) -> Result<i32, i32> {
         return Err(-13);
     }
     let caller = context::msg_sender();
+    if !is_authorized_for_identity(&caller, &identity) {
+        return Err(-40);
+    }
     if let Some(existing_idx) = st.find_seat_by_eoa(&caller) {
         st.seats[existing_idx].identity = identity;
         save_table(&tid, &st);
@@ -2372,19 +2406,39 @@ mod tests {
 
     const VOLES_ADDR: [u8; 20] = [0x77; 20];
     const ALICE: [u8; 20] = [0xA1; 20];
+    const ALICE_ID: [u8; 20] = [0xAA; 20];
     const BOB: [u8; 20] = [0xB2; 20];
     const CAROL: [u8; 20] = [0xC3; 20];
+
+    fn mock_alice_identity(cd: &[u8]) -> i32 {
+        if cd.len() >= 4 && cd[0..4] == selector("owner()") {
+            ret::write_address(&ALICE);
+            return 32;
+        }
+        0
+    }
 
     #[test]
     fn quick_start_solo_deals_baby_voles_masks_hands_and_plays() {
         mock::reset();
         mock::register_hps(VOLES_ADDR, dispatch_calldata);
+        mock::register_hps(ALICE_ID, mock_alice_identity);
         mock::set_block_number(500);
 
         let tid = [0x11; 32];
+        // Calling without deployed Identity HFS (0x0) MUST revert with -40!
+        let cd_no_id = CallEncoder::<256>::new(selector("quickStartSolo(bytes32,address,uint64,uint64)"))
+            .push_bytes32(&tid)
+            .push_address(&[0u8; 20])
+            .push_u64(3)
+            .push_u64(7)
+            .as_slice()
+            .to_vec();
+        assert_eq!(mock::transact_as(ALICE, VOLES_ADDR, &cd_no_id), Err(-40));
+
         let cd = CallEncoder::<256>::new(selector("quickStartSolo(bytes32,address,uint64,uint64)"))
             .push_bytes32(&tid)
-            .push_address(&[0xAA; 20])
+            .push_address(&ALICE_ID)
             .push_u64(3) // 1 human + 3 AI bots = 4 seats
             .push_u64(7)
             .as_slice()

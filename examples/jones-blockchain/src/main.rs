@@ -26,9 +26,10 @@
 #![cfg_attr(target_arch = "wasm32", no_main)]
 
 use hps_sdk::abi::CalldataReader;
+use hps_sdk::call::{self, CallEncoder};
 use hps_sdk::keccak::KeccakHasher;
 use hps_sdk::storage::KeyBuilder;
-use hps_sdk::{context, event_topic, events, hps_entry, ret, storage};
+use hps_sdk::{context, event_topic, events, hps_entry, ret, selector, storage};
 
 // ---------------------------------------------------------------------------
 // Bounded Protocol Constants
@@ -1630,6 +1631,30 @@ fn bot_synthetic_eoa(persona: u8, slot: usize) -> [u8; 20] {
     addr
 }
 
+const SEL_ID_OWNER: [u8; 4] = selector("owner()");
+const SEL_ID_IS_DEVICE: [u8; 4] = selector("isOwnerDevice(address)");
+
+/// Verify `identity_addr` is a real deployed Identity HFS owned/authorized by `caller` (never 0x0 or an EOA!).
+fn is_authorized_for_identity(caller: &[u8; 20], identity_addr: &[u8; 20]) -> bool {
+    if *identity_addr == [0u8; 20] {
+        return false;
+    }
+    if caller == identity_addr && context::code_hash_of(identity_addr).is_some() {
+        return true;
+    }
+    let owner_cd = CallEncoder::<16>::new(SEL_ID_OWNER);
+    if let Ok(raw) = call::call_raw(identity_addr, owner_cd.as_slice()) {
+        if raw.len() >= 32 && raw[0..12] == [0u8; 12] && &raw[12..32] == caller {
+            return true;
+        }
+    }
+    let dev_cd = CallEncoder::<64>::new(SEL_ID_IS_DEVICE).push_address(caller);
+    if let Ok(true) = call::call_bool(identity_addr, dev_cd.as_slice()) {
+        return true;
+    }
+    false
+}
+
 // ---------------------------------------------------------------------------
 // ABI Entrypoints (`hps_entry!`)
 // ---------------------------------------------------------------------------
@@ -1656,6 +1681,9 @@ fn handle_quick_start_solo(args: &CalldataReader) -> Result<i32, i32> {
     }
 
     let caller = context::msg_sender();
+    if !is_authorized_for_identity(&caller, &identity) {
+        return Err(-40); // Deployed Identity HFS required!
+    }
     let (w_goal, h_goal, e_goal, c_goal) = preset_goals(preset);
     let mut st = GameState::new_lobby(w_goal, h_goal, e_goal, c_goal, derive_seed(&gid, &caller));
 
@@ -1698,6 +1726,9 @@ fn handle_create_game(args: &CalldataReader) -> Result<i32, i32> {
     }
 
     let caller = context::msg_sender();
+    if !is_authorized_for_identity(&caller, &identity) {
+        return Err(-40);
+    }
     let mut st = GameState::new_lobby(w_goal, h_goal, e_goal, c_goal, derive_seed(&gid, &caller));
     st.seats[0].reset_for_new_game();
     st.seats[0].eoa = caller;
@@ -1719,6 +1750,9 @@ fn handle_join_game(args: &CalldataReader) -> Result<i32, i32> {
         return Err(-22);
     }
     let caller = context::msg_sender();
+    if !is_authorized_for_identity(&caller, &identity) {
+        return Err(-40);
+    }
     if st.find_seat_by_eoa(&caller).is_some() {
         return Err(-23);
     }
@@ -2033,20 +2067,51 @@ mod tests {
 
     const JONES_ADDR: [u8; 20] = [0x44; 20];
     const ALICE: [u8; 20] = [0xA1; 20];
+    const ALICE_ID: [u8; 20] = [0xAA; 20];
     const BOB: [u8; 20] = [0xB2; 20];
+    const BOB_ID: [u8; 20] = [0xBB; 20];
+
+    fn mock_alice_id(cd: &[u8]) -> i32 {
+        if cd.len() >= 4 && cd[0..4] == selector("owner()") {
+            ret::write_address(&ALICE);
+            return 32;
+        }
+        0
+    }
+
+    fn mock_bob_id(cd: &[u8]) -> i32 {
+        if cd.len() >= 4 && cd[0..4] == selector("owner()") {
+            ret::write_address(&BOB);
+            return 32;
+        }
+        0
+    }
 
     #[test]
     fn solo_vs_jones_submits_atomic_week_and_advances_ai_rival() {
         mock::reset();
         mock::register_hps(JONES_ADDR, dispatch_calldata);
+        mock::register_hps(ALICE_ID, mock_alice_id);
         mock::set_block_number(100);
 
         let gid = [0x11; 32];
+        // Calling without deployed Identity HFS MUST fail (-40)!
+        let cd_bad = CallEncoder::<256>::new(selector(
+            "quickStartSolo(bytes32,address,uint64,uint64)",
+        ))
+        .push_bytes32(&gid)
+        .push_address(&[0u8; 20])
+        .push_u64(1)
+        .push_u64(0)
+        .as_slice()
+        .to_vec();
+        assert_eq!(mock::transact_as(ALICE, JONES_ADDR, &cd_bad), Err(-40));
+
         let cd_start = CallEncoder::<256>::new(selector(
             "quickStartSolo(bytes32,address,uint64,uint64)",
         ))
         .push_bytes32(&gid)
-        .push_address(&[0xAA; 20])
+        .push_address(&ALICE_ID)
         .push_u64(1) // Alice vs. Rival Jones
         .push_u64(0) // Quick Afternoon Stroll preset
         .as_slice()
@@ -2156,6 +2221,8 @@ mod tests {
     fn pvp_lobby_banking_stocks_and_rematch_work_end_to_end() {
         mock::reset();
         mock::register_hps(JONES_ADDR, dispatch_calldata);
+        mock::register_hps(ALICE_ID, mock_alice_id);
+        mock::register_hps(BOB_ID, mock_bob_id);
         mock::set_block_number(400);
 
         let gid = [0x55; 32];
