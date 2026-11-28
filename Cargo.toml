@@ -34,6 +34,7 @@ members = [
     "examples/webrtc-signal",
     "examples/volatile-voles",
     "examples/ride-exchange",
+    "examples/jones-blockchain",
 ]
 
 [workspace.package]

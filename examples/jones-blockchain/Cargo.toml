@@ -1,0 +1,13 @@
+[package]
+name = "jones-blockchain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Jones in the Blockchain — Cozy 1-4 Player Turn-Based Life-Sim & Career/Education Strategy Haltproof Subroutine (HPS)"
+
+[[bin]]
+name = "jones_blockchain"
+path = "src/main.rs"
+
+[dependencies]
+hps-sdk = { path = "../../crates/hps-sdk" }
