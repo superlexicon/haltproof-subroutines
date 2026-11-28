@@ -94,7 +94,10 @@ const KEY_ACTIVE_ASKS: &[u8] = b"dex:aa_cnt";
 const KEY_BID_TREE: &[u8] = b"dex:bid_tree";
 const KEY_ASK_TREE: &[u8] = b"dex:ask_tree";
 
+const KEY_SETTLED_SET: &[u8] = b"dex:st_set";
+const KEY_SETTLED_BLOCK: &[u8] = b"dex:st_blk";
 const KEY_LAST_MATCH_EXEC_SET: &[u8] = b"dex:lm_set";
+const KEY_EXPLICIT_MATCH_BLOCK: &[u8] = b"dex:em_blk";
 const KEY_LAST_MATCH_BLOCK: &[u8] = b"dex:lm_blk";
 const KEY_LAST_PRICE: &[u8] = b"dex:lm_px";
 const KEY_LAST_VOL: &[u8] = b"dex:lm_vol";
@@ -905,14 +908,36 @@ fn handle_place_ask(args: &CalldataReader) -> Result<(), i32> {
 
 /// $O(1)$ intrusive doubly-linked list unlink (+ $O(\log M)$ AVL delete only if the price level
 /// becomes empty) and immediate escrow refund.
+///
+/// **Last-Look MEV Prevention**: If `order_id` was placed in a prior block (`ord.block_number < current_block`),
+/// any sealed prior-block (`< current_block`) cohorts are atomically settled *first* via
+/// `settle_prior_cohorts_if_needed(current_block)` before unlinking — guaranteeing `[cancelOrder, matchBlock]`
+/// and `[matchBlock, cancelOrder]` produce bit-for-bit identical fills regardless of canonical `(from, nonce)`
+/// intra-block transaction ordering.
 fn handle_cancel_order(args: &CalldataReader) -> Result<(), i32> {
     let (_registry, caller) = ensure_initialized_and_valid_caller()?;
     let order_id = args.u64(0).ok_or(-3)?;
-    let mut ord = load_order(order_id).ok_or(ERR_ORDER_NOT_FOUND)?;
-    if ord.trader != caller {
+    let pre_ord = load_order(order_id).ok_or(ERR_ORDER_NOT_FOUND)?;
+    if pre_ord.trader != caller {
         return Err(ERR_NOT_ORDER_OWNER);
     }
-    if ord.status == STATUS_CANCELLED || ord.status == STATUS_FILLED || ord.rem_qty == 0 {
+    if pre_ord.status == STATUS_CANCELLED || pre_ord.status == STATUS_FILLED || pre_ord.rem_qty == 0
+    {
+        return Err(ERR_ORDER_ALREADY_CANCELLED);
+    }
+
+    let current_block = context::block_number();
+    if pre_ord.block_number < current_block {
+        settle_prior_cohorts_if_needed(current_block)?;
+    }
+
+    let mut ord = load_order(order_id).ok_or(ERR_ORDER_NOT_FOUND)?;
+    if ord.status == STATUS_FILLED || ord.rem_qty == 0 {
+        // Order filled completely during sealed prior-block cohort clearing; keep fills committed!
+        ret::write_u64_word(0);
+        return Ok(());
+    }
+    if ord.status == STATUS_CANCELLED {
         return Err(ERR_ORDER_ALREADY_CANCELLED);
     }
 
@@ -1256,18 +1281,16 @@ fn commit_filled_prefix_to_tree(
 ///    permutation-invariant fills, settles transfers, and updates/prunes price levels in $O(\log M)$.
 /// Permissionless periodic orderbook matcher (no authentication or authorization required;
 /// guarded against being called more than once per block).
-fn handle_match_block(_args: &CalldataReader) -> Result<(), i32> {
-    if storage::get_u64(KEY_INIT) != 1 {
-        return Err(-10);
-    }
-    let current_block = context::block_number();
-    if storage::get_u64(KEY_LAST_MATCH_EXEC_SET) == 1
-        && storage::get_u64(KEY_LAST_MATCH_BLOCK) == current_block
+/// Idempotently settles all sealed prior-block (`ord.block_number < current_block`) cohorts at most
+/// once per block ($O(1)$ early return if already settled in `current_block`).
+fn settle_prior_cohorts_if_needed(current_block: u64) -> Result<(), i32> {
+    if storage::get_u64(KEY_SETTLED_SET) == 1
+        && storage::get_u64(KEY_SETTLED_BLOCK) == current_block
     {
-        return Err(ERR_ALREADY_EXECUTED_IN_BLOCK);
+        return Ok(());
     }
-    storage::set_u64(KEY_LAST_MATCH_EXEC_SET, 1);
-    storage::set_u64(KEY_LAST_MATCH_BLOCK, current_block);
+    storage::set_u64(KEY_SETTLED_SET, 1);
+    storage::set_u64(KEY_SETTLED_BLOCK, current_block);
 
     let mut pending_head = storage::get_u64(KEY_PENDING_HEAD);
     let mut pending_tail = storage::get_u64(KEY_PENDING_TAIL);
@@ -1356,10 +1379,6 @@ fn handle_match_block(_args: &CalldataReader) -> Result<(), i32> {
         storage::set_u64(KEY_LAST_INGESTED, ingested_count);
         storage::set_u64(KEY_LAST_FILLED_BIDS, 0);
         storage::set_u64(KEY_LAST_FILLED_ASKS, 0);
-
-        let mut out = [0u8; 160];
-        out[88..96].copy_from_slice(&ingested_count.to_be_bytes());
-        ret::write(&out);
         return Ok(());
     }
 
@@ -1651,13 +1670,32 @@ fn handle_match_block(_args: &CalldataReader) -> Result<(), i32> {
     summary[24..32].copy_from_slice(&filled_bid_orders.to_be_bytes());
     summary[32..40].copy_from_slice(&filled_ask_orders.to_be_bytes());
     events::emit(&[BLOCK_MATCHED, u64_topic(current_block)], &summary);
+    Ok(())
+}
+
+/// Permissionless periodic orderbook matcher (no authentication or authorization required;
+/// guarded against being called more than once per block).
+fn handle_match_block(_args: &CalldataReader) -> Result<(), i32> {
+    if storage::get_u64(KEY_INIT) != 1 {
+        return Err(-10);
+    }
+    let current_block = context::block_number();
+    if storage::get_u64(KEY_LAST_MATCH_EXEC_SET) == 1
+        && storage::get_u64(KEY_EXPLICIT_MATCH_BLOCK) == current_block
+    {
+        return Err(ERR_ALREADY_EXECUTED_IN_BLOCK);
+    }
+    storage::set_u64(KEY_LAST_MATCH_EXEC_SET, 1);
+    storage::set_u64(KEY_EXPLICIT_MATCH_BLOCK, current_block);
+
+    settle_prior_cohorts_if_needed(current_block)?;
 
     let mut out = [0u8; 160];
-    out[24..32].copy_from_slice(&clearing_price.to_be_bytes());
-    out[56..64].copy_from_slice(&matched_volume.to_be_bytes());
-    out[88..96].copy_from_slice(&ingested_count.to_be_bytes());
-    out[120..128].copy_from_slice(&filled_bid_orders.to_be_bytes());
-    out[152..160].copy_from_slice(&filled_ask_orders.to_be_bytes());
+    out[24..32].copy_from_slice(&storage::get_u64(KEY_LAST_PRICE).to_be_bytes());
+    out[56..64].copy_from_slice(&storage::get_u64(KEY_LAST_VOL).to_be_bytes());
+    out[88..96].copy_from_slice(&storage::get_u64(KEY_LAST_INGESTED).to_be_bytes());
+    out[120..128].copy_from_slice(&storage::get_u64(KEY_LAST_FILLED_BIDS).to_be_bytes());
+    out[152..160].copy_from_slice(&storage::get_u64(KEY_LAST_FILLED_ASKS).to_be_bytes());
     ret::write(&out);
     Ok(())
 }
@@ -2422,5 +2460,190 @@ mod tests {
         // 3. Advancing to the next block (#7) permits `matchBlock()` again!
         mock::set_block_number(7);
         assert!(mock::transact_as(unauthenticated_sim_eoa, dex, match_cd.as_slice()).is_ok());
+    }
+
+    #[test]
+    fn last_look_cancel_cannot_frontrun_prior_block_cohort_clearing() {
+        // Run BOTH intra-block permutations at Block #11:
+        //   Perm A: Low-EOA Maker `cancelOrder(ask_id)` FIRST, then Keeper `matchBlock()`
+        //   Perm B: Keeper `matchBlock()` FIRST, then High-EOA Maker `cancelOrder(ask_id)`
+        // Assert identical fills, clearing price, and final balances!
+        fn run_permutation(cancel_first: bool) -> (u64, u64, u64, u64, u64, u64) {
+            mock::reset();
+            let reg = [0x10; 20];
+            let asset_ledger = [0x20; 20];
+            let quote_ledger = [0x30; 20];
+            let dex = [0x40; 20];
+            let escrow_id = [0x90; 20];
+
+            let buyer = [0xA1; 20];
+            let low_eoa_maker = [0x01; 20]; // vanity low address attempting Last-Look cancel
+            let keeper = [0xEE; 20];
+
+            mock::register_hps(reg, sim_ledgers::reg_dispatch);
+            mock::register_hps(asset_ledger, sim_ledgers::ledger_dispatch);
+            mock::register_hps(quote_ledger, sim_ledgers::ledger_dispatch);
+            mock::register_hps(dex, dispatch_calldata);
+
+            let init_cd = CallEncoder::<160>::new(const {
+                selector("initialize(address,address,address,address)")
+            })
+            .push_address(&reg)
+            .push_address(&asset_ledger)
+            .push_address(&quote_ledger)
+            .push_address(&escrow_id);
+            mock::transact_as(buyer, dex, init_cd.as_slice()).unwrap();
+
+            seed_balance(quote_ledger, buyer, 10_000);
+            seed_balance(asset_ledger, low_eoa_maker, 100);
+
+            // Block #9: Warmup matchBlock so KEY_LAST_MATCH_EXEC_SET is already 1
+            mock::set_block_number(9);
+            let match_cd = CallEncoder::<16>::new(const { selector("matchBlock()") });
+            mock::transact_as(keeper, dex, match_cd.as_slice()).unwrap();
+
+            // Block #10: Buyer bids 60 @ $50; Maker asks 100 @ $50 (partial fill = 60, rem = 40)
+            mock::set_block_number(10);
+            let bid_cd = CallEncoder::<96>::new(const { selector("placeBid(uint64,uint64)") })
+                .push_u64(50)
+                .push_u64(60);
+            let ask_cd = CallEncoder::<96>::new(const { selector("placeAsk(uint64,uint64)") })
+                .push_u64(50)
+                .push_u64(100);
+            mock::transact_as(buyer, dex, bid_cd.as_slice()).unwrap();
+            let ask_ret = mock::transact_as(low_eoa_maker, dex, ask_cd.as_slice()).unwrap();
+            let ask_id = u64::from_be_bytes(ask_ret[24..32].try_into().unwrap());
+
+            // Block #11: External price jumps; Maker tries to cancel before `matchBlock()`!
+            mock::set_block_number(11);
+            let cancel_cd = CallEncoder::<64>::new(const { selector("cancelOrder(uint64)") })
+                .push_u64(ask_id);
+
+            let match_vol;
+            if cancel_first {
+                let cancel_ret =
+                    mock::transact_as(low_eoa_maker, dex, cancel_cd.as_slice()).unwrap();
+                let refunded = u64::from_be_bytes(cancel_ret[24..32].try_into().unwrap());
+                assert_eq!(refunded, 40, "only unfilled remainder (40) may be cancelled");
+
+                let m_ret = mock::transact_as(keeper, dex, match_cd.as_slice()).unwrap();
+                match_vol = u64::from_be_bytes(m_ret[56..64].try_into().unwrap());
+            } else {
+                let m_ret = mock::transact_as(keeper, dex, match_cd.as_slice()).unwrap();
+                match_vol = u64::from_be_bytes(m_ret[56..64].try_into().unwrap());
+
+                let cancel_ret =
+                    mock::transact_as(low_eoa_maker, dex, cancel_cd.as_slice()).unwrap();
+                let refunded = u64::from_be_bytes(cancel_ret[24..32].try_into().unwrap());
+                assert_eq!(refunded, 40);
+            }
+
+            (
+                match_vol,
+                balance_of(asset_ledger, buyer),
+                balance_of(quote_ledger, buyer),
+                balance_of(asset_ledger, low_eoa_maker),
+                balance_of(quote_ledger, low_eoa_maker),
+                balance_of(asset_ledger, escrow_id),
+            )
+        }
+
+        let perm_cancel_first = run_permutation(true);
+        let perm_match_first = run_permutation(false);
+        assert_eq!(perm_cancel_first, perm_match_first);
+        assert_eq!(perm_cancel_first.0, 60); // 60 units matched despite Last-Look cancel attempt!
+        assert_eq!(perm_cancel_first.1, 60); // buyer received 60 base units
+        assert_eq!(perm_cancel_first.3, 40); // maker got 40 base units back, sold 60
+        assert_eq!(perm_cancel_first.4, 3000); // maker received 60 * $50 = $3000
+        assert_eq!(perm_cancel_first.5, 0); // escrow cleanly drained
+    }
+
+    #[test]
+    fn intra_block_sandwich_and_vanity_address_priority_yield_zero_mev() {
+        mock::reset();
+        let reg = [0x10; 20];
+        let asset_ledger = [0x20; 20];
+        let quote_ledger = [0x30; 20];
+        let dex = [0x40; 20];
+        let escrow_id = [0x90; 20];
+
+        let mev_front_eoa = [0x01; 20]; // lowest address (executes 1st in block)
+        let victim = [0x77; 20]; // middle address
+        let mev_back_eoa = [0xFE; 20]; // highest address (executes last in block)
+        let resting_seller = [0xB2; 20];
+        let keeper = [0xEE; 20];
+
+        mock::register_hps(reg, sim_ledgers::reg_dispatch);
+        mock::register_hps(asset_ledger, sim_ledgers::ledger_dispatch);
+        mock::register_hps(quote_ledger, sim_ledgers::ledger_dispatch);
+        mock::register_hps(dex, dispatch_calldata);
+
+        let init_cd = CallEncoder::<160>::new(const {
+            selector("initialize(address,address,address,address)")
+        })
+        .push_address(&reg)
+        .push_address(&asset_ledger)
+        .push_address(&quote_ledger)
+        .push_address(&escrow_id);
+        mock::transact_as(victim, dex, init_cd.as_slice()).unwrap();
+
+        seed_balance(asset_ledger, resting_seller, 100);
+        seed_balance(quote_ledger, mev_front_eoa, 50_000);
+        seed_balance(asset_ledger, mev_back_eoa, 500);
+        seed_balance(quote_ledger, victim, 50_000);
+
+        // Block #1: Resting seller posts 100 units @ $100; ingested at Block #2
+        mock::set_block_number(1);
+        let ask100 = CallEncoder::<96>::new(const { selector("placeAsk(uint64,uint64)") })
+            .push_u64(100)
+            .push_u64(100);
+        mock::transact_as(resting_seller, dex, ask100.as_slice()).unwrap();
+
+        mock::set_block_number(2);
+        let match_cd = CallEncoder::<16>::new(const { selector("matchBlock()") });
+        mock::transact_as(keeper, dex, match_cd.as_slice()).unwrap();
+
+        // Block #3: Victim submits Bid 100 @ $105.
+        // Insider validator MEV bot sees it in mempool and brackets Victim in Block #3:
+        //   1. `mev_front_eoa` places Bid 100 @ $105 AHEAD of Victim (hoping to steal 100% of resting $100 ask)
+        //   2. Victim places Bid 100 @ $105
+        //   3. `mev_back_eoa` places Ask 100 @ $105 BEHIND Victim (hoping to dump onto Victim @ $105!)
+        mock::set_block_number(3);
+        let bid105 = CallEncoder::<96>::new(const { selector("placeBid(uint64,uint64)") })
+            .push_u64(105)
+            .push_u64(100);
+        let ask105 = CallEncoder::<96>::new(const { selector("placeAsk(uint64,uint64)") })
+            .push_u64(105)
+            .push_u64(100);
+
+        mock::transact_as(mev_front_eoa, dex, bid105.as_slice()).unwrap();
+        mock::transact_as(victim, dex, bid105.as_slice()).unwrap();
+        mock::transact_as(mev_back_eoa, dex, ask105.as_slice()).unwrap();
+
+        // Attempt intra-block `matchBlock()` in Block #3 -> 0 volume matched (strict prior-block cutoff!)
+        let m3 = mock::transact_as(keeper, dex, match_cd.as_slice()).unwrap();
+        assert_eq!(u64::from_be_bytes(m3[56..64].try_into().unwrap()), 0);
+
+        // Block #4: Cohort #3 clears!
+        // Look what happens to the sandwich:
+        // Total demand @ <=105 is 200 (100 bot + 100 victim); total supply is 200 (100 @ $100 + 100 @ $105).
+        // Even if `mev_back_eoa` had NOT posted the back-run ask (only 100 supply @ $100), both `mev_front_eoa`
+        // and `victim` share Cohort #3 and split 50/50 pro-rata — `mev_front_eoa` gets ZERO FIFO priority!
+        // And WITH the back-run ask @ $105, `mev_front_eoa` and `mev_back_eoa` net 0 MEV profit (`paid $105, sold $105 = $0`)!
+        mock::set_block_number(4);
+        let m4 = mock::transact_as(keeper, dex, match_cd.as_slice()).unwrap();
+        let px = u64::from_be_bytes(m4[24..32].try_into().unwrap());
+        let vol = u64::from_be_bytes(m4[56..64].try_into().unwrap());
+        assert_eq!(vol, 200);
+        // Combined MEV adversary net quote profit across `mev_front_eoa` + `mev_back_eoa` when round-tripping 100 units:
+        let bot_quote_after =
+            balance_of(quote_ledger, mev_front_eoa) + balance_of(quote_ledger, mev_back_eoa);
+        let bot_asset_after =
+            balance_of(asset_ledger, mev_front_eoa) + balance_of(asset_ledger, mev_back_eoa);
+        assert_eq!(bot_asset_after, 500, "sandwich bot ended flat in base asset");
+        assert_eq!(
+            bot_quote_after, 50_000,
+            "sandwich bot extracted ZERO net quote profit (clearing_px={px})"
+        );
     }
 }
