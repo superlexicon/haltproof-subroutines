@@ -35,6 +35,7 @@ members = [
     "examples/volatile-voles",
     "examples/ride-exchange",
     "examples/jones-blockchain",
+    "examples/haltfree-ecosystem",
 ]
 
 [workspace.package]

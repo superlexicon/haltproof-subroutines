@@ -1,0 +1,13 @@
+[package]
+name = "haltfree-ecosystem"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Haltfree Ecosystem — Educational Closed-Loop Permaculture, Carp Polyculture & Biospheric Simulation Haltproof Subroutine (HPS)"
+
+[[bin]]
+name = "haltfree_ecosystem"
+path = "src/main.rs"
+
+[dependencies]
+hps-sdk = { path = "../../crates/hps-sdk" }
